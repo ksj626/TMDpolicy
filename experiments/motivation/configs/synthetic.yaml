@@ -1,0 +1,9 @@
+data_label: synthetic_diagnostic
+tasks: [0, 1, 2, 3]
+split_episode_counts_per_source: [256, 128, 512]
+seed: 101
+training_steps: 60
+model_dim: 32
+num_layers: 1
+num_heads: 4
+control_auc_deviation_threshold: 0.12
