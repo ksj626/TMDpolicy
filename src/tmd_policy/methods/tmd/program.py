@@ -38,8 +38,14 @@ def sample_stage1_generator(
     value = outer_noise
     for index, (current, target) in enumerate(zip(grid[:-1], grid[1:], strict=True)):
         time = current.expand(value.shape[0])
-        _, features = student.velocity_with_features(condition, value, time)
-        transition = integrate_inner_flow(head, inner_noises[index], features, num_steps=inner_steps)
+        base_velocity, features = student.velocity_with_features(condition, value, time)
+        transition = integrate_inner_flow(
+            head,
+            inner_noises[index],
+            features,
+            num_steps=inner_steps,
+            base_velocity=base_velocity,
+        )
         value = value + (target - current) * transition
     return value
 
@@ -60,6 +66,7 @@ class TMDStage1Program(TrainingProgram):
                 heads=int(config["heads"]),
                 feedforward_dim=int(config["feedforward_dim"]),
                 dropout=float(config.get("dropout", 0.0)),
+                attention_mode=str(config.get("attention_mode", "bidirectional")),
             )
         elif variant == "tmd_gru_head":
             self.head = GRUMeanFlowHead(
@@ -71,7 +78,6 @@ class TMDStage1Program(TrainingProgram):
         else:
             raise ValueError(f"unknown TMD Stage-1 variant: {variant}")
 
-        student.policy.requires_grad_(False)
         expert_layers = list(student.flow.vlm_with_expert.lm_expert.layers)
         last_k = int(config["last_k_expert_blocks"])
         if not 1 <= last_k < len(expert_layers):
@@ -84,18 +90,12 @@ class TMDStage1Program(TrainingProgram):
             f"policy.model.vlm_with_expert.lm_expert.layers.{index}"
             for index in range(len(expert_layers) - last_k, len(expert_layers))
         )
-        if bool(config.get("train_backbone_flow_blocks", True)):
-            modules = [
-                *expert_layers[-last_k:],
-                student.flow.action_in_proj,
-                student.flow.action_out_proj,
-                student.flow.action_time_mlp_in,
-                student.flow.action_time_mlp_out,
-            ]
-            selected = {id(parameter) for module in modules for parameter in module.parameters()}
-            for parameter in student.policy.parameters():
-                parameter.requires_grad_(id(parameter) in selected)
+        student.configure_tmd_trainable(
+            last_k_expert_blocks=last_k,
+            train_backbone_flow_blocks=bool(config.get("train_backbone_flow_blocks", True)),
+        )
         self.head.requires_grad_(True)
+        self.intended_student_trainable_names = tuple(student.trainable_parameter_names)
 
     def phase_schedule(self) -> tuple[str, ...]:
         return ("generator",)
@@ -123,10 +123,19 @@ class TMDStage1Program(TrainingProgram):
         samples = sample_meanflow_batch(
             actions,
             flow_matching_fraction=float(self.tmd_config["flow_matching_fraction"]),
+            outer_time_shift_gamma=float(self.tmd_config.get("outer_time_shift_gamma", 1.0)),
+            inner_time_shift_gamma=float(self.tmd_config.get("inner_time_shift_gamma", 1.0)),
+            discrete_target_steps=int(self.tmd_config.get("inference_inner_steps", 1)),
         )
         outer_time = samples.outer_time
         x_t = (1.0 - outer_time[:, None, None]) * actions + outer_time[:, None, None] * samples.outer_noise
-        _, features = self.student.velocity_with_features(condition, x_t, outer_time)
+        base_velocity, features = self.student.velocity_with_features(condition, x_t, outer_time)
+        dropout = float(self.tmd_config.get("condition_dropout_probability", 0.0))
+        if not 0.0 <= dropout < 1.0:
+            raise ValueError("condition_dropout_probability must be in [0,1)")
+        if dropout:
+            keep = (torch.rand(actions.shape[0], device=actions.device) >= dropout).to(features.dtype)
+            features = features * keep[:, None, None]
         true_transition = samples.outer_noise - actions
         values = meanflow_loss(
             self.head,
@@ -135,6 +144,7 @@ class TMDStage1Program(TrainingProgram):
             inner_time=samples.inner_time,
             target_time=samples.target_time,
             context=features,
+            base_velocity=base_velocity,
             valid_coordinates=self._coordinate_mask(valid),
             normalization_constant=float(self.tmd_config["normalization_constant"]),
         )
@@ -152,6 +162,8 @@ class TMDStage1Program(TrainingProgram):
                     samples.outer_noise.flatten(1), samples.inner_source.flatten(1)
                 ).mean()
             ),
+            "base_velocity_abs": float(values["base_velocity"].abs().mean().detach()),
+            "residual_abs": float(values["residual"].abs().mean().detach()),
         }
 
     def sample(
@@ -197,6 +209,9 @@ class TMDStage1Program(TrainingProgram):
             "frozen_early_expert_blocks": list(self.early_block_names),
             "outer_flow_blocks": list(self.flow_block_names),
             "inner_update_modules": [name for name, _ in self.head.named_parameters()],
+            "intended_trainable_parameter_names": list(self.intended_student_trainable_names),
+            "attention_mode": getattr(self.head, "attention_mode", "recurrent"),
+            "preconditioning": "u=z-(v_smolvla+Delta); zero Delta reproduces SmolVLA transition",
         }
 
 

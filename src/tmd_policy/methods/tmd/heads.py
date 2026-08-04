@@ -18,10 +18,12 @@ def _time_embedding(time: Tensor, width: int) -> Tensor:
     return torch.cat((phase.sin(), phase.cos()), dim=-1)
 
 
-class _CausalTransformerBlock(nn.Module):
+class _TransformerBlock(nn.Module):
     """Forward-AD-safe transformer block used by the MeanFlow JVP."""
 
-    def __init__(self, model_dim: int, heads: int, feedforward_dim: int, dropout: float) -> None:
+    def __init__(
+        self, model_dim: int, heads: int, feedforward_dim: int, dropout: float, *, causal: bool
+    ) -> None:
         super().__init__()
         self.heads = heads
         self.head_dim = model_dim // heads
@@ -36,6 +38,7 @@ class _CausalTransformerBlock(nn.Module):
             nn.Linear(feedforward_dim, model_dim),
             nn.Dropout(dropout),
         )
+        self.causal = causal
 
     def forward(self, value: Tensor) -> Tensor:
         batch, length, width = value.shape
@@ -46,8 +49,12 @@ class _CausalTransformerBlock(nn.Module):
         key = key.transpose(1, 2)
         content = content.transpose(1, 2)
         logits = query @ key.transpose(-2, -1) / math.sqrt(self.head_dim)
-        causal = torch.triu(torch.ones(length, length, device=value.device, dtype=torch.bool), diagonal=1)
-        weights = F.softmax(logits.masked_fill(causal, torch.finfo(logits.dtype).min), dim=-1)
+        if self.causal:
+            mask = torch.triu(
+                torch.ones(length, length, device=value.device, dtype=torch.bool), diagonal=1
+            )
+            logits = logits.masked_fill(mask, torch.finfo(logits.dtype).min)
+        weights = F.softmax(logits, dim=-1)
         attended = (weights @ content).transpose(1, 2).reshape(batch, length, width)
         value = value + self.attention_out(attended)
         return value + self.feedforward(self.feedforward_norm(value))
@@ -74,15 +81,28 @@ class SplitTransformerMeanFlowHead(nn.Module):
         feedforward_dim: int,
         horizon: int = 50,
         dropout: float = 0.0,
+        attention_mode: str = "bidirectional",
     ) -> None:
         super().__init__()
         if model_dim % heads:
             raise ValueError("split-transformer model_dim must be divisible by heads")
+        if attention_mode not in {"bidirectional", "causal"}:
+            raise ValueError("attention_mode must be bidirectional or causal")
+        self.attention_mode = attention_mode
         self.input_projection = nn.Linear(action_dim + context_dim, model_dim)
         self.time_projection = nn.Linear(4, model_dim)
         self.position = nn.Embedding(horizon, model_dim)
         self.transformer = nn.ModuleList(
-            [_CausalTransformerBlock(model_dim, heads, feedforward_dim, dropout) for _ in range(layers)]
+            [
+                _TransformerBlock(
+                    model_dim,
+                    heads,
+                    feedforward_dim,
+                    dropout,
+                    causal=attention_mode == "causal",
+                )
+                for _ in range(layers)
+            ]
         )
         self.output_norm = nn.LayerNorm(model_dim)
         self.output_projection = nn.Linear(model_dim, action_dim)

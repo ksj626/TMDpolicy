@@ -1,5 +1,5 @@
 method: occupancy_discriminator
-classification: causal expert-vs-student LIBERO occupancy discriminator
+classification: paper-feature short-window replan occupancy discriminator
 backend:
   lerobot_version: "0.6.1"
   expected_source_hashes: null
@@ -45,16 +45,20 @@ training:
   validation_batches: 8
   checkpoint_interval: 1000
 rollouts:
-  store: artifacts/rollouts/motivation_student
-  window_stride: 2
-occupancy_model:
-  num_tasks: 40
-  window_length: 10
-  model_dim: 192
-  layers: 4
-  heads: 6
-  feedforward_dim: 768
-  dropout: 0.0
-  normalization_max_windows: 20000
+  store: artifacts/rollouts/all40_student
+  window_stride: 1
+  configured_task_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39]
+  balance_position_bins: false
+occupancy_discriminator:
+  variant: pi05_intermediate_features
+  window_length: 50
+  minimum_time: 0.001
+  maximum_time: 0.999
+  time_shift_gamma: 5.0
+  selected_layers: [5, 11, 17]
+  hidden_dim: 512
+  time_embedding_dim: 32
+preflight:
+  minimum_total_memory_gib: {cuda:0: 23.5}
 output:
   directory: artifacts/training/occupancy_discriminator

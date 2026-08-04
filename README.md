@@ -1,147 +1,153 @@
 # TMDpolicy
 
-TMDpolicy is an executable research codebase for distilling a frozen
-`lerobot/pi05_libero_finetuned` PI0.5 teacher into
-`lerobot/smolvla_libero` on the immutable real `lerobot/libero` dataset. It
-implements official-objective Flow-SFT, a SmolVLA Transition Matching
-Distillation port, DMD2-flow, Stage-2 DMD2-v refinement, and an experimental
-occupancy-weighted TMD method. VLA-OPD was deliberately removed; there is no
-OPD registry entry, config, script, test, density estimator, or executable path.
+Repository-owned PI0.5-to-SmolVLA action-policy distillation on the immutable
+`lerobot/libero` dataset. Production baselines use LeRobot exactly `0.6.1` and
+never modify installed LeRobot or site-packages.
 
-## Environment and assets
+Pinned assets:
 
-The fixed target is native Linux x86_64, Python 3.12, NVIDIA CUDA/BF16,
-PyTorch 2.11.0 from the explicit CUDA 12.8 wheel index, and PyPI
-`lerobot[training,pi,smolvla,libero,evaluation]==0.6.1`.
+- PI0.5 teacher: `lerobot/pi05_libero_finetuned@8e174154ef5f6c60a8da12ae99c303d8963138c1`
+- SmolVLA student: `lerobot/smolvla_libero@31d453f7edd78c839a8bbc39744a292686daf0de`
+- LIBERO data: `lerobot/libero@a1aaacb7f6cd6ee5fb43120f673cebb0cfea7dd4`
+
+## Implemented baselines
+
+`dmd2_flow_paper` uses a frozen PI0.5 teacher, a PI0.5-initialized independently
+trainable action-expert suffix, five fake-score updates per generator update,
+VSD, and a noised-action GAN on selected fake-score layers. Its generator loss
+is exactly `L_VSD + lambda_GAN L_GAN`; it has no Flow-SFT or data regression.
+
+TMD uses the repository-owned SmolVLA action-space transformer adaptation:
+
+1. Stage 1 trains TM-MF with independent outer/inner Gaussian sources,
+   shifted outer/inner times, discrete inference-aligned `r`, `r=s` on 75% of
+   rows, exact JVP, and adaptive normalization.
+2. Stage 2 loads Stage 1 immutably, preserves the selected final SmolVLA expert
+   blocks, constructs real-data outer transitions, differentiates through every
+   inner step, and applies TMD v2 DMD2-v VSD plus teacher-feature GAN. It has no
+   SFT/data term.
+
+For the action-space adaptation, `b=v_SmolVLA(x_t,t,c)`, the head predicts a
+zero-initialized residual `Delta`, `h=b+Delta`, and the MeanFlow average velocity
+is `u=z-h`. Therefore a zero residual returns `b` after 1, 2, or 4 inner steps
+and reproduces the corresponding SmolVLA outer Euler transition. Chunk
+attention is bidirectional by default; causal attention is an explicit ablation.
+
+The ordinary DMD/TMD conditional GAN and the short-window occupancy ratio are
+different programs. Occupancy training uses actual replan records
+`(s_t,o_t,a_plan[50],task)` from expert data and real student rollouts. Both
+families corrupt actions as
+
+```text
+a_tau = (1-tau) a + tau epsilon
+tau = gamma u / ((gamma-1)u + 1)
+```
+
+and use logistic discriminator and non-saturating generator losses. The default
+paper feature path uses separate heads on PI0.5 layers `[5,11,17]` and averages
+their losses. `cached_vla_features` is a separately named efficient adaptation.
+
+## Environment
 
 ```bash
 cd /home/dmsdmswns/TMDpolicy
 bash scripts/setup/create_environment.sh
 conda activate tmdpolicy
-huggingface-cli login
 export MUJOCO_GL=egl
-export HF_HOME=/home/dmsdmswns/TMDpolicy/.cache/huggingface
-export HF_LEROBOT_HOME=/home/dmsdmswns/TMDpolicy/.cache/lerobot
+export HF_HOME="$PWD/.cache/huggingface"
+export HF_LEROBOT_HOME="$PWD/.cache/lerobot"
 ```
 
-Accept gated access to `google/paligemma-3b-pt-224` before PI0.5 loading. The
-repository never modifies LeRobot or site-packages. Each run checks
-`importlib.metadata.version("lerobot") == "0.6.1"` and records source paths and
-SHA-256 hashes for PI0.5, SmolVLA, normalization, and processor-factory modules.
-See [environment/README.md](environment/README.md).
+Accept access to `google/paligemma-3b-pt-224`. Every model, processor, dataset,
+checkpoint, and LeRobot source identity is recorded. Checkpoint SHA-256 fields
+set to `auto` are computed before use and persisted into the resolved run config.
 
-Pinned assets:
-
-- teacher: `lerobot/pi05_libero_finetuned` at
-  `8e174154ef5f6c60a8da12ae99c303d8963138c1`;
-- student: `lerobot/smolvla_libero` at
-  `31d453f7edd78c839a8bbc39744a292686daf0de`;
-- expert data: `lerobot/libero` at
-  `a1aaacb7f6cd6ee5fb43120f673cebb0cfea7dd4`.
-
-## Real workflow
-
-Build the one episode-disjoint data manifest, then validate PI0.5 raw flow:
+## Data and parity
 
 ```bash
-conda run -n tmdpolicy tmd-policy data build-expert \
-  --config configs/data/libero.yaml
-MUJOCO_GL=egl conda run -n tmdpolicy tmd-policy teacher validate-pi05-flow \
-  --config configs/teacher/pi05_flow_parity.yaml \
-  --output artifacts/pi05_flow_parity
+bash scripts/data/build_libero_expert.sh
+bash scripts/data/query_pi05_teacher.sh --output artifacts/pi05_flow_parity
 ```
 
-Every training script constructs a real LeRobot dataset, processors, and model
-objects. None has a synthetic or dry execution mode:
+Rollout schema `tmdpolicy.libero-replans/v2` losslessly stores each canonical
+replan-start camera tensor and metadata, state `[8]`, full postprocessed plan
+`[50,7]`, executed prefix/actions, suite-local and global task identities,
+termination outcome, behavior checkpoint/round, and immutable revisions. Old v1
+stores fail closed. All-40-task collection is:
 
 ```bash
-bash scripts/train/train_flow_sft.sh
+bash scripts/data/collect_all_libero_rollouts.sh
+```
+
+## Training
+
+Preflight never changes the requested algorithm; insufficient memory/device
+fails explicitly.
+
+```bash
+bash scripts/preflight/preflight_dmd2.sh
+bash scripts/train/train_dmd2_flow_paper.sh
+
+bash scripts/preflight/preflight_tmd.sh
 bash scripts/train/train_tmd_stage1.sh
-bash scripts/train/train_dmd2_flow.sh
-bash scripts/train/train_tmd_stage2.sh
-bash scripts/data/collect_student_rollouts.sh
-bash scripts/train/train_occupancy_discriminator.sh
-bash scripts/train/train_occupancy_tmd.sh
+bash scripts/train/train_tmd_stage2_paper.sh
 ```
 
-Stage 2 and occupancy-TMD depend on upstream immutable checkpoints. Run
-`sha256sum artifacts/.../checkpoints/final.pt` and replace the corresponding
-`REPLACE_WITH_SHA256_FROM_sha256sum` field before launching. Resume exactly at a
-saved boundary:
+The pipeline either accepts an existing Stage-1 checkpoint or trains Stage 1,
+computes its SHA-256, checks its model/dataset provenance, writes a fully
+resolved Stage-2 input config, and refuses existing output directories:
 
 ```bash
-conda run -n tmdpolicy tmd-policy train tmd-stage1 \
-  --config configs/methods/tmd_stage1.yaml \
-  --output artifacts/training/tmd_stage1 \
-  --resume artifacts/training/tmd_stage1/checkpoints/latest.pt
+bash scripts/train/run_tmd_pipeline.sh \
+  artifacts/training/tmd_stage1/checkpoints/final.pt \
+  artifacts/training/tmd_stage2_pipeline
 ```
 
-Checkpoints contain the full program, all optimizers/schedulers/scaler, counters,
-sampler cursor, Python/NumPy/Torch/CUDA RNG, resolved config, exact trainable
-names, and model/processor/dataset/LeRobot source provenance. New outputs refuse
-to overwrite an existing directory.
-
-## Motivation and main LIBERO experiments
-
-The motivation protocol is intentionally larger than a ten-seed LIBERO-10
-smoke test. `configs/evaluation/libero_motivation.yaml` evaluates four diagnostic
-tasks from each of `libero_spatial`, `libero_object`, `libero_goal`, and
-`libero_10`, using the same 20 reset seeds: 320 paired complete episodes per
-method. `configs/evaluation/libero_main.yaml` evaluates all 40 suite/task entries
-at 50 paired reset seeds: 2,000 episodes per method. This grid makes differences
-visible and supports paired confidence intervals instead of relying on noisy
-single-task outcomes.
-
-The evaluation CLI accepts policy overrides, so the same paired protocol is
-reused without duplicating YAML. The immutable SmolVLA baseline needs no local
-checkpoint; trained arms require the checkpoint path and SHA-256:
+Paper occupancy and cached-VLA occupancy launch with:
 
 ```bash
-MUJOCO_GL=egl conda run -n tmdpolicy tmd-policy evaluate libero \
-  --config configs/evaluation/libero_motivation.yaml \
-  --policy-method smolvla \
-  --output artifacts/evaluation/motivation_smolvla
-
-MUJOCO_GL=egl conda run -n tmdpolicy tmd-policy evaluate libero \
-  --config configs/evaluation/libero_motivation.yaml \
-  --policy-method tmd_stage1 \
-  --checkpoint artifacts/training/tmd_stage1/checkpoints/final.pt \
-  --checkpoint-sha256 REPLACE_WITH_SHA256_FROM_sha256sum \
-  --outer-steps 2 --inner-steps 2 \
-  --output artifacts/evaluation/motivation_tmd_stage1
-
-conda run -n tmdpolicy tmd-policy evaluate compare \
-  --config configs/experiments/motivation.yaml \
-  --output artifacts/experiments/motivation_comparison
+conda run -n tmdpolicy tmd-policy train occupancy-discriminator \
+  --config configs/methods/occupancy_discriminator_paper.yaml
+conda run -n tmdpolicy tmd-policy train occupancy-discriminator \
+  --config configs/methods/occupancy_discriminator_cached_vla.yaml
 ```
 
-Comparison requires identical `(suite, task_id, reset_seed)` keys and reports
-overall, per-suite, and per-task paired bootstrap success differences plus exact
-McNemar tests. Results also include Wilson intervals, macro/micro success,
-synchronized replan latency, action-path smoothness, and optional versioned
-rollout paths. Substitute `configs/evaluation/libero_main.yaml` to execute the
-2,000-episode main grid, then compare those outputs with
-`configs/experiments/main.yaml`.
+Training batches for occupancy are deterministic source-paired/task-stratified
+and resume from an exact epoch/batch cursor. Validation is never oversampled and
+reports source, macro/task, and aggregate metrics.
 
-## Method fidelity and hardware
+## Evaluation
 
-- Flow-SFT is the exact official LeRobot SmolVLA flow-matching objective.
-- `tmd_split_transformer_head` is the primary, paper-closest SmolVLA
-  action-space port. LeRobot 0.6.1 exposes no supported partial expert forward,
-  so its repository-owned inner transformer is not claimed as an exact
-  paper-native architecture. `tmd_gru_head` is a lightweight adaptation.
-- Stage-2 uses the actual Stage-1 sampler and online PI0.5 DMD2-v updates.
-- DMD2 `pi05_clone` is closest to the original fake-score architecture but very
-  expensive; `smolvla_clone` and default `lightweight` are labeled adaptations.
-- occupancy-weighted TMD is a proposed method, not a published-paper reproduction.
+Direct PI0.5 and the ordinary SmolVLA baseline use official 10-step sampling.
+SmolVLA four-step sampling is only available as an explicitly labeled ablation.
 
-Flow/TMD head-only work generally needs a 24 GiB-class GPU. DMD2 with a frozen
-4B PI0.5 teacher is configured for two 24+ GiB GPUs (`cuda:0` student/fake score,
-`cuda:1` teacher); PI0.5-clone fake score needs materially more. Full/LoRA modes,
-batch size, activation memory, prefix cache, and optimizer states change the
-actual requirement. No large run is launched by setup or validation.
+```bash
+bash scripts/evaluate/evaluate_pi05.sh
+bash scripts/evaluate/evaluate_smolvla10.sh
+bash scripts/evaluate/evaluate_dmd2.sh
+bash scripts/evaluate/evaluate_tmd.sh
+```
 
-Architecture, tensor contracts, configuration fields, and limitations are in
-[docs/architecture.md](docs/architecture.md),
-[docs/experiment_protocol.md](docs/experiment_protocol.md), and each module's
-README.
+Use `configs/evaluation/tmd_stage1.yaml` as the first argument to
+`evaluate_tmd.sh` for Stage 1. Evaluation actions are canonical `[B,50,7]` and
+comparison requires identical `(suite, task_id, reset_seed)` grids. Motivation
+and main comparison configs include PI0.5 official, SmolVLA official-10, and the
+explicit four-step ablation.
+
+## Memory and fidelity
+
+The tested PI0.5 suffix clone has 693,422,112 trainable parameters and shares
+3,449,982,704 frozen teacher parameters. The default layout uses `cuda:0` for
+SmolVLA and `cuda:1` for PI0.5 prefix/suffix/features; both require a nominal
+24-GB-class GPU. Optimizer state and activations dominate beyond parameter-only
+memory. Config preflight records detected devices and fails rather than selecting
+a lightweight score or action-only discriminator.
+
+The TMD action head is a truthful SmolVLA action-space architectural adaptation,
+not the paper's native last-K video-DiT split. DMD2's teacher-residual weighting
+and TMD-v's fake–teacher stopped-L1 direction are distinct, method-locked
+objectives. The preconditioning, time sampling, inner rollout, feature sources,
+and loss exclusions are preserved within the labeled adaptation.
+
+See [architecture](docs/architecture.md), [experiment protocol](docs/experiment_protocol.md),
+[config reference](configs/README.md), and the method/data/evaluation READMEs.

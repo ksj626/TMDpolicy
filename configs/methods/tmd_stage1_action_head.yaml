@@ -1,0 +1,28 @@
+method: tmd_stage1
+classification: SmolVLA action-space TMD adaptation with TM-MF
+backend: {lerobot_version: "0.6.1", expected_source_hashes: null, local_files_only: false}
+models:
+  student: {id: lerobot/smolvla_libero, revision: 31d453f7edd78c839a8bbc39744a292686daf0de, processor_revision: 31d453f7edd78c839a8bbc39744a292686daf0de}
+  teacher: {id: lerobot/pi05_libero_finetuned, revision: 8e174154ef5f6c60a8da12ae99c303d8963138c1, processor_revision: 8e174154ef5f6c60a8da12ae99c303d8963138c1}
+dataset: {id: lerobot/libero, revision: a1aaacb7f6cd6ee5fb43120f673cebb0cfea7dd4, cache: .cache/lerobot, manifest: artifacts/data/libero_expert/episode_manifest.json, validation_fraction: 0.1, test_fraction: 0.1, split_seed: 17, download_videos: true, video_backend: pyav}
+horizons: {prediction: 50, execution: 10}
+training: {seed: 7, device: cuda:0, batch_size: 4, num_workers: 0, mixed_precision: bf16, gradient_accumulation: 8, gradient_clip_norm: 1.0, learning_rate: 1.0e-5, weight_decay: 1.0e-4, betas: [0.9, 0.95], epsilon: 1.0e-8, warmup_steps: 1000, minimum_lr_scale: 0.05, max_steps: 100000, validation_interval: 500, validation_batches: 8, checkpoint_interval: 1000}
+tmd:
+  variant: tmd_split_transformer_head
+  attention_mode: bidirectional
+  flow_matching_fraction: 0.75
+  normalization_constant: 350.0
+  outer_time_shift_gamma: 10.0
+  inner_time_shift_gamma: 3.0
+  condition_dropout_probability: 0.1
+  last_k_expert_blocks: 4
+  train_backbone_flow_blocks: true
+  model_dim: 512
+  layers: 4
+  heads: 8
+  feedforward_dim: 2048
+  dropout: 0.0
+  inference_outer_steps: 2
+  inference_inner_steps: 2
+preflight: {minimum_total_memory_gib: {cuda:0: 23.5}}
+output: {directory: artifacts/training/tmd_stage1}

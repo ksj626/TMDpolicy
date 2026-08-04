@@ -58,6 +58,9 @@ def _train(args: argparse.Namespace) -> int:
 
     expected = _TRAIN_METHODS[args.train_method]
     config = load_config(args.config, expected_method=expected)
+    from tmd_policy.training.preflight import preflight
+
+    preflight(config)
     bundle = build_training_bundle(config)
     report = run_training(
         bundle.program,
@@ -66,6 +69,7 @@ def _train(args: argparse.Namespace) -> int:
         config=config,
         output_dir=_output(args, config),
         resume=args.resume,
+        train_batch_sampler=bundle.train_batch_sampler,
     )
     print(json.dumps(report, indent=2, sort_keys=True))
     return 0
@@ -149,7 +153,7 @@ def build_parser() -> argparse.ArgumentParser:
     libero.add_argument("--output")
     libero.add_argument(
         "--policy-method",
-        choices=("smolvla", "flow_sft", "tmd_stage1", "dmd2_flow", "tmd_stage2", "occupancy_tmd"),
+        choices=("pi05", "smolvla", "flow_sft", "tmd_stage1", "dmd2_flow", "tmd_stage2", "occupancy_tmd"),
     )
     libero.add_argument("--checkpoint")
     libero.add_argument("--checkpoint-sha256")

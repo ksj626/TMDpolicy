@@ -63,6 +63,16 @@ class DeterministicBatchSampler(Sampler[list[int]]):
             batches.pop()
         yield from batches[self.start_batch :]
 
+    def state_dict(self) -> dict[str, Any]:
+        return {
+            "size": self.size,
+            "batch_size": self.batch_size,
+            "seed": self.seed,
+            "epoch": self.epoch,
+            "start_batch": self.start_batch,
+            "drop_last": self.drop_last,
+        }
+
 
 class TrainingProgram(nn.Module, ABC):
     """A concrete model graph and its ordered optimizer phases."""
@@ -88,6 +98,9 @@ class TrainingProgram(nn.Module, ABC):
 
     def trainable_parameter_names(self) -> list[str]:
         return [name for name, parameter in self.named_parameters() if parameter.requires_grad]
+
+    def validate_phase_gradients(self, phase: str) -> None:
+        """Fail fast on method-specific gradient-path invariants."""
 
 
 def seed_everything(seed: int) -> None:
@@ -164,7 +177,17 @@ def _checkpoint_payload(
     global_step: int,
     epoch: int,
     next_batch: int,
+    sampler: Sampler[list[int]],
 ) -> dict[str, Any]:
+    sampler_state = dict(sampler.state_dict()) if hasattr(sampler, "state_dict") else {}
+    sampler_state.update(
+        {
+            "type": f"{type(sampler).__module__}.{type(sampler).__qualname__}",
+            "epoch": epoch,
+            "start_batch": next_batch,
+            "resume_contract": "pure function of sampler type/config, seed, epoch, and batch cursor",
+        }
+    )
     return {
         "format": "tmdpolicy.training/v1",
         "program": program.state_dict(),
@@ -172,6 +195,7 @@ def _checkpoint_payload(
         "schedulers": {name: value.state_dict() for name, value in schedulers.items()},
         "scaler": scaler.state_dict(),
         "counters": {"global_step": global_step, "epoch": epoch, "next_batch": next_batch},
+        "sampler": sampler_state,
         "rng": _rng_state(),
         "config": config,
         "provenance": provenance,
@@ -193,6 +217,7 @@ def _load_checkpoint(
     schedulers: dict[str, LRScheduler],
     scaler: torch.amp.GradScaler,
     config: dict[str, Any],
+    sampler: Sampler[list[int]],
 ) -> tuple[int, int, int]:
     payload = torch.load(path, map_location="cpu", weights_only=False)
     if payload.get("format") != "tmdpolicy.training/v1":
@@ -212,6 +237,16 @@ def _load_checkpoint(
     scaler.load_state_dict(payload["scaler"])
     if payload["trainable_parameter_names"] != program.trainable_parameter_names():
         raise ValueError("trainable parameter identities changed across resume")
+    stored_sampler = dict(payload.get("sampler", {}))
+    current_sampler = dict(sampler.state_dict()) if hasattr(sampler, "state_dict") else {}
+    current_sampler["type"] = f"{type(sampler).__module__}.{type(sampler).__qualname__}"
+    for transient in ("epoch", "start_batch", "resume_contract"):
+        stored_sampler.pop(transient, None)
+        current_sampler.pop(transient, None)
+    if stored_sampler != current_sampler:
+        raise ValueError(
+            f"sampler identity/configuration changed across resume: {stored_sampler} != {current_sampler}"
+        )
     _restore_rng(payload["rng"])
     counters = payload["counters"]
     return int(counters["global_step"]), int(counters["epoch"]), int(counters["next_batch"])
@@ -255,6 +290,7 @@ def run_training(
     config: dict[str, Any],
     output_dir: str | Path,
     resume: str | Path | None = None,
+    train_batch_sampler: Sampler[list[int]] | None = None,
 ) -> dict[str, Any]:
     """Run real DataLoader/model updates; no dry-run branch exists."""
 
@@ -312,16 +348,19 @@ def run_training(
     }
     (output / "provenance.json").write_text(json.dumps(provenance, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
+    accumulation = int(training["gradient_accumulation"])
+    sampler = train_batch_sampler or DeterministicBatchSampler(
+        len(train_dataset), int(training["batch_size"]), seed=int(training["seed"]), drop_last=True
+    )
+    if not hasattr(sampler, "epoch") or not hasattr(sampler, "start_batch"):
+        raise TypeError("training batch samplers must expose epoch and start_batch for exact resume")
+
     global_step = epoch = next_batch = 0
     if resume is not None:
         global_step, epoch, next_batch = _load_checkpoint(
-            Path(resume), program, optimizers, schedulers, scaler, config
+            Path(resume), program, optimizers, schedulers, scaler, config, sampler
         )
     metrics_path = output / "metrics.jsonl"
-    accumulation = int(training["gradient_accumulation"])
-    sampler = DeterministicBatchSampler(
-        len(train_dataset), int(training["batch_size"]), seed=int(training["seed"]), drop_last=True
-    )
     clip = float(training["gradient_clip_norm"])
 
     while global_step < int(training["max_steps"]):
@@ -361,6 +400,7 @@ def run_training(
                     for name, value in values.items():
                         phase_values.setdefault(name, []).append(float(value))
                 scaler.unscale_(optimizer)
+                program.validate_phase_gradients(phase)
                 parameters = [parameter for group in optimizer.param_groups for parameter in group["params"]]
                 gradient_norm = torch.nn.utils.clip_grad_norm_(parameters, clip)
                 scaler.step(optimizer)
@@ -399,6 +439,7 @@ def run_training(
                     global_step=global_step,
                     epoch=epoch,
                     next_batch=next_batch,
+                    sampler=sampler,
                 )
                 checkpoint = output / "checkpoints" / f"step-{global_step:08d}.pt"
                 _atomic_save(payload, checkpoint)
@@ -414,6 +455,7 @@ def run_training(
         global_step=global_step,
         epoch=epoch,
         next_batch=next_batch,
+        sampler=sampler,
     )
     final_checkpoint = output / "checkpoints" / "final.pt"
     _atomic_save(final_payload, final_checkpoint)

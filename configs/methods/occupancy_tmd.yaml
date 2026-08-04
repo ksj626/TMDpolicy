@@ -46,8 +46,12 @@ training:
   checkpoint_interval: 1000
 tmd:
   variant: tmd_split_transformer_head
+  attention_mode: bidirectional
   flow_matching_fraction: 0.75
   normalization_constant: 350.0
+  outer_time_shift_gamma: 10.0
+  inner_time_shift_gamma: 3.0
+  condition_dropout_probability: 0.1
   last_k_expert_blocks: 4
   train_backbone_flow_blocks: true
   model_dim: 512
@@ -55,19 +59,11 @@ tmd:
   heads: 8
   feedforward_dim: 2048
   dropout: 0.0
-occupancy_model:
-  num_tasks: 40
-  window_length: 10
-  model_dim: 192
-  layers: 4
-  heads: 6
-  feedforward_dim: 768
-  dropout: 0.0
-  normalization_max_windows: 20000
+  inference_outer_steps: 2
+  inference_inner_steps: 2
 occupancy:
   discriminator_checkpoint: artifacts/training/occupancy_discriminator/checkpoints/final.pt
-  discriminator_checkpoint_sha256: REPLACE_WITH_SHA256_FROM_sha256sum
-  window_length: 10
+  discriminator_checkpoint_sha256: auto
   minimum_weight: 0.5
   maximum_weight: 2.0
   temperature: 1.0

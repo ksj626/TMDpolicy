@@ -1,23 +1,36 @@
-# Motivation and main protocol
+# Experiment protocol
 
-Build data once, validate PI0.5 parity, train Flow-SFT and Stage-1, train DMD2 and
-Stage-2 as resources permit, collect current-student rollout rounds, train the
-occupancy discriminator, then train occupancy-TMD. Record each upstream SHA in
-dependent configs. Never reuse validation/test episodes to fit normalization or
-occupancy statistics. The shipped occupancy configuration is explicitly a
-fixed-checkpoint, off-policy experiment.
+1. Build the immutable episode manifest and run PI0.5 fixed-noise parity.
+2. Run method preflight.
+3. Train DMD2 directly, or train TMD Stage 1 and let `run_tmd_pipeline.sh`
+   validate/hash it before Stage 2.
+4. Evaluate PI0.5 official and SmolVLA official-10 before trained arms.
+5. Collect v2 student replans across all 40 tasks before occupancy training.
+6. Train paper occupancy and optionally the cached-VLA adaptation.
 
-Motivation uses four diagnostic tasks from each of four LIBERO suites and 20
-shared reset seeds (320 complete episodes/arm). Main uses all ten tasks per suite
-and 50 shared seeds (2,000/arm). Training seeds should be repeated independently
-when estimating training variance; within one checkpoint comparison, environment
-seeds and policy-noise derivation are paired exactly. Primary outcomes are macro
-task success and paired difference from Flow-SFT; secondary outcomes are micro
-success, per-task Wilson intervals, exact McNemar discordance, synchronized warm
-replan latency, path smoothness, and occupancy discrimination diagnostics.
+The motivation/main comparison inputs explicitly include PI0.5 official,
+SmolVLA official-10, and the four-step SmolVLA ablation so step-count effects are
+visible. All arms must use identical suite/task/reset grids. Main evaluation is
+all 40 tasks; use multiple training seeds for training variance and paired reset
+seeds for within-checkpoint comparisons.
 
-Do not inspect main results to tune hyperparameters. Mark static rollout reuse as
-off-policy. A current-policy occupancy claim requires separately collecting a
-new uniquely named rollout store from the current checkpoint, recording its
-SHA, and training against that new store; the trainer does not refresh an
-environment implicitly.
+Static rollout data estimates historical behavior occupancy. A current-policy
+claim requires a new uniquely named collection round from that exact checkpoint.
+No validation/test oversampling or occupancy normalization fitting is allowed.
+
+Minimal validation command:
+
+```bash
+conda run -n tmdpolicy pytest -q -m 'not integration'
+```
+
+Opt-in real integration commands load pinned checkpoints and one real batch only:
+
+```bash
+conda run -n tmdpolicy pytest -q -m integration
+bash scripts/data/query_pi05_teacher.sh --output artifacts/pi05_flow_parity
+```
+
+Do not use these commands as performance experiments. Full training, rollout
+collection, and evaluation are launched only by the explicit scripts in the root
+README.

@@ -36,13 +36,80 @@ def _revision(value: Any, field: str) -> str:
     return value
 
 
+def _reject_unknown(mapping: dict[str, Any], allowed: set[str], context: str) -> None:
+    unknown = sorted(set(mapping) - allowed)
+    if unknown:
+        raise ConfigError(f"unknown or deprecated configuration fields in {context}: {unknown}")
+
+
+def _all_libero_tasks(benchmark: Any, context: str) -> None:
+    if not isinstance(benchmark, list):
+        raise ConfigError(f"{context} must be a suite/task list")
+    expected = {
+        "libero_spatial": set(range(10)),
+        "libero_object": set(range(10)),
+        "libero_goal": set(range(10)),
+        "libero_10": set(range(10)),
+    }
+    actual: dict[str, set[int]] = {}
+    for value in benchmark:
+        suite = str(value.get("suite"))
+        if suite in actual:
+            raise ConfigError(f"{context} repeats suite {suite}")
+        actual[suite] = {int(task) for task in value.get("task_ids", [])}
+    if actual != expected:
+        raise ConfigError(f"{context} must cover each of the four suites and all 40 tasks exactly")
+
+
 def validate_config(config: dict[str, Any], *, expected_method: str | None = None) -> None:
     """Fail closed on asset identity and the shared LIBERO tensor contract."""
 
     method = str(_require(config, "method", "config"))
+    root_fields = {
+        "data_build_expert": {"method", "backend", "models", "dataset", "horizons", "output"},
+        "pi05_flow_parity": {
+            "method", "classification", "backend", "models", "dataset", "horizons", "parity", "output"
+        },
+        "flow_sft": {
+            "method", "classification", "backend", "models", "dataset", "horizons", "training",
+            "fine_tuning", "output"
+        },
+        "tmd_stage1": {
+            "method", "classification", "backend", "models", "dataset", "horizons", "training",
+            "tmd", "preflight", "output"
+        },
+        "dmd2_flow": {
+            "method", "classification", "backend", "models", "dataset", "horizons", "training",
+            "dmd2", "preflight", "output"
+        },
+        "tmd_stage2": {
+            "method", "classification", "backend", "models", "dataset", "horizons", "training",
+            "stage1_architecture", "stage2", "preflight", "output"
+        },
+        "occupancy_discriminator": {
+            "method", "classification", "backend", "models", "dataset", "horizons", "training",
+            "rollouts", "occupancy_discriminator", "preflight", "output"
+        },
+        "occupancy_tmd": {
+            "method", "classification", "backend", "models", "dataset", "horizons", "training",
+            "tmd", "occupancy", "output"
+        },
+        "collect_student": {
+            "method", "classification", "backend", "models", "dataset", "horizons", "policy",
+            "collection", "output"
+        },
+        "evaluate_libero": {
+            "method", "classification", "backend", "models", "dataset", "horizons", "policy",
+            "evaluation", "output"
+        },
+    }
+    if method not in root_fields:
+        raise ConfigError(f"unknown production method: {method!r}")
+    _reject_unknown(config, root_fields[method] | {"_config_path"}, "config")
     if expected_method is not None and method != expected_method:
         raise ConfigError(f"command expects method={expected_method!r}, config declares {method!r}")
     backend = _require(config, "backend", "config")
+    _reject_unknown(backend, {"lerobot_version", "expected_source_hashes", "local_files_only"}, "backend")
     if _require(backend, "lerobot_version", "backend") != LEROBOT_VERSION:
         raise ConfigError(f"backend.lerobot_version must be exactly {LEROBOT_VERSION}")
     hashes = backend.get("expected_source_hashes")
@@ -50,8 +117,10 @@ def validate_config(config: dict[str, Any], *, expected_method: str | None = Non
         raise ConfigError("backend.expected_source_hashes must be null or a module-name mapping")
 
     models = _require(config, "models", "config")
+    _reject_unknown(models, {"student", "teacher"}, "models")
     for name in ("student", "teacher"):
         asset = _require(models, name, "models")
+        _reject_unknown(asset, {"id", "revision", "processor_revision"}, f"models.{name}")
         if not str(_require(asset, "id", f"models.{name}")).strip():
             raise ConfigError(f"models.{name}.id must be nonempty")
         _revision(_require(asset, "revision", f"models.{name}"), f"models.{name}.revision")
@@ -61,6 +130,14 @@ def validate_config(config: dict[str, Any], *, expected_method: str | None = Non
         )
 
     dataset = _require(config, "dataset", "config")
+    _reject_unknown(
+        dataset,
+        {
+            "id", "revision", "cache", "manifest", "validation_fraction", "test_fraction",
+            "split_seed", "download_videos", "video_backend",
+        },
+        "dataset",
+    )
     if _require(dataset, "id", "dataset") != "lerobot/libero":
         raise ConfigError("the canonical expert dataset must be lerobot/libero")
     _revision(_require(dataset, "revision", "dataset"), "dataset.revision")
@@ -69,6 +146,7 @@ def validate_config(config: dict[str, Any], *, expected_method: str | None = Non
         raise ConfigError("validation/test fractions must be positive and sum to less than one")
 
     horizons = _require(config, "horizons", "config")
+    _reject_unknown(horizons, {"prediction", "execution"}, "horizons")
     if int(_require(horizons, "prediction", "horizons")) != 50:
         raise ConfigError("LIBERO prediction horizon is fixed at 50")
     execution = int(_require(horizons, "execution", "horizons"))
@@ -77,15 +155,200 @@ def validate_config(config: dict[str, Any], *, expected_method: str | None = Non
 
     training = config.get("training")
     if training is not None:
+        _reject_unknown(
+            training,
+            {
+                "seed", "device", "batch_size", "num_workers", "mixed_precision",
+                "gradient_accumulation", "gradient_clip_norm", "learning_rate", "weight_decay",
+                "betas", "epsilon", "warmup_steps", "minimum_lr_scale", "max_steps",
+                "validation_interval", "validation_batches", "checkpoint_interval",
+            },
+            "training",
+        )
         if int(training.get("batch_size", 0)) < 1 or int(training.get("max_steps", 0)) < 1:
             raise ConfigError("training.batch_size and training.max_steps must be positive")
         if training.get("mixed_precision", "bf16") not in {"no", "fp16", "bf16"}:
             raise ConfigError("training.mixed_precision must be no, fp16, or bf16")
         if int(training.get("gradient_accumulation", 0)) < 1:
             raise ConfigError("training.gradient_accumulation must be positive")
+    _reject_unknown(_require(config, "output", "config"), {"directory"}, "output")
+    if "preflight" in config:
+        _reject_unknown(config["preflight"], {"minimum_total_memory_gib"}, "preflight")
 
     if "capabilities" in json.dumps(config):
         raise ConfigError("capability declarations were removed; configure concrete assets instead")
+
+    tmd_fields = {
+        "variant", "attention_mode", "flow_matching_fraction", "normalization_constant",
+        "outer_time_shift_gamma", "inner_time_shift_gamma", "condition_dropout_probability",
+        "last_k_expert_blocks", "train_backbone_flow_blocks", "model_dim", "layers", "heads",
+        "feedforward_dim", "dropout", "inference_outer_steps", "inference_inner_steps",
+    }
+    if method in {"tmd_stage1", "occupancy_tmd"}:
+        tmd = _require(config, "tmd", "config")
+        _reject_unknown(tmd, tmd_fields, "tmd")
+        tmd_sections = [("tmd", tmd)]
+    else:
+        tmd_sections = []
+    if method == "tmd_stage2":
+        architecture = _require(config, "stage1_architecture", "config")
+        _reject_unknown(architecture, tmd_fields, "stage1_architecture")
+        tmd_sections.append(("stage1_architecture", architecture))
+    for name, value in tmd_sections:
+        if not 0 <= float(value["flow_matching_fraction"]) <= 1:
+            raise ConfigError(f"{name}.flow_matching_fraction must be in [0,1]")
+        if float(value.get("outer_time_shift_gamma", 1.0)) < 1 or float(
+            value.get("inner_time_shift_gamma", 1.0)
+        ) < 1:
+            raise ConfigError(f"{name} timestep shifts must be at least one")
+        if not 0 <= float(value.get("condition_dropout_probability", 0.0)) < 1:
+            raise ConfigError(f"{name}.condition_dropout_probability must be in [0,1)")
+        if int(value["inference_outer_steps"]) < 1 or int(value["inference_inner_steps"]) < 1:
+            raise ConfigError(f"{name} inference step counts must be positive")
+
+    if method in {"dmd2_flow", "tmd_stage2"}:
+        section_name = "dmd2" if method == "dmd2_flow" else "stage2"
+        objective = _require(config, section_name, "config")
+        objective_fields = {
+            "student_fine_tuning", "fake_score_variant", "fake_updates_per_generator",
+            "generation_steps", "generator_learning_rate", "fake_score_learning_rate",
+            "discriminator_learning_rate", "gan_weight", "vsd_normalization_epsilon",
+            "vsd_normalization",
+            "outer_time_shift_gamma", "teacher_device", "teacher_dtype", "fake_score_device",
+            "vsd_time", "gan_time", "fake_score_time", "discriminator", "resource_estimate",
+            "fake_score", "data_weight",
+        }
+        if method == "tmd_stage2":
+            objective_fields |= {
+                "stage1_checkpoint", "stage1_checkpoint_sha256", "stage1_outer_steps",
+                "stage1_inner_steps",
+            }
+        _reject_unknown(objective, objective_fields, section_name)
+        if "data_weight" in objective:
+            raise ConfigError(
+                f"{section_name}.data_weight is deprecated: faithful {method} has no SFT/data loss; "
+                "migrate to the paper config or an explicitly named hybrid ablation"
+            )
+        expected_normalization = (
+            "dmd2_teacher_residual_mean_abs"
+            if method == "dmd2_flow"
+            else "tmd_fake_teacher_difference_l1"
+        )
+        if objective.get("vsd_normalization") != expected_normalization:
+            raise ConfigError(
+                f"{section_name}.vsd_normalization must be {expected_normalization} for {method}"
+            )
+        if objective.get("fake_score_variant") != "pi05_clone" and "ablation" not in str(
+            config.get("classification", "")
+        ).lower():
+            raise ConfigError(f"baseline {method} must use fake_score_variant=pi05_clone")
+        if "fake_score" in objective and objective.get("fake_score_variant") != "lightweight":
+            raise ConfigError(
+                f"{section_name}.fake_score is only valid for the explicitly lightweight ablation"
+            )
+        discriminator = _require(objective, "discriminator", section_name)
+        if discriminator.get("variant") not in {"pi05_intermediate_features", "cached_vla_features"}:
+            raise ConfigError(
+                f"{section_name}.discriminator.variant must explicitly select paper or cached VLA features"
+            )
+        if (
+            discriminator["variant"] != "pi05_intermediate_features"
+            and "ablation" not in str(config.get("classification", "")).lower()
+        ):
+            raise ConfigError(f"baseline {method} must use the paper intermediate-feature discriminator")
+        if discriminator["variant"] == "pi05_intermediate_features":
+            _reject_unknown(
+                discriminator,
+                {"variant", "feature_source", "selected_layers", "hidden_dim", "time_embedding_dim"},
+                f"{section_name}.discriminator",
+            )
+            expected_source = "fake_score_features" if method == "dmd2_flow" else "teacher_features"
+            if discriminator.get("feature_source") != expected_source:
+                raise ConfigError(
+                    f"{section_name} paper discriminator requires feature_source={expected_source}"
+                )
+            selected = [int(value) for value in discriminator.get("selected_layers", [])]
+            if not selected or len(selected) != len(set(selected)) or min(selected) < 0:
+                raise ConfigError(f"{section_name}.discriminator.selected_layers must be nonempty and unique")
+        else:
+            _reject_unknown(
+                discriminator,
+                {"variant", "feature_source", "num_tasks", "model_dim", "layers", "heads"},
+                f"{section_name}.discriminator",
+            )
+            if discriminator.get("feature_source") != "cached_vla_features":
+                raise ConfigError(f"{section_name} cached discriminator must identify cached_vla_features")
+        for name in ("vsd_time", "gan_time", "fake_score_time"):
+            timing = _require(objective, name, section_name)
+            minimum = float(_require(timing, "minimum_time", f"{section_name}.{name}"))
+            maximum = float(_require(timing, "maximum_time", f"{section_name}.{name}"))
+            gamma = float(_require(timing, "time_shift_gamma", f"{section_name}.{name}"))
+            if not 0 <= minimum < maximum <= 1 or gamma < 1:
+                raise ConfigError(f"invalid {section_name}.{name} time range/shift")
+
+    if method == "collect_student":
+        _all_libero_tasks(_require(config["collection"], "benchmark", "collection"), "collection.benchmark")
+        _reject_unknown(
+            config["policy"],
+            {"method", "device", "checkpoint", "checkpoint_sha256", "outer_steps", "inner_steps"},
+            "policy",
+        )
+
+    if method == "occupancy_tmd":
+        _reject_unknown(
+            config["occupancy"],
+            {
+                "discriminator_checkpoint", "discriminator_checkpoint_sha256", "minimum_weight",
+                "maximum_weight", "temperature", "weight_sampler_outer_steps",
+                "weight_sampler_inner_steps", "rollout_mode",
+            },
+            "occupancy",
+        )
+
+    if method == "occupancy_discriminator":
+        occupancy = _require(config, "occupancy_discriminator", "config")
+        allowed = {
+            "variant", "window_length", "minimum_time", "maximum_time", "time_shift_gamma",
+            "selected_layers", "hidden_dim", "time_embedding_dim", "num_tasks", "model_dim",
+            "layers", "heads",
+        }
+        _reject_unknown(occupancy, allowed, "occupancy_discriminator")
+        if occupancy.get("variant") not in {"pi05_intermediate_features", "cached_vla_features"}:
+            raise ConfigError("occupancy_discriminator.variant must explicitly select a feature source")
+        configured = set(int(value) for value in config["rollouts"].get("configured_task_indices", []))
+        if configured != set(range(40)):
+            raise ConfigError("occupancy rollouts must configure all 40 global task indices")
+        minimum = float(_require(occupancy, "minimum_time", "occupancy_discriminator"))
+        maximum = float(_require(occupancy, "maximum_time", "occupancy_discriminator"))
+        gamma = float(_require(occupancy, "time_shift_gamma", "occupancy_discriminator"))
+        if not 0 <= minimum < maximum <= 1 or gamma < 1:
+            raise ConfigError("invalid occupancy discriminator time range/shift")
+
+    if method == "evaluate_libero":
+        policy = _require(config, "policy", "config")
+        policy_method = str(_require(policy, "method", "policy"))
+        if policy_method not in {
+            "pi05", "smolvla", "flow_sft", "tmd_stage1", "dmd2_flow", "tmd_stage2", "occupancy_tmd"
+        }:
+            raise ConfigError(f"unknown evaluation policy method: {policy_method}")
+        if policy_method == "pi05":
+            _reject_unknown(policy, {"method", "device", "num_steps"}, "policy")
+        elif policy_method == "smolvla":
+            _reject_unknown(
+                policy, {"method", "device", "sampler_mode", "num_steps", "classification"}, "policy"
+            )
+        else:
+            _reject_unknown(
+                policy,
+                {"method", "device", "checkpoint", "checkpoint_sha256", "outer_steps", "inner_steps"},
+                "policy",
+            )
+        if policy_method == "smolvla":
+            mode = str(_require(policy, "sampler_mode", "policy"))
+            if mode == "official" and ({"num_steps", "outer_steps"} & set(policy)):
+                raise ConfigError("official SmolVLA evaluation forbids step overrides")
+            if mode == "override" and "ablation" not in str(policy.get("classification", "")).lower():
+                raise ConfigError("SmolVLA override mode must be classified as an ablation")
 
 
 def load_config(path: str | Path, *, expected_method: str | None = None) -> dict[str, Any]:

@@ -1,25 +1,27 @@
 # Transition Matching Distillation
 
-`meanflow.py` samples independent outer/inner Gaussian sources, samples
-`0≤r≤s`, makes the configured Bernoulli fraction exactly use `r=s`, computes
-the total derivative with a JVP, stops gradients only through the constructed
-target, applies coordinate masks, and uses adaptive per-sample normalization.
-`heads.py` contains the primary `tmd_split_transformer_head` port and the
-explicitly non-paper-faithful `tmd_gru_head`. `program.py` couples those equations
-to real SmolVLA features/actions and the resumable trainer.
+Stage 1 samples real `x`, outer `x1`, shifted discrete outer time, transition
+`y=x1-x`, and independent inner `z`. Inner `s` is shifted; `r` is drawn from the
+inference grid with `r=s` on the configured fraction. The SmolVLA base velocity
+is retained:
 
-All action tensors are normalized `[B,50,32]`; only the first seven dimensions
-and nonterminal timesteps contribute. The early action expert is evaluated once
-per outer state. LeRobot 0.6.1 offers no supported partial-layer forward, so the
-repository-owned split transformer is the inner flow head. This is the closest
-supported SmolVLA architectural port, not an exact reproduction of the paper's
-native backbone. Its descending inner Euler convention is shared by training,
-Stage 2, and inference.
+```text
+b = v_SmolVLA(x_t,t,c)
+h = b + Delta(y_s,s,r,m)
+u = z - h
+```
 
-Public math helpers are `sample_meanflow_batch`, `meanflow_total_derivative`,
-`meanflow_loss`, and `integrate_inner_flow`; `MeanFlowBatch` records all sampled
-sources/times. `SplitTransformerMeanFlowHead` is primary and
-`GRUMeanFlowHead` adapted. `TMDStage1Program`, `sample_stage1_generator`, and
-`TMDStage2Program` own training/shared sampling/checkpoint refinement. Gaussian
-sources use Torch RNG on the action device; teacher results and MeanFlow targets
-are detached at their documented boundaries.
+The exact JVP implements MeanFlow and adaptive normalization masks padded steps
+and non-executable coordinates. Bidirectional action-token attention matches the
+joint SmolVLA action expert; causal is an explicit ablation. Zero `Delta`
+reproduces the SmolVLA transition for 1/2/4 inner steps.
+
+Stage 2 loads the immutable Stage-1 checkpoint and asserts the exact final-K
+expert-block trainability set survived construction. Each update builds
+`x_t=(1-t)x+t*x1` from real data, computes one main feature/base velocity,
+unrolls every inner step from independent `z`, returns `x_hat=x1-InnerFlow`, and
+applies VSD plus teacher-feature GAN. No Flow-SFT/data loss is present.
+
+This is a repository-owned SmolVLA action-space adaptation, not an exact native
+split of the video model used by the paper. Architecture fidelity and objective
+fidelity are labeled separately in configs and checkpoints.

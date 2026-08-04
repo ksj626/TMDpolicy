@@ -114,13 +114,36 @@ def build_episode_manifest(
 
     if repo_id != "lerobot/libero" or not re.fullmatch(r"[0-9a-f]{40}", revision):
         raise ValueError("build-expert requires lerobot/libero at an immutable Hub revision")
-    from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
+    from collections import defaultdict
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
     from tmd_policy.backends.lerobot.compatibility import verify_installed_lerobot
 
-    metadata = LeRobotDatasetMetadata(repo_id, root=root, revision=revision, token=token)
+    source = LeRobotDataset(
+        repo_id,
+        root=root,
+        revision=revision,
+        download_videos=False,
+        token=token,
+        video_backend="pyav",
+    )
+
+    if str(source.revision) != revision:
+        raise RuntimeError(
+            f"LeRobot resolved dataset revision {source.revision}, expected {revision}"
+        )
+
+    metadata = source.meta
+
+    tasks_by_episode: dict[int, set[int]] = defaultdict(set)
+    frame_metadata = source.reader.hf_dataset.select_columns(
+        ["episode_index", "task_index"]
+    )
+
+    for row in frame_metadata:
+        tasks_by_episode[int(row["episode_index"])].add(int(row["task_index"]))
     episode_to_task: dict[int, int] = {}
     for episode in range(int(metadata.total_episodes)):
-        indices = sorted(set(_task_indices(metadata, episode)))
+        indices = sorted(tasks_by_episode.get(episode, set()))
         if len(indices) != 1:
             raise RuntimeError(f"LIBERO episode {episode} has ambiguous task identities: {indices}")
         episode_to_task[episode] = indices[0]

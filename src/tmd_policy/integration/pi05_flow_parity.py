@@ -43,6 +43,7 @@ def run(config_path: str | Path, output_dir: str | Path, *, sample_index: int) -
         "validation",
         root=project_path(config["dataset"]["cache"]) / "datasets" / "lerobot--libero",
         download_videos=True,
+        video_backend=config["dataset"].get("video_backend"),
     )
     batch = next(iter(DataLoader(Subset(dataset, [sample_index]), batch_size=1)))
     processed = teacher.preprocess_observation(batch)

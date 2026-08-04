@@ -1,7 +1,9 @@
 method: compare_libero
 classification: paired motivation comparison across real policy evaluations
 inputs:
-  baseline: artifacts/evaluation/motivation_smolvla/evaluation.json
+  pi05_official: artifacts/evaluation/pi05_official/evaluation.json
+  smolvla_official10: artifacts/evaluation/smolvla_official10/evaluation.json
+  smolvla_4step_ablation: artifacts/evaluation/smolvla_4step_ablation/evaluation.json
   flow_sft: artifacts/evaluation/motivation_flow_sft/evaluation.json
   tmd_stage1: artifacts/evaluation/motivation_tmd_stage1/evaluation.json
   dmd2_flow: artifacts/evaluation/motivation_dmd2_flow/evaluation.json

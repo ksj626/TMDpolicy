@@ -14,9 +14,9 @@ import torch
 from tmd_policy.config import project_path, save_resolved_config
 from tmd_policy.backends.lerobot.compatibility import verify_installed_lerobot
 from tmd_policy.data.libero import load_episode_manifest
-from tmd_policy.rollout import RolloutEpisode, RolloutStore
+from tmd_policy.rollout import ReplanRecord, RolloutEpisode, RolloutStore
 
-from .policy import InferencePolicy, load_inference_policy
+from .policy import InferencePolicy, PI05InferencePolicy, load_inference_policy
 
 
 _SUITE_OFFSETS = {"libero_spatial": 0, "libero_object": 10, "libero_goal": 20, "libero_10": 30}
@@ -52,20 +52,26 @@ def _canonical_observation(raw: dict[str, Any], env_processor: Any) -> dict[str,
     return env_processor(preprocess_observation(raw))
 
 
-def _visual(observation: dict[str, Any]) -> torch.Tensor:
-    values = []
-    for key in sorted(key for key in observation if key.startswith("observation.images.")):
-        image = torch.as_tensor(observation[key]).float()
-        if image.ndim == 3:
-            image = image.unsqueeze(0)
-        values.append(image.mean(dim=(-2, -1))[0].cpu())
-        if len(values) == 2:
-            break
-    if not values:
-        raise RuntimeError("LIBERO observation contains no images")
-    while len(values) < 2:
-        values.append(torch.zeros_like(values[0]))
-    return torch.cat(values)
+def _stored_observations(
+    observation: dict[str, Any]
+) -> tuple[dict[str, torch.Tensor], dict[str, dict[str, Any]]]:
+    images = {
+        key: torch.as_tensor(value).detach().cpu().clone()
+        for key, value in observation.items()
+        if key.startswith("observation.images.") and not key.endswith("_is_pad")
+    }
+    if not images:
+        raise RuntimeError("LIBERO observation contains no canonical camera images")
+    metadata = {}
+    for key, value in images.items():
+        layouts = {3: "CHW", 4: "BCHW"}
+        metadata[key] = {
+            "shape": list(value.shape),
+            "dtype": str(value.dtype),
+            "layout": layouts.get(value.ndim, f"rank-{value.ndim}"),
+            "encoding": "lossless torch tensor",
+        }
+    return images, metadata
 
 
 def _success(info: Any) -> bool:
@@ -87,7 +93,7 @@ def _sync(device: torch.device, enabled: bool) -> None:
 def run_episode(
     env: Any,
     env_processor: Any,
-    policy: InferencePolicy,
+    policy: InferencePolicy | PI05InferencePolicy,
     *,
     instruction: str,
     reset_seed: int,
@@ -95,15 +101,15 @@ def run_episode(
     execution_horizon: int,
     max_steps: int,
     synchronize_cuda: bool,
-) -> tuple[dict[str, Any], dict[str, torch.Tensor]]:
+    replan_metadata: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
     from lerobot.envs.utils import NEW_ROLLOUT_OPTION
 
     policy.reset()
     raw, info = env.reset(seed=[reset_seed], options={NEW_ROLLOUT_OPTION: True})
     observation = _canonical_observation(raw, env_processor)
-    states = [torch.as_tensor(observation["observation.state"])[0, :8].float().cpu()]
     actions: list[torch.Tensor] = []
-    visuals: list[torch.Tensor] = []
+    replan_records: list[ReplanRecord] = []
     model_latencies: list[float] = []
     environment_latencies: list[float] = []
     successful = _success(info)
@@ -113,27 +119,66 @@ def run_episode(
         model_batch = dict(observation)
         model_batch["task"] = [instruction]
         seed = 100_000_007 * task_index + 10_007 * reset_seed + replans
-        _sync(policy.student.device, synchronize_cuda)
+        start_step = len(actions)
+        start_state = torch.as_tensor(observation["observation.state"])[0, :8].float().cpu().clone()
+        stored_images, image_metadata = _stored_observations(observation)
+        _sync(policy.device, synchronize_cuda)
         started = time.perf_counter()
         plan = policy.plan(model_batch, noise_seed=seed)[0].detach().cpu()
-        _sync(policy.student.device, synchronize_cuda)
+        _sync(policy.device, synchronize_cuda)
         model_latencies.append(time.perf_counter() - started)
+        if plan.shape != (50, 7):
+            raise RuntimeError(f"policy plan must be canonical [50,7], got {tuple(plan.shape)}")
+        executed_this_plan: list[torch.Tensor] = []
         for action in plan[:execution_horizon]:
             if len(actions) >= max_steps:
                 truncated_value = True
                 break
-            visuals.append(_visual(observation))
             environment_started = time.perf_counter()
             raw, _, terminated, truncated, info = env.step(action.numpy()[None])
             environment_latencies.append(time.perf_counter() - environment_started)
             actions.append(action.float())
+            executed_this_plan.append(action.float())
             observation = _canonical_observation(raw, env_processor)
-            states.append(torch.as_tensor(observation["observation.state"])[0, :8].float().cpu())
             terminated_value = bool(np.asarray(terminated).reshape(-1)[0])
             truncated_value = bool(np.asarray(truncated).reshape(-1)[0])
+            if len(actions) >= max_steps and not terminated_value:
+                truncated_value = True
             successful = successful or _success(info)
             if terminated_value or truncated_value:
                 break
+        executed_tensor = (
+            torch.stack(executed_this_plan)
+            if executed_this_plan
+            else torch.empty(0, 7, dtype=plan.dtype)
+        )
+        replan_records.append(
+            ReplanRecord(
+                suite=str(replan_metadata["suite"]),
+                suite_task_id=int(replan_metadata["suite_task_id"]),
+                global_task_index=task_index,
+                canonical_task_uid=str(replan_metadata["canonical_task_uid"]),
+                instruction=instruction,
+                reset_seed=reset_seed,
+                policy_checkpoint=str(replan_metadata["policy_checkpoint"]),
+                policy_checkpoint_sha256=str(replan_metadata["policy_checkpoint_sha256"]),
+                policy_version=str(replan_metadata["policy_version"]),
+                collection_round=int(replan_metadata["collection_round"]),
+                environment_step=start_step,
+                state=start_state,
+                observations=stored_images,
+                observation_metadata=image_metadata,
+                planned_actions=plan.float(),
+                executed_prefix_length=len(executed_this_plan),
+                executed_actions=executed_tensor,
+                terminated=terminated_value,
+                truncated=truncated_value,
+                success=successful,
+                model_revision=str(replan_metadata["model_revision"]),
+                processor_revision=str(replan_metadata["processor_revision"]),
+                dataset_revision=str(replan_metadata["dataset_revision"]),
+            )
+        )
         replans += 1
     if len(actions) >= max_steps and not terminated_value:
         truncated_value = True
@@ -143,11 +188,7 @@ def run_episode(
         if len(actions) > 1
         else torch.zeros(1)
     )
-    payload = {
-        "states": torch.stack(states),
-        "actions": action_path,
-        "visual": torch.stack(visuals),
-    }
+    payload = {"replans": tuple(replan_records)}
     metrics = {
         "success": successful,
         "terminated": terminated_value,
@@ -214,8 +255,8 @@ def summarize(episodes: list[dict[str, Any]]) -> dict[str, Any]:
 def evaluate_libero(config: dict[str, Any], output_dir: str | Path) -> dict[str, Any]:
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=False)
-    save_resolved_config(config, output / "resolved_config.yaml")
     policy, identity = load_inference_policy(config)
+    save_resolved_config(config, output / "resolved_config.yaml")
     evaluation = config["evaluation"]
     manifest = load_episode_manifest(project_path(config["dataset"]["manifest"]))
     from lerobot.envs.configs import LiberoEnv
@@ -262,6 +303,18 @@ def evaluate_libero(config: dict[str, Any], output_dir: str | Path) -> dict[str,
                         execution_horizon=int(config["horizons"]["execution"]),
                         max_steps=int(evaluation["max_episode_steps"]),
                         synchronize_cuda=bool(evaluation.get("synchronize_cuda", True)),
+                        replan_metadata={
+                            "suite": suite,
+                            "suite_task_id": task_id,
+                            "canonical_task_uid": task_uid,
+                            "policy_checkpoint": identity["checkpoint"],
+                            "policy_checkpoint_sha256": identity["checkpoint_sha256"],
+                            "policy_version": str(identity.get("training_global_step", "hub")),
+                            "collection_round": 0,
+                            "model_revision": identity["model_revision"],
+                            "processor_revision": identity["processor_revision"],
+                            "dataset_revision": config["dataset"]["revision"],
+                        },
                     )
                     row = {
                         "suite": suite,
@@ -275,20 +328,7 @@ def evaluate_libero(config: dict[str, Any], output_dir: str | Path) -> dict[str,
                     episodes.append(row)
                     if rollout_store is not None:
                         rollout_store.append(
-                            RolloutEpisode(
-                                **payload,
-                                task_index=dataset_task_index,
-                                canonical_task_uid=row["canonical_task_uid"],
-                                instruction=instruction,
-                                reset_seed=int(reset_seed),
-                                success=bool(metrics["success"]),
-                                terminated=bool(metrics["terminated"]),
-                                truncated=bool(metrics["truncated"]),
-                                policy_checkpoint=identity["checkpoint"],
-                                policy_checkpoint_sha256=identity["checkpoint_sha256"],
-                                collection_round=0,
-                                split="test",
-                            )
+                            RolloutEpisode(replans=payload["replans"], split="test")
                         )
         finally:
             for group in environments.values():
@@ -336,59 +376,59 @@ def collect_student_rollouts(config: dict[str, Any], output_dir: str | Path) -> 
         }
     )
     save_resolved_config(config, output / "resolved_config.yaml")
-    env_config = LiberoEnv(
-        task=collection["suite"],
-        task_ids=collection["task_ids"],
-        fps=int(collection.get("fps", 10)),
-        observation_height=256,
-        observation_width=256,
-        episode_length=int(collection["max_episode_steps"]),
-    )
-    env_processor, _ = env_config.get_env_processors()
-    environments = env_config.create_envs(n_envs=1, use_async_envs=False)
-    try:
-        for task_id in collection["task_ids"]:
-            env = environments[collection["suite"]][task_id]
-            instruction = str(env.call("task_description")[0])
-            dataset_task_index, task_uid = _canonical_task_identity(
-                manifest, collection["suite"], int(task_id), instruction
-            )
-            for split, seeds in (
-                ("train", collection["train_reset_seeds"]),
-                ("validation", collection["validation_reset_seeds"]),
-            ):
-                for reset_seed in seeds:
-                    metrics, payload = run_episode(
-                        env,
-                        env_processor,
-                        policy,
-                        instruction=instruction,
-                        reset_seed=int(reset_seed),
-                        task_index=dataset_task_index,
-                        execution_horizon=int(config["horizons"]["execution"]),
-                        max_steps=int(collection["max_episode_steps"]),
-                        synchronize_cuda=True,
-                    )
-                    store.append(
-                        RolloutEpisode(
-                            **payload,
-                            task_index=dataset_task_index,
-                            canonical_task_uid=task_uid,
+    for suite_spec in collection["benchmark"]:
+        suite = str(suite_spec["suite"])
+        task_ids = [int(value) for value in suite_spec["task_ids"]]
+        env_config = LiberoEnv(
+            task=suite,
+            task_ids=task_ids,
+            fps=int(collection.get("fps", 10)),
+            observation_height=256,
+            observation_width=256,
+            episode_length=int(collection["max_episode_steps"]),
+        )
+        env_processor, _ = env_config.get_env_processors()
+        environments = env_config.create_envs(n_envs=1, use_async_envs=False)
+        try:
+            for task_id in task_ids:
+                env = environments[suite][task_id]
+                instruction = str(env.call("task_description")[0])
+                dataset_task_index, task_uid = _canonical_task_identity(
+                    manifest, suite, int(task_id), instruction
+                )
+                for split, seeds in (
+                    ("train", collection["train_reset_seeds"]),
+                    ("validation", collection["validation_reset_seeds"]),
+                ):
+                    for reset_seed in seeds:
+                        _, payload = run_episode(
+                            env,
+                            env_processor,
+                            policy,
                             instruction=instruction,
                             reset_seed=int(reset_seed),
-                            success=bool(metrics["success"]),
-                            terminated=bool(metrics["terminated"]),
-                            truncated=bool(metrics["truncated"]),
-                            policy_checkpoint=identity["checkpoint"],
-                            policy_checkpoint_sha256=identity["checkpoint_sha256"],
-                            collection_round=int(collection["collection_round"]),
-                            split=split,
+                            task_index=dataset_task_index,
+                            execution_horizon=int(config["horizons"]["execution"]),
+                            max_steps=int(collection["max_episode_steps"]),
+                            synchronize_cuda=True,
+                            replan_metadata={
+                                "suite": suite,
+                                "suite_task_id": task_id,
+                                "canonical_task_uid": task_uid,
+                                "policy_checkpoint": identity["checkpoint"],
+                                "policy_checkpoint_sha256": identity["checkpoint_sha256"],
+                                "policy_version": str(identity.get("training_global_step", "hub")),
+                                "collection_round": int(collection["collection_round"]),
+                                "model_revision": identity["model_revision"],
+                                "processor_revision": identity["processor_revision"],
+                                "dataset_revision": config["dataset"]["revision"],
+                            },
                         )
-                    )
-    finally:
-        for group in environments.values():
-            for env in group.values():
-                env.close()
+                        store.append(RolloutEpisode(replans=payload["replans"], split=split))
+        finally:
+            for group in environments.values():
+                for env in group.values():
+                    env.close()
     report = store.validate()
     (output / "collection_report.json").write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return report

@@ -29,17 +29,20 @@ horizons:
 policy:
   method: tmd_stage1
   checkpoint: artifacts/training/tmd_stage1/checkpoints/final.pt
-  checkpoint_sha256: REPLACE_WITH_SHA256_FROM_sha256sum
+  checkpoint_sha256: auto
   device: cuda:0
   outer_steps: 2
   inner_steps: 2
 collection:
-  suite: libero_10
   fps: 10
-  task_ids: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+  benchmark:
+    - {suite: libero_spatial, task_ids: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]}
+    - {suite: libero_object, task_ids: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]}
+    - {suite: libero_goal, task_ids: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]}
+    - {suite: libero_10, task_ids: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]}
   train_reset_seeds: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
   validation_reset_seeds: [16, 17, 18, 19]
   max_episode_steps: 600
   collection_round: 0
 output:
-  directory: artifacts/rollouts/motivation_student
+  directory: artifacts/rollouts/all40_student

@@ -1,0 +1,35 @@
+method: tmd_stage2
+classification: TMD Stage-2 cached VLA feature ablation
+backend: {lerobot_version: "0.6.1", expected_source_hashes: null, local_files_only: false}
+models:
+  student: {id: lerobot/smolvla_libero, revision: 31d453f7edd78c839a8bbc39744a292686daf0de, processor_revision: 31d453f7edd78c839a8bbc39744a292686daf0de}
+  teacher: {id: lerobot/pi05_libero_finetuned, revision: 8e174154ef5f6c60a8da12ae99c303d8963138c1, processor_revision: 8e174154ef5f6c60a8da12ae99c303d8963138c1}
+dataset: {id: lerobot/libero, revision: a1aaacb7f6cd6ee5fb43120f673cebb0cfea7dd4, cache: .cache/lerobot, manifest: artifacts/data/libero_expert/episode_manifest.json, validation_fraction: 0.1, test_fraction: 0.1, split_seed: 17, download_videos: true, video_backend: pyav}
+horizons: {prediction: 50, execution: 10}
+training: {seed: 7, device: cuda:0, batch_size: 4, num_workers: 0, mixed_precision: bf16, gradient_accumulation: 8, gradient_clip_norm: 1.0, learning_rate: 1.0e-5, weight_decay: 1.0e-4, betas: [0.9, 0.95], epsilon: 1.0e-8, warmup_steps: 1000, minimum_lr_scale: 0.05, max_steps: 100000, validation_interval: 500, validation_batches: 8, checkpoint_interval: 1000}
+stage1_architecture: {variant: tmd_split_transformer_head, attention_mode: bidirectional, flow_matching_fraction: 0.75, normalization_constant: 350.0, outer_time_shift_gamma: 10.0, inner_time_shift_gamma: 3.0, condition_dropout_probability: 0.1, last_k_expert_blocks: 4, train_backbone_flow_blocks: true, model_dim: 512, layers: 4, heads: 8, feedforward_dim: 2048, dropout: 0.0, inference_outer_steps: 2, inference_inner_steps: 2}
+stage2:
+  stage1_checkpoint: artifacts/training/tmd_stage1/checkpoints/final.pt
+  stage1_checkpoint_sha256: auto
+  stage1_outer_steps: 2
+  stage1_inner_steps: 2
+  student_fine_tuning: tmd_preserve_stage1
+  fake_score_variant: pi05_clone
+  fake_updates_per_generator: 5
+  generation_steps: 2
+  generator_learning_rate: 1.0e-5
+  fake_score_learning_rate: 1.0e-5
+  discriminator_learning_rate: 1.0e-5
+  gan_weight: 0.03
+  vsd_normalization: tmd_fake_teacher_difference_l1
+  vsd_normalization_epsilon: 1.0e-6
+  outer_time_shift_gamma: 10.0
+  teacher_device: cuda:1
+  teacher_dtype: bfloat16
+  fake_score_device: cuda:1
+  vsd_time: {minimum_time: 0.001, maximum_time: 0.999, time_shift_gamma: 5.0}
+  gan_time: {minimum_time: 0.001, maximum_time: 0.999, time_shift_gamma: 5.0}
+  fake_score_time: {minimum_time: 0.001, maximum_time: 0.999, time_shift_gamma: 5.0}
+  discriminator: {variant: cached_vla_features, feature_source: cached_vla_features, num_tasks: 40, model_dim: 256, layers: 3, heads: 8}
+preflight: {minimum_total_memory_gib: {cuda:0: 23.5, cuda:1: 23.5}}
+output: {directory: artifacts/training/tmd_stage2_cached_vla_ablation}

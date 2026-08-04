@@ -1,3 +1,3 @@
-from .store import ROLLOUT_SCHEMA, RolloutEpisode, RolloutStore
+from .store import ROLLOUT_SCHEMA, ReplanRecord, RolloutEpisode, RolloutStore
 
-__all__ = ["ROLLOUT_SCHEMA", "RolloutEpisode", "RolloutStore"]
+__all__ = ["ROLLOUT_SCHEMA", "ReplanRecord", "RolloutEpisode", "RolloutStore"]

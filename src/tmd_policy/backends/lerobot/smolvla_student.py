@@ -28,6 +28,11 @@ class SmolVLAConditionCache:
     processor_revision: str
     dtype: str
     device: str
+    pooled_visual_features: Tensor
+    pooled_language_features: Tensor
+    pooled_state_features: Tensor
+    condition_features: Tensor
+    feature_identity: dict[str, Any]
 
 
 def _unique_parameters(modules: list[nn.Module]) -> set[int]:
@@ -188,6 +193,40 @@ class LeRobotSmolVLAStudent(nn.Module):
         self.trainable_parameter_names = names
         return names
 
+    def configure_tmd_trainable(
+        self, *, last_k_expert_blocks: int, train_backbone_flow_blocks: bool
+    ) -> tuple[str, ...]:
+        """Select the exact Stage-1/Stage-2 TMD parameter set without generic overrides."""
+
+        layers = list(self.flow.vlm_with_expert.lm_expert.layers)
+        if not 1 <= last_k_expert_blocks < len(layers):
+            raise ValueError(f"last_k_expert_blocks must be in [1,{len(layers) - 1}]")
+        self.policy.requires_grad_(False)
+        if train_backbone_flow_blocks:
+            modules = [*layers[-last_k_expert_blocks:], *self._head_modules()]
+            selected = _unique_parameters(modules)
+            for parameter in self.policy.parameters():
+                parameter.requires_grad_(id(parameter) in selected)
+        names = tuple(name for name, parameter in self.policy.named_parameters() if parameter.requires_grad)
+        if train_backbone_flow_blocks and not any("lm_expert.layers" in name for name in names):
+            raise RuntimeError("TMD selected no final expert-block parameters")
+        self.trainable_parameter_names = names
+        return names
+
+    @property
+    def condition_feature_identity(self) -> dict[str, Any]:
+        hidden = int(self.flow.vlm_with_expert.config.text_config.hidden_size)
+        return {
+            "encoder_model_id": self.model_id,
+            "encoder_model_revision": self.model_revision,
+            "processor_revision": self.processor_revision,
+            "feature_layer": "smolvla.embed_prefix.inputs",
+            "dtype": str(next(self.policy.parameters()).dtype),
+            "feature_dimension": 3 * hidden,
+            "components": ["pooled_visual", "pooled_language", "pooled_state"],
+            "detached": True,
+        }
+
     def flow_matching_loss(self, canonical_batch: dict[str, Any], *, reduction: str = "mean") -> Tensor:
         processed = self.preprocess_observation(canonical_batch)
         result = self.policy(processed, reduction=reduction)
@@ -205,6 +244,29 @@ class LeRobotSmolVLAStudent(nn.Module):
         prefix, prefix_pad, prefix_att = self.flow.embed_prefix(
             images, image_masks, language, language_mask, state=state
         )
+        state_positions = prefix_att.bool() & prefix_pad.bool()
+        state_count = state_positions.sum(dim=1)
+        if torch.any(state_count == 0):
+            raise RuntimeError("SmolVLA prefix contains no state-conditioned token")
+        state_weight = state_positions.to(prefix.dtype).unsqueeze(-1)
+        state_features = (prefix * state_weight).sum(dim=1) / state_weight.sum(dim=1).clamp_min(1)
+
+        # LeRobot constructs prefix tokens as cameras, language, state, padding.
+        # The state attention marker provides an exact boundary even when the
+        # language padding mask contains false tokens.
+        state_start = state_positions.float().argmax(dim=1)
+        language_length = int(language.shape[1])
+        positions = torch.arange(prefix.shape[1], device=prefix.device)[None]
+        language_positions = (positions >= (state_start - language_length)[:, None]) & (
+            positions < state_start[:, None]
+        )
+        language_positions &= prefix_pad.bool()
+        language_weight = language_positions.to(prefix.dtype).unsqueeze(-1)
+        language_features = (prefix * language_weight).sum(dim=1) / language_weight.sum(dim=1).clamp_min(1)
+        visual_positions = (positions < (state_start - language_length)[:, None]) & prefix_pad.bool()
+        visual_weight = visual_positions.to(prefix.dtype).unsqueeze(-1)
+        visual_features = (prefix * visual_weight).sum(dim=1) / visual_weight.sum(dim=1).clamp_min(1)
+        condition_features = torch.cat((visual_features, language_features, state_features), dim=-1).detach()
         attention = make_att_2d_masks(prefix_pad, prefix_att)
         positions = torch.cumsum(prefix_pad, dim=1) - 1
         _, past = self.flow.vlm_with_expert.forward(
@@ -223,6 +285,15 @@ class LeRobotSmolVLAStudent(nn.Module):
             processor_revision=self.processor_revision,
             dtype=str(next(self.policy.parameters()).dtype),
             device=str(self.device),
+            pooled_visual_features=visual_features.detach(),
+            pooled_language_features=language_features.detach(),
+            pooled_state_features=state_features.detach(),
+            condition_features=condition_features,
+            feature_identity={
+                **self.condition_feature_identity,
+                "dtype": str(condition_features.dtype),
+                "feature_dimension": int(condition_features.shape[-1]),
+            },
         )
 
     def velocity(self, condition: SmolVLAConditionCache, x_t: Tensor, t: Tensor) -> Tensor:

@@ -55,37 +55,39 @@ stage1_architecture:
   heads: 8
   feedforward_dim: 2048
   dropout: 0.0
+  inference_outer_steps: 2
+  inference_inner_steps: 2
 stage2:
   stage1_checkpoint: artifacts/training/tmd_stage1/checkpoints/final.pt
-  stage1_checkpoint_sha256: REPLACE_WITH_SHA256_FROM_sha256sum
+  stage1_checkpoint_sha256: auto
   stage1_outer_steps: 2
   stage1_inner_steps: 2
-  student_fine_tuning: head_only
-  fake_score_variant: lightweight
+  student_fine_tuning: tmd_preserve_stage1
+  fake_score_variant: pi05_clone
   fake_updates_per_generator: 5
   generation_steps: 2
   generator_learning_rate: 1.0e-5
   fake_score_learning_rate: 1.0e-4
   discriminator_learning_rate: 1.0e-4
   gan_weight: 0.003
-  data_weight: 0.1
-  minimum_score_time: 0.01
-  maximum_score_time: 0.99
+  vsd_normalization: tmd_fake_teacher_difference_l1
+  vsd_normalization_epsilon: 1.0e-6
+  outer_time_shift_gamma: 10.0
   teacher_device: cuda:1
   teacher_dtype: bfloat16
-  fake_score_device: cuda:0
-  fake_score:
-    num_tasks: 40
-    model_dim: 256
-    layers: 4
-    heads: 8
-    feedforward_dim: 1024
+  fake_score_device: cuda:1
+  vsd_time: {minimum_time: 0.001, maximum_time: 0.999, time_shift_gamma: 5.0}
+  gan_time: {minimum_time: 0.001, maximum_time: 0.999, time_shift_gamma: 5.0}
+  fake_score_time: {minimum_time: 0.001, maximum_time: 0.999, time_shift_gamma: 5.0}
   discriminator:
-    num_tasks: 40
-    model_dim: 192
-    layers: 3
-    heads: 6
+    variant: pi05_intermediate_features
+    feature_source: teacher_features
+    selected_layers: [5, 11, 17]
+    hidden_dim: 512
+    time_embedding_dim: 32
   resource_estimate:
     recommendation: two 24+ GiB GPUs; Stage-1 identity is immutable
 output:
   directory: artifacts/training/tmd_stage2
+preflight:
+  minimum_total_memory_gib: {cuda:0: 23.5, cuda:1: 23.5}

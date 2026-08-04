@@ -1,47 +1,47 @@
 # Configuration reference
 
-All experiment YAML is fully resolved and immutable-asset oriented.
+All assets require immutable 40-character Hub revisions and LeRobot `0.6.1`.
+Unknown method variants and deprecated faithful-objective fields fail before
+model loading. In particular, `data_weight` is an error for `dmd2_flow` and
+`tmd_stage2`.
 
-Shared fields:
+Faithful method configs:
 
-- `method`, `classification`: concrete builder identity and truthful fidelity label.
-- `backend.lerobot_version`: exactly `0.6.1`; `expected_source_hashes` optionally
-  pins the four imported module hashes; `local_files_only` forbids Hub fetches.
-- `models.{student,teacher}.{id,revision,processor_revision}`: Hub identity and
-  40-character immutable commits.
-- `dataset.id`, `revision`, `cache`, `manifest`: `lerobot/libero`, immutable
-  commit, repo-local cache, and episode manifest. Fractions/seed define the
-  task-stratified episode split. Video fields configure the real reader.
-- `horizons.prediction/execution`: `[50,10]` by default.
-- `training`: seed, device, batch/workers, precision, accumulation, clipping,
-  AdamW hyperparameters, warmup/cosine floor, maximum optimizer cycles,
-  validation/checkpoint intervals, and validation batch limit.
-- `output.directory`: safe default; CLI `--output` may override it.
+- `dmd2_flow_paper.yaml`: `pi05_clone`, fake-score layer features, no SFT.
+- `tmd_stage1_action_head.yaml`: bidirectional action head, corrected base
+  preconditioning, shifted/discrete TM-MF.
+- `tmd_stage2_paper.yaml`: automatic immutable Stage-1 SHA, `pi05_clone`, teacher
+  layer features, real-data outer transitions, no SFT.
+- `occupancy_discriminator_paper.yaml`: all-40-task v2 replans and PI0.5 features.
 
-Method fields:
+Named adaptations are `dmd2_flow_cached_vla_ablation.yaml`,
+`tmd_stage2_cached_vla_ablation.yaml`, and
+`occupancy_discriminator_cached_vla.yaml`. They never masquerade as paper
+feature defaults.
 
-- `fine_tuning`: Flow-SFT mode (`head_only`, `expert_only`, `lora`, `full`) and
-  LoRA rank/alpha/dropout.
-- `tmd`: head variant, `r=s` fraction, adaptive constant, early/last expert
-  split, transformer/GRU dimensions, dropout, and inference steps.
-- `dmd2`: student mode, fake variant, TTUR, shared generation steps, optimizer
-  rates, GAN/data weights, explicit score-time interval, device placement,
-  network dimensions, and resource estimate.
-- `stage1_architecture`/`stage2`: exact Stage-1 reconstruction and checkpoint
-  SHA, shared sampler steps, then DMD2-v fields.
-- `rollouts`: versioned store and window stride.
-- `occupancy_model`: window/model dimensions and train-only normalization cap.
-- `occupancy`: discriminator checkpoint/SHA, density-ratio clipping/temperature,
-  weight-sampler steps and the explicit fixed-checkpoint off-policy rollout mode.
-- `parity`: device/dtype/fixed steps/noise seed/minimum score time.
-- `policy`: inference method, checkpoint/SHA, device, outer/inner steps.
-- `collection`: suite/tasks, disjoint reset-seed splits, horizon, and round.
-- `evaluation`: suite/task matrix, paired reset seeds, episode horizon, rollout
-  saving, and CUDA synchronization. Comparison bootstrap count/confidence/seed
-  live under `statistics` in the experiment config.
-- `inputs`/`statistics`: named evaluation JSON paths (including `baseline`),
-  exact pairing keys, bootstrap resample count, confidence, and RNG seed.
+Time sections `vsd_time`, `gan_time`, and `fake_score_time` require
+`0 <= minimum_time < maximum_time <= 1` and `time_shift_gamma >= 1`. TMD Stage 1
+separately configures outer and inner shifts, the discrete inference inner-step
+grid, condition dropout, `r=s` fraction, and adaptive normalization.
 
-The Stage-1 and occupancy checkpoint SHA placeholders must be replaced after
-their upstream run. No `lerobot_commit`, executability declaration, or synthetic
-research runner field exists.
+`discriminator.feature_source` is explicitly `fake_score_features` for DMD2 and
+`teacher_features` for TMD Stage 2. Selected layers and separate-head aggregation
+are stored in provenance. Cached condition identity includes encoder/processor
+revision, layer, dtype, dimension, components, and detach policy.
+
+`vsd_normalization` is method-locked: DMD2 uses
+`dmd2_teacher_residual_mean_abs`, while TMD Stage 2 uses
+`tmd_fake_teacher_difference_l1`. A config cannot silently exchange them.
+
+Checkpoint hashes may be `auto`: the exact file SHA-256 is computed, validated,
+inserted into the in-memory config, and written to the run's resolved YAML before
+training/evaluation. There are no unresolved placeholder hashes.
+
+Evaluation configs distinguish `pi05`, SmolVLA `official`, and SmolVLA
+`override`. Official SmolVLA forbids `num_steps`; override requires an ablation
+classification. Collection configs must enumerate the four suites and every
+local task 0–9. Occupancy configs must enumerate global task indices 0–39.
+
+`preflight.minimum_total_memory_gib` is a per-device hard floor. A failed
+preflight reports the requested component device and detected memory and never
+substitutes a smaller score/discriminator.

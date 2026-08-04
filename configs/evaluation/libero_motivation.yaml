@@ -29,7 +29,7 @@ horizons:
 policy:
   method: flow_sft
   checkpoint: artifacts/training/flow_sft/checkpoints/final.pt
-  checkpoint_sha256: REPLACE_WITH_SHA256_FROM_sha256sum
+  checkpoint_sha256: auto
   device: cuda:0
   outer_steps: 4
   inner_steps: 2

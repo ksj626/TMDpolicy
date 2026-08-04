@@ -1,4 +1,4 @@
-"""Versioned complete-episode student rollout storage."""
+"""Atomic versioned LIBERO replan-record storage for occupancy estimation."""
 
 from __future__ import annotations
 
@@ -11,102 +11,278 @@ from typing import Any, Literal
 import torch
 from torch import Tensor
 
-ROLLOUT_SCHEMA = "tmdpolicy.libero-rollout/v1"
+ROLLOUT_SCHEMA = "tmdpolicy.libero-replans/v2"
+_SUITE_OFFSETS = {"libero_spatial": 0, "libero_object": 10, "libero_goal": 20, "libero_10": 30}
+
+
+def _sha256(value: str, field: str) -> None:
+    if len(value) != 64 or any(character not in "0123456789abcdef" for character in value.lower()):
+        raise ValueError(f"{field} must be a SHA-256 hex digest")
+
+
+@dataclass(frozen=True)
+class ReplanRecord:
+    suite: str
+    suite_task_id: int
+    global_task_index: int
+    canonical_task_uid: str
+    instruction: str
+    reset_seed: int
+    policy_checkpoint: str
+    policy_checkpoint_sha256: str
+    policy_version: str
+    collection_round: int
+    environment_step: int
+    state: Tensor
+    observations: dict[str, Tensor]
+    observation_metadata: dict[str, dict[str, Any]]
+    planned_actions: Tensor
+    executed_prefix_length: int
+    executed_actions: Tensor
+    terminated: bool
+    truncated: bool
+    success: bool
+    model_revision: str
+    processor_revision: str
+    dataset_revision: str
+
+    def __post_init__(self) -> None:
+        if self.suite not in {"libero_spatial", "libero_object", "libero_goal", "libero_10"}:
+            raise ValueError(f"unknown LIBERO suite: {self.suite}")
+        if not 0 <= self.suite_task_id < 10 or not 0 <= self.global_task_index < 40:
+            raise ValueError("LIBERO task identities are outside the all-40-task contract")
+        if self.global_task_index != _SUITE_OFFSETS[self.suite] + self.suite_task_id:
+            raise ValueError("suite-local and global LIBERO task identities disagree")
+        if not self.canonical_task_uid or not self.instruction:
+            raise ValueError("canonical task UID and instruction must be nonempty")
+        if self.state.shape != (8,) or not torch.isfinite(self.state).all():
+            raise ValueError("replan-start state must be finite [8]")
+        if self.planned_actions.shape != (50, 7) or not torch.isfinite(self.planned_actions).all():
+            raise ValueError("full canonical planned action chunk must be finite [50,7]")
+        if not 0 <= self.executed_prefix_length <= 50:
+            raise ValueError("executed prefix length must be in [0,50]")
+        if self.executed_actions.shape != (self.executed_prefix_length, 7):
+            raise ValueError("executed actions must exactly match the executed prefix length")
+        if not torch.equal(
+            self.executed_actions.float(), self.planned_actions[: self.executed_prefix_length].float()
+        ):
+            raise ValueError("executed actions are not the recorded plan prefix")
+        if not self.observations:
+            raise ValueError("a replan record must retain canonical camera observations")
+        if set(self.observations) != set(self.observation_metadata):
+            raise ValueError("observation metadata must cover every stored camera")
+        for key, image in self.observations.items():
+            metadata = self.observation_metadata[key]
+            if list(image.shape) != list(metadata.get("shape", [])):
+                raise ValueError(f"observation shape metadata mismatch for {key}")
+            if str(image.dtype) != metadata.get("dtype"):
+                raise ValueError(f"observation dtype metadata mismatch for {key}")
+            if image.dtype.is_floating_point and not torch.isfinite(image).all():
+                raise ValueError(f"observation contains non-finite pixels: {key}")
+        _sha256(self.policy_checkpoint_sha256, "policy_checkpoint_sha256")
+        for revision in (self.model_revision, self.processor_revision, self.dataset_revision):
+            if len(revision) != 40:
+                raise ValueError("model/processor/dataset revisions must be immutable Hub commits")
 
 
 @dataclass(frozen=True)
 class RolloutEpisode:
-    states: Tensor
-    actions: Tensor
-    visual: Tensor
-    task_index: int
-    canonical_task_uid: str
-    instruction: str
-    reset_seed: int
-    success: bool
-    terminated: bool
-    truncated: bool
-    policy_checkpoint: str
-    policy_checkpoint_sha256: str
-    collection_round: int
+    replans: tuple[ReplanRecord, ...]
     split: Literal["train", "validation", "test"]
 
     def __post_init__(self) -> None:
-        length = self.actions.shape[0]
-        if self.states.shape != (length + 1, 8):
-            raise ValueError("rollout states must be [T+1,8]")
-        if self.actions.shape[1:] != (7,) or self.visual.shape != (length, 6):
-            raise ValueError("rollout actions/visual must be [T,7]/[T,6]")
-        for value in (self.states, self.actions, self.visual):
-            if not torch.isfinite(value).all():
-                raise ValueError("rollout tensors must be finite")
-        if length < 1 or self.reset_seed < 0 or self.collection_round < 0:
-            raise ValueError("rollout length/seed/round must be valid")
-        if len(self.policy_checkpoint_sha256) != 64:
-            raise ValueError("rollout must record a SHA-256 producing checkpoint identity")
+        if self.split not in {"train", "validation", "test"}:
+            raise ValueError(f"unknown rollout split: {self.split}")
+        if not self.replans:
+            raise ValueError("rollout episode must contain at least one real replan record")
+        first = self.replans[0]
+        identity = (
+            first.suite,
+            first.suite_task_id,
+            first.global_task_index,
+            first.canonical_task_uid,
+            first.instruction,
+            first.reset_seed,
+            first.policy_checkpoint,
+            first.policy_checkpoint_sha256,
+            first.policy_version,
+            first.collection_round,
+            first.model_revision,
+            first.processor_revision,
+            first.dataset_revision,
+        )
+        if any(
+            (
+                value.suite,
+                value.suite_task_id,
+                value.global_task_index,
+                value.canonical_task_uid,
+                value.instruction,
+                value.reset_seed,
+                value.policy_checkpoint,
+                value.policy_checkpoint_sha256,
+                value.policy_version,
+                value.collection_round,
+                value.model_revision,
+                value.processor_revision,
+                value.dataset_revision,
+            )
+            != identity
+            for value in self.replans
+        ):
+            raise ValueError("all replans in an episode must share suite/task/reset identity")
+        actual_steps = [value.environment_step for value in self.replans]
+        for left, right in zip(self.replans, self.replans[1:], strict=False):
+            if right.environment_step != left.environment_step + left.executed_prefix_length:
+                raise ValueError("replan steps must advance by the actual executed prefix length")
+        if any(value.terminated or value.truncated for value in self.replans[:-1]):
+            raise ValueError("only the final replan may terminate or truncate an episode")
 
 
 class RolloutStore:
     def __init__(self, root: str | Path) -> None:
         self.root = Path(root)
         self.episodes = self.root / "episodes"
-        self.index_path = self.root / "episodes.jsonl"
+        self.index_path = self.root / "episodes.json"
 
     def initialize(self, metadata: dict[str, Any]) -> None:
         self.root.mkdir(parents=True, exist_ok=False)
         self.episodes.mkdir()
         manifest = {"schema": ROLLOUT_SCHEMA, **metadata}
-        (self.root / "manifest.json").write_text(
-            json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-        )
+        target = self.root / "manifest.json"
+        temporary = target.with_suffix(".partial")
+        temporary.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        os.replace(temporary, target)
+        self._write_index([])
+
+    def _manifest(self) -> dict[str, Any]:
+        path = self.root / "manifest.json"
+        if not path.exists():
+            raise RuntimeError("rollout store must be initialized before use")
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+        if manifest.get("schema") != ROLLOUT_SCHEMA:
+            raise ValueError(
+                f"unsupported rollout schema {manifest.get('schema')!r}; v1 episode windows cannot "
+                "be reinterpreted as v2 replan records and must be recollected"
+            )
+        return manifest
+
+    def _write_index(self, rows: list[dict[str, Any]]) -> None:
+        temporary = self.index_path.with_suffix(".partial")
+        temporary.write_text(json.dumps(rows, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        os.replace(temporary, self.index_path)
+
+    @staticmethod
+    def _record_payload(record: ReplanRecord) -> dict[str, Any]:
+        return {
+            "suite": record.suite,
+            "suite_task_id": record.suite_task_id,
+            "global_task_index": record.global_task_index,
+            "canonical_task_uid": record.canonical_task_uid,
+            "instruction": record.instruction,
+            "reset_seed": record.reset_seed,
+            "policy_checkpoint": record.policy_checkpoint,
+            "policy_checkpoint_sha256": record.policy_checkpoint_sha256,
+            "policy_version": record.policy_version,
+            "collection_round": record.collection_round,
+            "environment_step": record.environment_step,
+            "state": record.state.cpu(),
+            "observations": {key: value.cpu() for key, value in record.observations.items()},
+            "observation_metadata": record.observation_metadata,
+            "planned_actions": record.planned_actions.cpu(),
+            "executed_prefix_length": record.executed_prefix_length,
+            "executed_actions": record.executed_actions.cpu(),
+            "terminated": record.terminated,
+            "truncated": record.truncated,
+            "success": record.success,
+            "model_revision": record.model_revision,
+            "processor_revision": record.processor_revision,
+            "dataset_revision": record.dataset_revision,
+        }
 
     def append(self, episode: RolloutEpisode) -> dict[str, Any]:
-        if not (self.root / "manifest.json").exists():
-            raise RuntimeError("rollout store must be initialized before append")
-        episode_id = sum(1 for _ in self.records())
+        self._manifest()
+        rows = self.records()
+        episode_id = len(rows)
         filename = f"episode-{episode_id:06d}.pt"
         target = self.episodes / filename
         temporary = target.with_suffix(".partial")
-        torch.save(
-            {"states": episode.states.cpu(), "actions": episode.actions.cpu(), "visual": episode.visual.cpu()},
-            temporary,
-        )
+        torch.save({"replans": [self._record_payload(value) for value in episode.replans]}, temporary)
         os.replace(temporary, target)
+        first, last = episode.replans[0], episode.replans[-1]
         row = {
             "episode_id": episode_id,
             "payload": f"episodes/{filename}",
-            "length": int(episode.actions.shape[0]),
-            "task_index": episode.task_index,
-            "canonical_task_uid": episode.canonical_task_uid,
-            "instruction": episode.instruction,
-            "reset_seed": episode.reset_seed,
-            "success": episode.success,
-            "terminated": episode.terminated,
-            "truncated": episode.truncated,
-            "policy_checkpoint": episode.policy_checkpoint,
-            "policy_checkpoint_sha256": episode.policy_checkpoint_sha256,
-            "collection_round": episode.collection_round,
+            "replans": len(episode.replans),
+            "executed_steps": sum(value.executed_prefix_length for value in episode.replans),
+            "suite": first.suite,
+            "suite_task_id": first.suite_task_id,
+            "global_task_index": first.global_task_index,
+            "canonical_task_uid": first.canonical_task_uid,
+            "instruction": first.instruction,
+            "reset_seed": first.reset_seed,
+            "success": last.success,
+            "terminated": last.terminated,
+            "truncated": last.truncated,
+            "policy_checkpoint": first.policy_checkpoint,
+            "policy_checkpoint_sha256": first.policy_checkpoint_sha256,
+            "policy_version": first.policy_version,
+            "collection_round": first.collection_round,
             "split": episode.split,
         }
-        with self.index_path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(row, sort_keys=True) + "\n")
+        rows.append(row)
+        self._write_index(rows)
         return row
 
     def records(self) -> list[dict[str, Any]]:
         if not self.index_path.exists():
             return []
-        return [json.loads(line) for line in self.index_path.read_text(encoding="utf-8").splitlines() if line]
+        value = json.loads(self.index_path.read_text(encoding="utf-8"))
+        if not isinstance(value, list):
+            raise ValueError("rollout index must be a JSON list")
+        return value
+
+    def load_replans(self, row: dict[str, Any]) -> list[dict[str, Any]]:
+        self._manifest()
+        payload = torch.load(self.root / row["payload"], map_location="cpu", weights_only=True)
+        replans = payload.get("replans")
+        if not isinstance(replans, list) or len(replans) != row["replans"]:
+            raise ValueError(f"corrupt rollout payload: {row['payload']}")
+        return replans
 
     def validate(self) -> dict[str, Any]:
-        manifest = json.loads((self.root / "manifest.json").read_text(encoding="utf-8"))
-        if manifest.get("schema") != ROLLOUT_SCHEMA:
-            raise ValueError("unsupported rollout store schema")
+        manifest = self._manifest()
         rows = self.records()
+        support: set[int] = set()
+        replans = steps = 0
         for row in rows:
-            payload = torch.load(self.root / row["payload"], map_location="cpu", weights_only=True)
-            if payload["actions"].shape != (row["length"], 7):
-                raise ValueError(f"corrupt rollout payload: {row['payload']}")
-        return {"episodes": len(rows), "steps": sum(row["length"] for row in rows), "manifest": manifest}
+            values = self.load_replans(row)
+            episode = RolloutEpisode(
+                replans=tuple(ReplanRecord(**value) for value in values),
+                split=row["split"],
+            )
+            replans += len(values)
+            steps += sum(int(value["executed_prefix_length"]) for value in values)
+            support.add(int(row["global_task_index"]))
+            for value in values:
+                if value["planned_actions"].shape != (50, 7):
+                    raise ValueError(f"corrupt full plan in {row['payload']}")
+                if value["executed_actions"].shape != (value["executed_prefix_length"], 7):
+                    raise ValueError(f"corrupt executed prefix in {row['payload']}")
+            first = episode.replans[0]
+            if (row["suite"], row["suite_task_id"], row["global_task_index"]) != (
+                first.suite,
+                first.suite_task_id,
+                first.global_task_index,
+            ):
+                raise ValueError(f"rollout index identity differs from {row['payload']}")
+        return {
+            "episodes": len(rows),
+            "replans": replans,
+            "steps": steps,
+            "task_support": sorted(support),
+            "manifest": manifest,
+        }
 
 
-__all__ = ["ROLLOUT_SCHEMA", "RolloutEpisode", "RolloutStore"]
+__all__ = ["ROLLOUT_SCHEMA", "ReplanRecord", "RolloutEpisode", "RolloutStore"]
