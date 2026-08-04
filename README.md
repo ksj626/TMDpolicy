@@ -1,5 +1,12 @@
 # TMDpolicy
 
+The research-grade framework now lives under `tmd_policy.common` and
+`tmd_policy.methods`, with strictly separated Flow-SFT, TMD, DMD2-flow,
+VLA-OPD, and proposed occupancy-TMD implementations. Start with
+[`docs/experiment_guide.md`](docs/experiment_guide.md); the scientific status
+and fail-closed capability blockers are recorded in
+[`docs/completion_report.md`](docs/completion_report.md).
+
 TMDpolicy is an audited robot-learning research codebase for asking one narrow
 question: can a small recurrent transition head repair the quality lost when a
 LIBERO SmolVLA action flow is reduced from ten expensive backbone evaluations

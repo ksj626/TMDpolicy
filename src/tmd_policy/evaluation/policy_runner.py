@@ -57,13 +57,18 @@ def _load_arm(
         inner_steps=config.tmd.inner_steps,
         recurrent_layers=config.tmd.recurrent_layers,
         hidden_dim=config.tmd.hidden_dim,
+        dropout=config.tmd.dropout,
         main_loss_weight=config.tmd.main_loss_weight,
+        transition_loss=config.tmd.loss,
         inner_source_mode=config.tmd.inner_source_mode,
     )
     metadata: dict[str, Any] = {
         "base_checkpoint": config.checkpoints.student_id,
         "base_revision": config.checkpoints.student_revision,
     }
+    policy.configure_trainable(
+        train_main_action_projections=config.tmd.train_main_action_projections
+    )
     if arm == "B0":
         policy.base_policy.model.config.num_steps = 10
         return OfficialSmolVLAAdapter(policy.base_policy).eval(), preprocessor, postprocessor, metadata
@@ -81,6 +86,7 @@ def _load_arm(
             "inner_source_mode": config.tmd.inner_source_mode,
             "base_revision": config.checkpoints.student_revision,
             "dataset_revision": config.dataset.revision,
+            "train_main_action_projections": config.tmd.train_main_action_projections,
         }
         mismatches = {
             key: (metadata.get(key), value)

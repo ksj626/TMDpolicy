@@ -259,7 +259,9 @@ def load_smolvla_tmd(
     inner_steps: int = 2,
     recurrent_layers: int = 2,
     hidden_dim: int = 256,
+    dropout: float = 0.0,
     main_loss_weight: float = 0.0,
+    transition_loss: str = "huber",
     inner_source_mode: InnerSourceMode | str = InnerSourceMode.GAUSSIAN_TM,
 ) -> tuple[SmolVLATMDPolicy, Any, Any]:
     from lerobot.policies.factory import make_pre_post_processors
@@ -286,7 +288,9 @@ def load_smolvla_tmd(
         inner_steps=inner_steps,
         recurrent_layers=recurrent_layers,
         hidden_dim=hidden_dim,
+        dropout=dropout,
         main_loss_weight=main_loss_weight,
+        transition_loss=transition_loss,
         inner_source_mode=inner_source_mode,
     ).to(device)
     policy.configure_trainable()

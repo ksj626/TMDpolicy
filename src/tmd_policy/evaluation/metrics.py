@@ -6,6 +6,8 @@ from typing import Any
 
 import numpy as np
 
+from tmd_policy.common.evaluation import average_precision, precision_recall_auc
+
 
 def _average_ranks(values: np.ndarray) -> np.ndarray:
     order = np.argsort(values, kind="mergesort")
@@ -30,16 +32,6 @@ def _roc_auc(labels: np.ndarray, scores: np.ndarray) -> float:
     return float((ranks[positive].sum() - n_pos * (n_pos + 1) / 2) / (n_pos * n_neg))
 
 
-def _pr_auc(labels: np.ndarray, scores: np.ndarray) -> float:
-    positives = int(labels.sum())
-    if positives == 0:
-        return math.nan
-    order = np.argsort(-scores, kind="mergesort")
-    sorted_labels = labels[order]
-    precision = np.cumsum(sorted_labels) / np.arange(1, len(labels) + 1)
-    return float((precision * sorted_labels).sum() / positives)
-
-
 def binary_metrics(labels: Any, logits: Any, bins: int = 10) -> dict[str, float]:
     labels = np.asarray(labels, dtype=np.int64).reshape(-1)
     logits = np.asarray(logits, dtype=np.float64).reshape(-1)
@@ -58,7 +50,8 @@ def binary_metrics(labels: Any, logits: Any, bins: int = 10) -> dict[str, float]
         "bce": float(bce.mean()),
         "accuracy": float((predictions == labels).mean()),
         "roc_auc": _roc_auc(labels, logits),
-        "pr_auc": _pr_auc(labels, logits),
+        "average_precision": average_precision(labels, logits),
+        "pr_auc": precision_recall_auc(labels, logits),
         "brier": float(np.square(probabilities - labels).mean()),
         "ece": ece,
         "saturation_fraction": float(((probabilities < 0.01) | (probabilities > 0.99)).mean()),

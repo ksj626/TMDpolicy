@@ -8,6 +8,8 @@ from typing import Any
 
 import numpy as np
 
+from tmd_policy.common.data.records import validate_image
+
 SCHEMA_VERSION = 2
 PLAN_HORIZON = 50
 EXECUTION_HORIZON = 10
@@ -103,11 +105,17 @@ class ExpertChunk:
             "path_actions", self.path_actions, (EXECUTION_HORIZON, CANONICAL_ACTION_DIM)
         )
         self.path_valid = _boolean_mask("path_valid", self.path_valid, EXECUTION_HORIZON)
+        if not self.plan_valid.any() or not self.path_valid.any():
+            raise ValueError("expert chunks cannot contain all-invalid action/path masks")
         self.path_states = _states(
             "path_states", self.path_states, (EXECUTION_HORIZON + 1, CANONICAL_STATE_DIM)
         )
         if np.any(self.path_valid & ~self.plan_valid[:EXECUTION_HORIZON]):
             raise ValueError("path_valid cannot mark a transition invalid in plan_valid as real")
+        for key, image in tuple(self.images.items()):
+            if not key.startswith("observation.images."):
+                raise ValueError(f"image key must use observation.images.* schema: {key}")
+            self.images[key] = validate_image(key, image)
 
     @property
     def metadata(self) -> dict[str, Any]:
@@ -163,6 +171,8 @@ class RolloutChunk:
     reset_seed: int
     outer_noise_seed: int
     inner_noise_seeds: tuple[int, ...]
+    environment_truncated: bool = False
+    local_time_limit: bool = False
     preprocessing_latency_s: float = 0.0
     model_latency_s: float = 0.0
     postprocessing_latency_s: float = 0.0
@@ -201,10 +211,16 @@ class RolloutChunk:
         )
         if not self.path_valid.all():
             raise ValueError("rollout storage contains only real transitions, so path_valid must be all true")
+        if self.truncated != (self.environment_truncated or self.local_time_limit):
+            raise ValueError("truncated must equal environment_truncated OR local_time_limit")
         seeds = tuple(int(seed) for seed in self.inner_noise_seeds)
         if seeds and min(seeds) < 0:
             raise ValueError("inner-noise seeds must be nonnegative")
         self.inner_noise_seeds = seeds
+        for key, image in tuple(self.chunk_start_images.items()):
+            if not key.startswith("observation.images."):
+                raise ValueError(f"image key must use observation.images.* schema: {key}")
+            self.chunk_start_images[key] = validate_image(key, image)
         for name in (
             "preprocessing_latency_s",
             "model_latency_s",
@@ -237,6 +253,8 @@ class RolloutChunk:
             "success": self.success,
             "terminated": self.terminated,
             "truncated": self.truncated,
+            "environment_truncated": self.environment_truncated,
+            "local_time_limit": self.local_time_limit,
             "reset_seed": self.reset_seed,
             "outer_noise_seed": self.outer_noise_seed,
             "inner_noise_seeds": list(self.inner_noise_seeds),
@@ -289,6 +307,8 @@ class TeacherQuery:
             "action_chunk", self.action_chunk, (PLAN_HORIZON, CANONICAL_ACTION_DIM)
         )
         self.action_valid = _boolean_mask("action_valid", self.action_valid, PLAN_HORIZON)
+        if not self.action_valid.any():
+            raise ValueError("teacher action mask cannot be all invalid")
 
     @staticmethod
     def make_cache_key(

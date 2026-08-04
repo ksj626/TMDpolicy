@@ -9,6 +9,7 @@ from typing import Any
 
 import numpy as np
 import torch
+from torch.utils.data import DataLoader, Dataset
 
 from tmd_policy.config import ExperimentConfig, save_resolved_config
 from tmd_policy.models.smolvla_tmd import load_smolvla_tmd
@@ -42,12 +43,53 @@ def _read_record(manifest: Path, index: int = 0) -> tuple[dict[str, Any], dict[s
     return record, arrays
 
 
+class _ExpertManifestDataset(Dataset[tuple[dict[str, Any], dict[str, np.ndarray]]]):
+    def __init__(self, manifest: Path, split: str) -> None:
+        self.manifest = manifest
+        rows = [json.loads(line) for line in manifest.read_text(encoding="utf-8").splitlines()]
+        self.rows = [row for row in rows if row.get("split", "train") == split]
+        if not self.rows:
+            raise ValueError(f"expert manifest contains no {split!r} records: {manifest}")
+
+    def __len__(self) -> int:
+        return len(self.rows)
+
+    def __getitem__(self, index: int) -> tuple[dict[str, Any], dict[str, np.ndarray]]:
+        row = self.rows[index]
+        with np.load(self.manifest.parent / row["payload"], allow_pickle=False) as payload:
+            arrays = {key: payload[key] for key in payload.files}
+        return row, arrays
+
+
 def _expert_batch(
-    record: dict[str, Any],
-    arrays: dict[str, np.ndarray],
+    record: dict[str, Any] | list[dict[str, Any]],
+    arrays: dict[str, np.ndarray] | list[dict[str, np.ndarray]],
     device: torch.device,
     batch_size: int,
 ) -> dict[str, Any]:
+    if isinstance(record, list):
+        records = record
+        array_rows = arrays
+        assert isinstance(array_rows, list)
+        batch = {
+            "observation.state": torch.from_numpy(
+                np.stack([item["path_states"][0] for item in array_rows])
+            ).to(device),
+            "action": torch.from_numpy(np.stack([item["plan_actions"] for item in array_rows])).to(device),
+            "action_is_pad": torch.from_numpy(
+                np.stack([~item["plan_valid"].astype(bool) for item in array_rows])
+            ).to(device),
+            "task": [item["instruction"] for item in records],
+        }
+        image_keys = {key for key in array_rows[0] if key.startswith("image::")}
+        if any({key for key in item if key.startswith("image::")} != image_keys for item in array_rows):
+            raise ValueError("expert records have inconsistent image keys")
+        for key in image_keys:
+            batch[key.removeprefix("image::")] = torch.from_numpy(
+                np.stack([item[key] for item in array_rows])
+            ).to(device)
+        return batch
+    assert isinstance(arrays, dict)
     batch: dict[str, Any] = {
         "observation.state": torch.from_numpy(arrays["path_states"][0]).to(device)[None],
         "action": torch.from_numpy(arrays["plan_actions"]).to(device)[None],
@@ -68,9 +110,9 @@ def train_expert_chunk(
     *,
     expert_manifest: str | Path,
     output_dir: str | Path,
-    record_index: int = 0,
+    record_index: int | None = None,
 ) -> dict[str, Any]:
-    """Train B2 on one stored real expert observation/action chunk."""
+    """Train B2 over every training record through a seeded DataLoader."""
 
     if config.tmd.inner_source_mode != "gaussian_tm":
         raise ValueError("B2 requires tmd.inner_source_mode=gaussian_tm")
@@ -78,7 +120,11 @@ def train_expert_chunk(
     output.mkdir(parents=True, exist_ok=False)
     save_resolved_config(config, output / "resolved_config.yaml")
     seed_everything(config.training.seed)
-    record, arrays = _read_record(Path(expert_manifest), record_index)
+    if record_index is not None:
+        raise ValueError("single-record training was retired; omit record_index to use the train split")
+    manifest_path = Path(expert_manifest)
+    train_dataset = _ExpertManifestDataset(manifest_path, "train")
+    validation_dataset = _ExpertManifestDataset(manifest_path, "validation")
     device = torch.device(config.training.device)
     policy, preprocessor, _ = load_smolvla_tmd(
         config.checkpoints.student_id,
@@ -90,7 +136,9 @@ def train_expert_chunk(
         inner_steps=config.tmd.inner_steps,
         recurrent_layers=config.tmd.recurrent_layers,
         hidden_dim=config.tmd.hidden_dim,
+        dropout=config.tmd.dropout,
         main_loss_weight=config.tmd.main_loss_weight,
+        transition_loss=config.tmd.loss,
         inner_source_mode=config.tmd.inner_source_mode,
     )
     policy.configure_trainable(
@@ -103,12 +151,27 @@ def train_expert_chunk(
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=max(config.training.expert_steps, 1)
     )
-    canonical_batch = _expert_batch(record, arrays, device, config.training.batch_size)
-    processed = preprocessor(canonical_batch)
+    def collate(rows: list[tuple[dict[str, Any], dict[str, np.ndarray]]]) -> dict[str, Any]:
+        result = _expert_batch([row[0] for row in rows], [row[1] for row in rows], device, len(rows))
+        result["metadata"] = [row[0] for row in rows]
+        return result
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=config.training.batch_size,
+        shuffle=True,
+        generator=torch.Generator().manual_seed(config.training.seed),
+        num_workers=0,
+        collate_fn=collate,
+    )
+    validation_loader = DataLoader(validation_dataset, batch_size=config.training.batch_size, collate_fn=collate)
+    fixed_validation_batch = next(iter(validation_loader))
+    fixed_validation_batch.pop("metadata")
+    fixed_validation = preprocessor(fixed_validation_batch)
     losses: list[float] = []
     started = time.perf_counter()
     policy.train()
-    internal_actions = policy.base_policy.prepare_action(processed)
+    internal_actions = policy.base_policy.prepare_action(fixed_validation)
     diagnostic_generator = torch.Generator(device=device).manual_seed(config.training.seed + 99)
     diagnostic_outer_noise = torch.randn(
         internal_actions.shape,
@@ -123,18 +186,27 @@ def train_expert_chunk(
         generator=diagnostic_generator,
     )
     diagnostic_time = torch.full(
-        (config.training.batch_size,), 0.5, device=device, dtype=torch.float32
+        (internal_actions.shape[0],), 0.5, device=device, dtype=torch.float32
     )
     with torch.no_grad():
         diagnostic_initial = float(
             policy.transition_matching_loss(
-                processed,
+                fixed_validation,
                 noise=diagnostic_outer_noise,
                 inner_noise=diagnostic_inner_noise,
                 outer_time=diagnostic_time,
             )["loss"]
         )
+    train_iterator = iter(train_loader)
+    records_seen: set[str] = set()
     for _ in range(config.training.expert_steps):
+        try:
+            canonical_batch = next(train_iterator)
+        except StopIteration:
+            train_iterator = iter(train_loader)
+            canonical_batch = next(train_iterator)
+        records_seen.update(item["sample_id"] for item in canonical_batch.pop("metadata", []))
+        processed = preprocessor(canonical_batch)
         optimizer.zero_grad(set_to_none=True)
         result = policy.transition_matching_loss(processed)
         result["loss"].backward()
@@ -145,7 +217,7 @@ def train_expert_chunk(
     with torch.no_grad():
         diagnostic_final = float(
             policy.transition_matching_loss(
-                processed,
+                fixed_validation,
                 noise=diagnostic_outer_noise,
                 inner_noise=diagnostic_inner_noise,
                 outer_time=diagnostic_time,
@@ -170,6 +242,7 @@ def train_expert_chunk(
         "outer_steps": config.tmd.outer_steps,
         "inner_steps": config.tmd.inner_steps,
         "inner_source_mode": config.tmd.inner_source_mode,
+        "train_main_action_projections": config.tmd.train_main_action_projections,
         "architecture": {
             "hidden_dim": config.tmd.hidden_dim,
             "recurrent_layers": config.tmd.recurrent_layers,
@@ -190,9 +263,9 @@ def train_expert_chunk(
     report = {
         "arm": "B2",
         "data_label": "real LIBERO expert chunk",
-        "sample_id": record["sample_id"],
-        "task_index": record["task_index"],
-        "instruction": record["instruction"],
+        "training_records": len(train_dataset),
+        "validation_records": len(validation_dataset),
+        "records_seen": sorted(records_seen),
         "training_steps": config.training.expert_steps,
         "initial_loss": losses[0] if losses else None,
         "final_loss": losses[-1] if losses else None,

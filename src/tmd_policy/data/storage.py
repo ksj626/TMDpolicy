@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -16,6 +17,27 @@ from .schemas import SCHEMA_VERSION
 
 class StorageIntegrityError(RuntimeError):
     pass
+
+
+def _file_hash(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _content_hash(metadata: Mapping[str, Any], arrays: Mapping[str, np.ndarray]) -> str:
+    digest = hashlib.sha256()
+    stable = {key: value for key, value in metadata.items() if key not in {"payload", "content_hash", "payload_sha256"}}
+    digest.update(json.dumps(stable, sort_keys=True, separators=(",", ":")).encode())
+    for key in sorted(arrays):
+        value = np.ascontiguousarray(arrays[key])
+        digest.update(key.encode())
+        digest.update(str(value.dtype).encode())
+        digest.update(json.dumps(value.shape).encode())
+        digest.update(value.tobytes())
+    return digest.hexdigest()
 
 
 class ChunkStore:
@@ -112,6 +134,8 @@ class ChunkStore:
                 finally:
                     os.close(directory_descriptor)
                 metadata["payload"] = str(target.relative_to(self.root))
+                metadata["payload_sha256"] = _file_hash(target)
+                metadata["content_hash"] = _content_hash(metadata, arrays)
                 encoded = (json.dumps(metadata, sort_keys=True) + "\n").encode()
                 manifest_descriptor = os.open(
                     self.manifest_path, os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o600
@@ -168,6 +192,9 @@ class ChunkStore:
                 self.load_arrays(record)
             except StorageIntegrityError as error:
                 issues["manifest"].append(str(error))
+            expected = record.get("payload_sha256")
+            if expected is not None and _file_hash(path) != expected:
+                issues["manifest"].append(f"payload hash mismatch: {path}")
         for path in sorted(self.payload_dir.glob("*.npz")):
             if path.resolve() not in referenced:
                 issues["orphan_payloads"].append(str(path))

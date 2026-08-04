@@ -167,6 +167,8 @@ def collect_rollout_episode(
         executed: list[np.ndarray] = []
         terminated_flag = False
         truncated_flag = False
+        environment_truncated_flag = False
+        chunk_local_time_limit = False
         success = False
         environment_latency = 0.0
         for action in plan[:execution_horizon]:
@@ -178,7 +180,8 @@ def collect_rollout_episode(
             canonical = _canonical_observation(raw, env_preprocessor)
             states.append(canonical["observation.state"][0].detach().cpu().numpy())
             terminated_flag = bool(np.asarray(terminated).reshape(-1)[0])
-            truncated_flag = bool(np.asarray(truncated).reshape(-1)[0])
+            environment_truncated_flag = bool(np.asarray(truncated).reshape(-1)[0])
+            truncated_flag = environment_truncated_flag
             if (
                 max_environment_steps is not None
                 and environment_steps >= max_environment_steps
@@ -186,9 +189,10 @@ def collect_rollout_episode(
                 and not truncated_flag
             ):
                 truncated_flag = True
+                chunk_local_time_limit = True
                 local_time_limit_reached = True
             if "is_success" in info:
-                success = bool(np.asarray(info["is_success"]).reshape(-1)[0])
+                success = success or bool(np.asarray(info["is_success"]).reshape(-1)[0])
             if "final_info" in info and info["final_info"] is not None:
                 final = np.asarray(info["final_info"], dtype=object).reshape(-1)[0]
                 if isinstance(final, dict):
@@ -224,6 +228,8 @@ def collect_rollout_episode(
                 success=success,
                 terminated=terminated_flag,
                 truncated=truncated_flag,
+                environment_truncated=environment_truncated_flag,
+                local_time_limit=chunk_local_time_limit,
                 reset_seed=reset_seed,
                 outer_noise_seed=outer_noise_seed,
                 inner_noise_seeds=plan_result.inner_noise_seeds,

@@ -327,7 +327,10 @@ def build_parser() -> argparse.ArgumentParser:
     _add_config(train_expert)
     train_expert.add_argument("--expert-manifest", required=True)
     train_expert.add_argument("--output", required=True)
-    train_expert.add_argument("--record-index", type=int, default=0)
+    train_expert.add_argument(
+        "--record-index", type=int, default=None,
+        help="retired fail-closed compatibility flag; training always uses the full train split",
+    )
     train_expert.set_defaults(handler=_train_expert)
 
     collect = commands.add_parser("collect-rollouts", help="collect complete episodes for B0/B1/B2")
