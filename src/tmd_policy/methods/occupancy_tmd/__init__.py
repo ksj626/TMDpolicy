@@ -1,14 +1,10 @@
-from .discriminator import OccupancyWindowDiscriminator, occupancy_discriminator_loss
-from .method import OccupancyDiscriminatorMethod, OccupancyGate, OccupancyTMDConfig, OccupancyTMDMethod
-from .weights import ImportanceRatio, MismatchPrioritizationWeight
+from .networks import OccupancyDiscriminator, WindowNormalizer
+from .program import OccupancyDiscriminatorProgram, OccupancyWeightedTMDProgram, weighted_generator_loss
 
 __all__ = [
-    "ImportanceRatio",
-    "MismatchPrioritizationWeight",
-    "OccupancyDiscriminatorMethod",
-    "OccupancyGate",
-    "OccupancyTMDConfig",
-    "OccupancyTMDMethod",
-    "OccupancyWindowDiscriminator",
-    "occupancy_discriminator_loss",
+    "OccupancyDiscriminator",
+    "OccupancyDiscriminatorProgram",
+    "OccupancyWeightedTMDProgram",
+    "WindowNormalizer",
+    "weighted_generator_loss",
 ]

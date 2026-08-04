@@ -1,9 +1,21 @@
-# Occupancy TMD
+# Occupancy-weighted TMD
 
-`discriminator.py` is a causal `[B,L+1,S]`/`[B,L,A]` path classifier distinct from DMD2 GAN. `weights.py` separates clipped prioritization from valid importance ratios/ESS. `method.py` provides isolated discriminator BCE training and held-out-gated downstream weighting; the discriminator is frozen during TMD. See the method contract for balanced-measure ratio limits and diagnostics.
+`networks.py` defines a causal task-conditioned discriminator over aligned state
+`[B,L,8]`, canonical action `[B,L,7]`, and two-camera RGB summaries `[B,L,6]`,
+with explicit within-window positions and valid masks. Its normalizer is fitted
+only from train expert and train rollout windows. The combined dataset supplies
+inverse task/position/source frequency weights. Expert is label 1; student is 0.
 
-`OccupancyTMDConfig` defaults are weights `[0.5,2.0]` and discriminator LR
-`1e-4`. Gate thresholds are source deviation `0.05`, calibration `0.1`,
-saturation `0.1`, support overlap `0.5`, and ESS `20`, all from real held-out
-paths. Diagnostic optimizer state is separate; downstream occupancy-TMD freezes
-the discriminator and does not conflate its weights with importance ratios.
+`program.py` trains that discriminator and implements occupancy-weighted Stage-1
+TMD. The density-ratio proxy is `exp(logit/temperature)`, visibly clipped to
+configured bounds and detached before multiplying the per-sample MeanFlow loss.
+Thus the weights alter generator gradients without training the discriminator
+through the generator. Rollout producer checkpoint/round provenance determines
+whether a store is current-policy or explicitly off-policy.
+
+Public objects are `WindowNormalizer`, `OccupancyDiscriminator`,
+`OccupancyDiscriminatorProgram`, `OccupancyWeightedTMDProgram`, and
+`weighted_generator_loss`. The first program owns real=1/student=0 BCE; the
+second reuses Stage-1 sampling and scales its per-sample gradient with detached
+positive weights. Discriminator and normalizer checkpoints are immutable inputs
+to occupancy-TMD.

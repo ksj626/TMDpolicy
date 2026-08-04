@@ -1,5 +1,5 @@
-from .schemas import ExpertChunk, RolloutChunk, TeacherQuery
-from .storage import ChunkStore
+"""The one canonical expert-data schema: direct LeRobot LIBERO chunks."""
 
-__all__ = ["ChunkStore", "ExpertChunk", "RolloutChunk", "TeacherQuery"]
+from .libero import LeRobotLiberoChunks, build_episode_manifest, load_episode_manifest
 
+__all__ = ["LeRobotLiberoChunks", "build_episode_manifest", "load_episode_manifest"]

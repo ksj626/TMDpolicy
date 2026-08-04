@@ -1,16 +1,15 @@
-# Package entry points
+# Python package map
 
-| File | Purpose | Public API | Caller → downstream | Input → output | Trainable parameters | Side effects/config/artifacts | Limitations |
-|---|---|---|---|---|---|---|---|
-| `__init__.py` | Package version/export marker. | package metadata | importers | n/a | none | none | no behavior |
-| `cli.py` | All audited command parsing and orchestration/gates. | `build_parser`, `main` | shell entry point → specialized modules | arguments + strict config → reports/status | command-dependent | all writes stay under explicit project output; sets project-local HF cache defaults | B3/B4 return gated status 2. |
-| `config.py` | Frozen strict dataclasses, validators, resolved YAML, consumer report, generated docs. | config classes and load/save/render functions | CLI/runners/tests → constructors | YAML → `ExperimentConfig`/Markdown | none | reads YAML; writes only through `save_resolved_config` caller | Fixed audited LIBERO dimensions/horizons. |
-| `smoke.py` | Tiny end-to-end Gaussian head/discriminator/replay diagnostic. | `run_synthetic_smoke` | CLI/tests → JSON report | seed/output → metrics | diagnostic head/discriminator | writes one report | Synthetic only. |
+`config.py` loads and validates immutable YAML contracts. `cli.py` defines real
+data, teacher, train, rollout, and evaluation verbs. `backends/` isolates pinned
+LeRobot internals and action coordinates. `data/` owns the single expert schema
+and occupancy windows. `methods/` owns Flow-SFT, TMD/Stage-2, DMD2, and occupancy
+program graphs. `training/` owns deterministic DataLoaders, optimizers, and full
+resume. `rollout/` owns versioned student episodes. `evaluation/` owns policy
+loading, complete LIBERO episodes, and paired statistics. `integration/` owns
+the real fixed-noise PI0.5 parity check.
 
-The CLI scalar namespace contains validated filesystem paths, command choices,
-seeds, arm names, and optional checkpoint/store references for one process
-lifetime. Configuration leaf types/ranges/provenance are exhaustive in the
-generated config reference. The smoke tensors use model-standard
-`[B,50,7]` actions/noises and `[B,11,8]/[B,10,7]` paths; they are CPU float32,
-synthetic, masked by all-true bool prefixes, and gradients are confined to the
-diagnostic models.
+Public tensors are torch tensors. Canonical LIBERO actions are `[B,50,7]`;
+checkpoint flow actions are `[B,50,32]`; valid masks are boolean `[B,50]` with
+`True` meaning an environment target exists. Each subdirectory README records
+coordinates, gradients, randomness, data dependencies, and checkpoint behavior.

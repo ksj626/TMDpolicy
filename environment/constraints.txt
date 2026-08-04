@@ -1,0 +1,11 @@
+# PyPI/runtime pins validated on native Linux x86_64. Install torch first from
+# the explicit CUDA index in create_environment.sh.
+torch==2.11.0
+torchvision==0.26.0
+lerobot==0.6.1
+numpy==2.2.6
+PyYAML==6.0.3
+safetensors==0.8.0
+transformers==5.5.4
+mujoco==3.8.1
+robosuite==1.4.0

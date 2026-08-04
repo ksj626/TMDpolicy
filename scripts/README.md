@@ -1,10 +1,12 @@
-# Scripts
+# Executable scripts
 
-| File | Purpose | Public entry | Caller → consumer | Inputs → outputs | Parameters/side effects/config | Limitations |
-|---|---|---|---|---|---|---|
-| `generate_config_reference.py` | Regenerate or check schema-derived config documentation. | `main` | developer/CI → `tmd_policy.config.render_config_reference` | dataclass metadata → Markdown | writes `docs/config_reference.md` unless `--check`; no model config consumed | Must run with project on `PYTHONPATH`. |
-| `run_diagnostics.sh` | Legacy convenience wrapper for tests/smoke. | shell script | developer → CLI/pytest | environment → diagnostic artifacts | may write its named artifact output | Prefer explicit commands in root README. |
+`setup/create_environment.sh` creates only the fixed environment and verifies
+it. `data/build_libero_expert.sh`, `data/query_pi05_teacher.sh`, and
+`data/collect_student_rollouts.sh` build the real split manifest, run real PI0.5
+parity, and collect real student LIBERO paths. Every file under `train/` invokes
+one concrete trainer. `evaluate/evaluate_policy.sh` runs the expanded motivation
+grid; `evaluate/compare_methods.sh` performs paired statistics. Arguments after
+the script name are forwarded to the CLI, including `--output` and `--resume`.
 
-`--check` is read-only and exits nonzero on drift. `--output` is a `Path` whose
-default is inside this repository. The script contains no tensors, randomness,
-trainable parameters, caches, or network calls.
+Scripts set headless EGL and repo-local Hugging Face/LeRobot caches. They assume
+the `tmdpolicy` Conda environment and never start from setup automatically.

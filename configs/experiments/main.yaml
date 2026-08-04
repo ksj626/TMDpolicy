@@ -1,0 +1,16 @@
+method: compare_libero
+classification: paired main comparison across real policy evaluations
+inputs:
+  baseline: artifacts/evaluation/main_smolvla/evaluation.json
+  flow_sft: artifacts/evaluation/main_flow_sft/evaluation.json
+  tmd_stage1: artifacts/evaluation/main_tmd_stage1/evaluation.json
+  dmd2_flow: artifacts/evaluation/main_dmd2_flow/evaluation.json
+  tmd_stage2: artifacts/evaluation/main_tmd_stage2/evaluation.json
+  occupancy_tmd: artifacts/evaluation/main_occupancy_tmd/evaluation.json
+statistics:
+  pairing_keys: [suite, task_id, reset_seed]
+  bootstrap_resamples: 20000
+  confidence: 0.95
+  seed: 20260804
+output:
+  directory: artifacts/experiments/main_comparison

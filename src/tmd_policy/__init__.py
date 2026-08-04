@@ -1,7 +1,7 @@
-"""TMD-policy research prototype."""
+"""TMDpolicy: executable PI0.5-to-SmolVLA distillation for LIBERO."""
 
-from .config import ExperimentConfig, load_config
+from .config import LEROBOT_VERSION, ConfigError, load_config
 
-__all__ = ["ExperimentConfig", "load_config"]
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
+__all__ = ["ConfigError", "LEROBOT_VERSION", "load_config"]
