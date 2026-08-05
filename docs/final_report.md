@@ -1,4 +1,4 @@
-# Implementation report (2026-08-05)
+# Implementation report (2026-08-05, shifted-grid/DMD2-v correction)
 
 ## Delivered scope
 
@@ -20,17 +20,17 @@ attention.
 
 ## Mathematical and systems changes
 
-- DMD2 uses a differentiable multi-step SmolVLA generator, a frozen PI0.5 real
-  model, an exactly initialized trainable PI0.5 suffix, 5:1 TTUR, noised
+- DMD2 uses a real-data outer DMD2-v transition, a frozen PI0.5 real model, an
+  exactly initialized trainable PI0.5 suffix, five joint guidance updates, noised
   fake-score features, and no SFT. Its stopped direction is
   `(mu_fake-mu_real)/(mean_valid(abs(x-mu_real))+epsilon)`.
 - TMD Stage 2 uses its distinct appendix direction
   `(g_fake-g_teacher)/(sum_valid(abs(g_fake-g_teacher))+epsilon)`, real-data
   outer transitions, and a differentiable inner rollout. It also has no SFT.
-- TM-MF now uses `y=x1-x`, `h=b+Delta`, and `u=z-h`; shifted/discrete times,
-  exact JVP, condition dropout, adaptive normalization, and bidirectional chunk
-  attention are explicit. Zero `Delta` integrates to the SmolVLA base transition
-  for 1, 2, and 4 inner steps.
+- TM-MF uses `y=x1-x`, `h=b+Delta`, and `u=z-h`; shifted/discrete student grids,
+  exact JVP, valid-coordinate adaptive normalization, and bidirectional chunk
+  attention are explicit. The conditional baseline has no CFG or condition
+  dropout. Zero `Delta` integrates to the SmolVLA base transition.
 - Conditional GAN and historical short-window occupancy-ratio objectives are
   separate programs. Occupancy units are actual replan observations plus full
   `[50,7]` plans, and source/task-balanced sampling is exactly resumable.
@@ -38,26 +38,14 @@ attention.
   sampler type/config/cursor, trainable identities, immutable revisions, and
   resolved upstream SHA-256 values.
 
-## Validation performed
+## Validation status for this correction
 
-- Full lightweight suite: `39 passed, 1 skipped` (the opt-in real-integration
-  marker), with no failures.
-- All 24 production YAML configs loaded through strict fail-closed validation.
-- Python compile, shell syntax, executable launcher modes, and `git diff
-  --check` passed.
-- Device preflight passed on the detected two RTX A5000 GPUs (23.67 GiB each).
-- A real pinned PI0.5/LIBERO one-batch parity query passed: immutable cache,
-  deterministic repeat maximum error `0`, finite score, and maximum normalized
-  wrapper/reference error `0.00425` (`0.003448` after postprocessing).
-- A real PI0.5 cloned-suffix/intermediate-feature backward probe passed with
-  nonzero action gradient, selected layers `[5,11,17]`, no teacher gradients,
-  693,422,112 trainable suffix parameters, and 3,449,982,704 shared frozen
-  parameters.
-
-No long training, LIBERO environment rollout/evaluation, full DMD2/TMD backward,
-or real SmolVLA-10 plan was run, honoring the minimal-test constraint. The
-opt-in test explains how to enable real cached-asset validation; these omitted
-checks are not represented as successful results.
+Regression tests were added for shifted grid membership/predecessors, shared
+training/evaluation grids, adaptive normalization and padding, optimizer
+ownership, guidance gradient isolation, DMD2-v clean prediction, strict legacy
+config rejection, and canonical config loading. In accordance with the task
+constraint, these tests were not executed. No training, evaluation, rollout,
+download, checkpoint load, or real PI0.5/SmolVLA construction was performed.
 
 ## Fidelity and resources
 

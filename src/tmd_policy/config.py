@@ -179,10 +179,10 @@ def validate_config(config: dict[str, Any], *, expected_method: str | None = Non
         raise ConfigError("capability declarations were removed; configure concrete assets instead")
 
     tmd_fields = {
-        "variant", "attention_mode", "flow_matching_fraction", "normalization_constant",
-        "outer_time_shift_gamma", "inner_time_shift_gamma", "condition_dropout_probability",
+        "variant", "attention_mode", "flow_matching_fraction", "normalization_constant_scale",
+        "student_time_shift_gamma", "meanflow_time_shift_gamma", "condition_dropout_probability",
         "last_k_expert_blocks", "train_backbone_flow_blocks", "model_dim", "layers", "heads",
-        "feedforward_dim", "dropout", "inference_outer_steps", "inference_inner_steps",
+        "feedforward_dim", "dropout", "discrete_outer_steps", "discrete_inner_steps",
     }
     if method in {"tmd_stage1", "occupancy_tmd"}:
         tmd = _require(config, "tmd", "config")
@@ -197,31 +197,41 @@ def validate_config(config: dict[str, Any], *, expected_method: str | None = Non
     for name, value in tmd_sections:
         if not 0 <= float(value["flow_matching_fraction"]) <= 1:
             raise ConfigError(f"{name}.flow_matching_fraction must be in [0,1]")
-        if float(value.get("outer_time_shift_gamma", 1.0)) < 1 or float(
-            value.get("inner_time_shift_gamma", 1.0)
+        if float(value.get("student_time_shift_gamma", 1.0)) < 1 or float(
+            value.get("meanflow_time_shift_gamma", 1.0)
         ) < 1:
             raise ConfigError(f"{name} timestep shifts must be at least one")
-        if not 0 <= float(value.get("condition_dropout_probability", 0.0)) < 1:
-            raise ConfigError(f"{name}.condition_dropout_probability must be in [0,1)")
-        if int(value["inference_outer_steps"]) < 1 or int(value["inference_inner_steps"]) < 1:
-            raise ConfigError(f"{name} inference step counts must be positive")
+        if float(value.get("condition_dropout_probability", 0.0)) != 0.0:
+            raise ConfigError(
+                f"{name}.condition_dropout_probability must be 0.0; this conditional baseline has no CFG"
+            )
+        if float(value["normalization_constant_scale"]) <= 0:
+            raise ConfigError(f"{name}.normalization_constant_scale must be positive")
+        if int(value["discrete_outer_steps"]) < 1 or int(value["discrete_inner_steps"]) < 1:
+            raise ConfigError(f"{name} discrete student-grid step counts must be positive")
 
     if method in {"dmd2_flow", "tmd_stage2"}:
         section_name = "dmd2" if method == "dmd2_flow" else "stage2"
         objective = _require(config, section_name, "config")
         objective_fields = {
             "student_fine_tuning", "fake_score_variant", "fake_updates_per_generator",
-            "generation_steps", "generator_learning_rate", "fake_score_learning_rate",
+            "student_training_mode",
+            "generator_learning_rate", "fake_score_learning_rate",
             "discriminator_learning_rate", "gan_weight", "vsd_normalization_epsilon",
             "vsd_normalization",
-            "outer_time_shift_gamma", "teacher_device", "teacher_dtype", "fake_score_device",
+            "teacher_device", "teacher_dtype", "fake_score_device",
             "vsd_time", "gan_time", "fake_score_time", "discriminator", "resource_estimate",
             "fake_score", "data_weight",
         }
         if method == "tmd_stage2":
             objective_fields |= {
-                "stage1_checkpoint", "stage1_checkpoint_sha256", "stage1_outer_steps",
-                "stage1_inner_steps",
+                "stage1_checkpoint", "stage1_checkpoint_sha256",
+                "discriminator_updates_per_generator",
+            }
+        else:
+            objective_fields |= {
+                "guidance_classifier_weight", "discriminator_updates_per_generator",
+                "discrete_outer_steps", "student_time_shift_gamma",
             }
         _reject_unknown(objective, objective_fields, section_name)
         if "data_weight" in objective:
@@ -238,6 +248,22 @@ def validate_config(config: dict[str, Any], *, expected_method: str | None = Non
             raise ConfigError(
                 f"{section_name}.vsd_normalization must be {expected_normalization} for {method}"
             )
+        expected_training_mode = (
+            "real_data_outer_transition"
+            if method == "dmd2_flow"
+            else "tmd_stage1_outer_transition"
+        )
+        if objective.get("student_training_mode") != expected_training_mode:
+            raise ConfigError(
+                f"{section_name}.student_training_mode must be {expected_training_mode}"
+            )
+        if int(objective.get("fake_updates_per_generator", 0)) != 5:
+            raise ConfigError(f"{section_name}.fake_updates_per_generator must be 5")
+        if method == "dmd2_flow":
+            if int(objective["discrete_outer_steps"]) < 1:
+                raise ConfigError("dmd2.discrete_outer_steps must be positive")
+            if float(objective["student_time_shift_gamma"]) < 1:
+                raise ConfigError("dmd2.student_time_shift_gamma must be at least one")
         if objective.get("fake_score_variant") != "pi05_clone" and "ablation" not in str(
             config.get("classification", "")
         ).lower():
@@ -267,6 +293,17 @@ def validate_config(config: dict[str, Any], *, expected_method: str | None = Non
                 raise ConfigError(
                     f"{section_name} paper discriminator requires feature_source={expected_source}"
                 )
+            if method == "dmd2_flow" and float(objective.get("guidance_classifier_weight", 0.0)) <= 0:
+                raise ConfigError("dmd2.guidance_classifier_weight must be positive")
+            if method == "dmd2_flow" and "discriminator_updates_per_generator" in objective:
+                raise ConfigError(
+                    "dmd2 fake-score-feature guidance jointly updates the classifier; "
+                    "discriminator_updates_per_generator is invalid"
+                )
+            if method == "tmd_stage2" and int(
+                objective.get("discriminator_updates_per_generator", 0)
+            ) < 1:
+                raise ConfigError("stage2.discriminator_updates_per_generator must be positive")
             selected = [int(value) for value in discriminator.get("selected_layers", [])]
             if not selected or len(selected) != len(set(selected)) or min(selected) < 0:
                 raise ConfigError(f"{section_name}.discriminator.selected_layers must be nonempty and unique")
@@ -278,6 +315,14 @@ def validate_config(config: dict[str, Any], *, expected_method: str | None = Non
             )
             if discriminator.get("feature_source") != "cached_vla_features":
                 raise ConfigError(f"{section_name} cached discriminator must identify cached_vla_features")
+            if int(objective.get("discriminator_updates_per_generator", 0)) < 1:
+                raise ConfigError(
+                    f"{section_name}.discriminator_updates_per_generator must be positive"
+                )
+            if "guidance_classifier_weight" in objective:
+                raise ConfigError(
+                    f"{section_name}.guidance_classifier_weight is only valid for fake-score features"
+                )
         for name in ("vsd_time", "gan_time", "fake_score_time"):
             timing = _require(objective, name, section_name)
             minimum = float(_require(timing, "minimum_time", f"{section_name}.{name}"))
@@ -290,7 +335,7 @@ def validate_config(config: dict[str, Any], *, expected_method: str | None = Non
         _all_libero_tasks(_require(config["collection"], "benchmark", "collection"), "collection.benchmark")
         _reject_unknown(
             config["policy"],
-            {"method", "device", "checkpoint", "checkpoint_sha256", "outer_steps", "inner_steps"},
+            {"method", "device", "checkpoint", "checkpoint_sha256"},
             "policy",
         )
 
@@ -338,9 +383,13 @@ def validate_config(config: dict[str, Any], *, expected_method: str | None = Non
                 policy, {"method", "device", "sampler_mode", "num_steps", "classification"}, "policy"
             )
         else:
+            sampling_override_fields = (
+                {"outer_steps", "inner_steps"} if policy_method == "flow_sft" else set()
+            )
             _reject_unknown(
                 policy,
-                {"method", "device", "checkpoint", "checkpoint_sha256", "outer_steps", "inner_steps"},
+                {"method", "device", "checkpoint", "checkpoint_sha256"}
+                | sampling_override_fields,
                 "policy",
             )
         if policy_method == "smolvla":

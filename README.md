@@ -16,11 +16,16 @@ Pinned assets:
 trainable action-expert suffix, five fake-score updates per generator update,
 VSD, and a noised-action GAN on selected fake-score layers. Its generator loss
 is exactly `L_VSD + lambda_GAN L_GAN`; it has no Flow-SFT or data regression.
+The direct baseline is DMD2-v: training predicts a clean action from one
+real-data outer transition, while evaluation deterministically integrates the
+checkpoint's shifted descending student grid. The five guidance updates jointly
+train fake-score and classifier parameters from one detached student sample.
 
 TMD uses the repository-owned SmolVLA action-space transformer adaptation:
 
 1. Stage 1 trains TM-MF with independent outer/inner Gaussian sources,
-   shifted outer/inner times, discrete inference-aligned `r`, `r=s` on 75% of
+   a shifted discrete outer grid, continuous shifted MeanFlow `s`, the largest
+   inner-grid predecessor `r<=s`, `r=s` on 75% of
    rows, exact JVP, and adaptive normalization.
 2. Stage 2 loads Stage 1 immutably, preserves the selected final SmolVLA expert
    blocks, constructs real-data outer transitions, differentiates through every
@@ -95,7 +100,9 @@ bash scripts/train/train_tmd_stage2_paper.sh
 
 The pipeline either accepts an existing Stage-1 checkpoint or trains Stage 1,
 computes its SHA-256, checks its model/dataset provenance, writes a fully
-resolved Stage-2 input config, and refuses existing output directories:
+resolved Stage-2 input config, and refuses existing output directories. After
+training it writes `evaluation_resolved.yaml` with the exact final checkpoint
+path and SHA-256:
 
 ```bash
 bash scripts/train/run_tmd_pipeline.sh \
@@ -148,6 +155,8 @@ not the paper's native last-K video-DiT split. DMD2's teacher-residual weighting
 and TMD-v's fake–teacher stopped-L1 direction are distinct, method-locked
 objectives. The preconditioning, time sampling, inner rollout, feature sources,
 and loss exclusions are preserved within the labeled adaptation.
+The current conditional action-policy TMD has no CFG; nonzero condition dropout
+is rejected rather than partially dropping only captured features.
 
 See [architecture](docs/architecture.md), [experiment protocol](docs/experiment_protocol.md),
 [config reference](configs/README.md), and the method/data/evaluation READMEs.

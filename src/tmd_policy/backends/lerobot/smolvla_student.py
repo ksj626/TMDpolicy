@@ -9,6 +9,8 @@ from typing import Any, Literal
 import torch
 from torch import Tensor, nn
 
+from tmd_policy.methods.flow_objectives import shifted_time_grid
+
 from .compatibility import (
     validate_smolvla_instance,
     verify_checkpoint_projection_loaded,
@@ -338,6 +340,8 @@ class LeRobotSmolVLAStudent(nn.Module):
         condition: SmolVLAConditionCache,
         noise: Tensor,
         num_steps: int,
+        *,
+        student_time_shift_gamma: float,
         time_grid: Tensor | None = None,
     ) -> Tensor:
         """Shared differentiable sampler used by training simulation and inference."""
@@ -345,7 +349,13 @@ class LeRobotSmolVLAStudent(nn.Module):
         if num_steps < 1:
             raise ValueError("num_steps must be positive")
         if time_grid is None:
-            time_grid = torch.linspace(1.0, 0.0, num_steps + 1, device=noise.device, dtype=torch.float32)
+            time_grid = shifted_time_grid(
+                num_steps,
+                student_time_shift_gamma,
+                device=noise.device,
+                dtype=torch.float32,
+                descending=True,
+            )
         if time_grid.shape != (num_steps + 1,) or not torch.all(time_grid[:-1] > time_grid[1:]):
             raise ValueError("time_grid must contain num_steps+1 strictly descending values")
         value = noise
@@ -361,9 +371,12 @@ class LeRobotSmolVLAStudent(nn.Module):
         *,
         noise: Tensor | None = None,
         num_steps: int | None = None,
+        student_time_shift_gamma: float | None = None,
     ) -> Tensor:
         processed = self.preprocess_observation(canonical_batch)
         if num_steps is not None:
+            if student_time_shift_gamma is None:
+                raise ValueError("a student time-grid gamma is required with a custom step count")
             condition = self.encode_condition(processed)
             if noise is None:
                 noise = torch.randn(
@@ -372,7 +385,12 @@ class LeRobotSmolVLAStudent(nn.Module):
                     self.internal_action_dim,
                     device=self.device,
                 )
-            normalized = self.sample(condition, noise, num_steps)[..., :7]
+            normalized = self.sample(
+                condition,
+                noise,
+                num_steps,
+                student_time_shift_gamma=student_time_shift_gamma,
+            )[..., :7]
         else:
             normalized = self.policy.predict_action_chunk(processed, noise=noise)
         return self.postprocessor(normalized)

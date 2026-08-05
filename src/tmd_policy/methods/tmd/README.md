@@ -1,8 +1,9 @@
 # Transition Matching Distillation
 
 Stage 1 samples real `x`, outer `x1`, shifted discrete outer time, transition
-`y=x1-x`, and independent inner `z`. Inner `s` is shifted; `r` is drawn from the
-inference grid with `r=s` on the configured fraction. The SmolVLA base velocity
+`y=x1-x`, and independent inner `z`. Inner `s` is shifted; for non-FM rows `r`
+is the largest shifted inner-student-grid point with `r<=s`, while `r=s` on the
+configured fraction. The SmolVLA base velocity
 is retained:
 
 ```text
@@ -11,7 +12,11 @@ h = b + Delta(y_s,s,r,m)
 u = z - h
 ```
 
-The exact JVP implements MeanFlow and adaptive normalization masks padded steps
+The exact JVP implements MeanFlow and adaptive normalization
+`sum(e^2)/(stopgrad(sum(e^2)+scale*N_valid))`; padding and non-executable
+coordinates are masked, so scale `1.0` yields `350` for `[50,7]`. Both training
+and inference use the same checkpoint-owned shifted student grids. This
+conditional action-policy adaptation has no CFG. Bidirectional action-token attention matches the
 and non-executable coordinates. Bidirectional action-token attention matches the
 joint SmolVLA action expert; causal is an explicit ablation. Zero `Delta`
 reproduces the SmolVLA transition for 1/2/4 inner steps.

@@ -48,10 +48,10 @@ tmd:
   variant: tmd_split_transformer_head
   attention_mode: bidirectional
   flow_matching_fraction: 0.75
-  normalization_constant: 350.0
-  outer_time_shift_gamma: 10.0
-  inner_time_shift_gamma: 3.0
-  condition_dropout_probability: 0.1
+  normalization_constant_scale: 1.0
+  student_time_shift_gamma: 10.0
+  meanflow_time_shift_gamma: 3.0
+  condition_dropout_probability: 0.0
   last_k_expert_blocks: 4
   train_backbone_flow_blocks: true
   model_dim: 512
@@ -59,8 +59,8 @@ tmd:
   heads: 8
   feedforward_dim: 2048
   dropout: 0.0
-  inference_outer_steps: 2
-  inference_inner_steps: 2
+  discrete_outer_steps: 2
+  discrete_inner_steps: 2
 occupancy:
   discriminator_checkpoint: artifacts/training/occupancy_discriminator/checkpoints/final.pt
   discriminator_checkpoint_sha256: auto

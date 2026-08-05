@@ -1,5 +1,5 @@
 method: dmd2_flow
-classification: paper-faithful DMD2-flow action-policy baseline
+classification: TMD-paper direct DMD2-v action-policy baseline
 backend: {lerobot_version: "0.6.1", expected_source_hashes: null, local_files_only: false}
 models:
   student: {id: lerobot/smolvla_libero, revision: 31d453f7edd78c839a8bbc39744a292686daf0de, processor_revision: 31d453f7edd78c839a8bbc39744a292686daf0de}
@@ -37,14 +37,16 @@ dmd2:
   student_fine_tuning: head_only
   fake_score_variant: pi05_clone
   fake_updates_per_generator: 5
-  generation_steps: 4
+  guidance_classifier_weight: 1.0
+  student_training_mode: real_data_outer_transition
+  discrete_outer_steps: 4
+  student_time_shift_gamma: 5.0
   generator_learning_rate: 1.0e-5
   fake_score_learning_rate: 1.0e-5
   discriminator_learning_rate: 1.0e-5
   gan_weight: 0.003
   vsd_normalization: dmd2_teacher_residual_mean_abs
   vsd_normalization_epsilon: 1.0e-6
-  outer_time_shift_gamma: 5.0
   teacher_device: cuda:1
   teacher_dtype: bfloat16
   fake_score_device: cuda:1

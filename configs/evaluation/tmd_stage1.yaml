@@ -6,7 +6,7 @@ models:
   teacher: {id: lerobot/pi05_libero_finetuned, revision: 8e174154ef5f6c60a8da12ae99c303d8963138c1, processor_revision: 8e174154ef5f6c60a8da12ae99c303d8963138c1}
 dataset: {id: lerobot/libero, revision: a1aaacb7f6cd6ee5fb43120f673cebb0cfea7dd4, cache: .cache/lerobot, manifest: artifacts/data/libero_expert/episode_manifest.json, validation_fraction: 0.1, test_fraction: 0.1, split_seed: 17, download_videos: true, video_backend: pyav}
 horizons: {prediction: 50, execution: 10}
-policy: {method: tmd_stage1, device: cuda:0, checkpoint: artifacts/training/tmd_stage1/checkpoints/final.pt, checkpoint_sha256: auto, outer_steps: 2, inner_steps: 2}
+policy: {method: tmd_stage1, device: cuda:0, checkpoint: artifacts/training/tmd_stage1/checkpoints/final.pt, checkpoint_sha256: auto}
 evaluation:
   fps: 10
   benchmark:

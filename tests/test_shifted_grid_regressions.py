@@ -1,0 +1,203 @@
+from __future__ import annotations
+
+from types import MethodType, SimpleNamespace
+
+import pytest
+import torch
+from torch import nn
+
+from tmd_policy.backends.lerobot.smolvla_student import LeRobotSmolVLAStudent
+from tmd_policy.methods.dmd2_flow.program import DMD2FlowProgram
+from tmd_policy.methods.flow_objectives import shifted_time_grid
+from tmd_policy.methods.tmd.meanflow import meanflow_loss, sample_meanflow_batch
+from tmd_policy.methods.tmd.program import sample_stage1_generator
+from tmd_policy.training.engine import validate_optimizer_parameter_ownership
+
+
+def test_tmd_outer_times_and_predecessors_use_shifted_student_grids() -> None:
+    reference = torch.zeros(4096, 1, 1)
+    samples = sample_meanflow_batch(
+        reference,
+        flow_matching_fraction=0.0,
+        student_time_shift_gamma=10.0,
+        meanflow_time_shift_gamma=3.0,
+        discrete_outer_steps=4,
+        discrete_inner_steps=7,
+        generator=torch.Generator().manual_seed(9),
+    )
+    outer_grid = shifted_time_grid(4, 10.0, device=reference.device)
+    inner_grid = shifted_time_grid(7, 10.0, device=reference.device)
+    assert torch.all(torch.isin(samples.outer_time, outer_grid[1:]))
+    expected_indices = torch.searchsorted(
+        inner_grid, samples.inner_time.contiguous(), right=True
+    ) - 1
+    assert torch.equal(samples.target_time, inner_grid[expected_indices])
+    assert torch.all(samples.target_time <= samples.inner_time)
+
+
+class _RecordingStudent:
+    def __init__(self) -> None:
+        self.times: list[torch.Tensor] = []
+
+    def velocity_with_features(self, condition, value, time):
+        self.times.append(time.detach().clone())
+        return torch.zeros_like(value), torch.zeros(*value.shape[:-1], 3)
+
+
+class _RecordingHead(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.intervals: list[tuple[torch.Tensor, torch.Tensor]] = []
+
+    def forward(self, value, s, r, context):
+        self.intervals.append((s.detach().clone(), r.detach().clone()))
+        return torch.zeros_like(value)
+
+
+def test_tmd_training_sampler_and_both_inference_loops_share_shifted_grid() -> None:
+    student = _RecordingStudent()
+    head = _RecordingHead()
+    noise = torch.zeros(2, 5, 4)
+    gamma = 10.0
+    sample_stage1_generator(
+        student,
+        head,
+        SimpleNamespace(batch_size=2),
+        noise,
+        outer_steps=3,
+        inner_steps=2,
+        student_time_shift_gamma=gamma,
+        inner_noises=torch.zeros(3, 2, 5, 4),
+    )
+    outer = shifted_time_grid(3, gamma, device=noise.device, descending=True)
+    inner = shifted_time_grid(2, gamma, device=noise.device, descending=True)
+    assert torch.allclose(torch.stack([value[0] for value in student.times]), outer[:-1])
+    expected_intervals = list(zip(inner[:-1], inner[1:], strict=True)) * 3
+    for (actual_s, actual_r), (expected_s, expected_r) in zip(
+        head.intervals, expected_intervals, strict=True
+    ):
+        assert torch.allclose(actual_s, expected_s.expand(2))
+        assert torch.allclose(actual_r, expected_r.expand(2))
+
+
+class _ZeroHead(nn.Module):
+    def forward(self, value, s, r, context):
+        return torch.zeros_like(value)
+
+
+def test_adaptive_meanflow_normalization_uses_valid_squared_norm_and_count() -> None:
+    target = torch.zeros(2, 50, 7)
+    source = torch.ones_like(target)
+    valid = torch.ones_like(target, dtype=torch.bool)
+    valid[1, 40:] = False
+    result = meanflow_loss(
+        _ZeroHead(),
+        target_transition=target,
+        inner_source=source,
+        inner_time=torch.tensor([0.25, 0.75]),
+        target_time=torch.tensor([0.0, 0.5]),
+        context=torch.zeros(2, 50, 1),
+        valid_coordinates=valid,
+        normalization_constant_scale=1.0,
+    )
+    expected_count = torch.tensor([350.0, 280.0])
+    assert torch.equal(result["valid_coordinate_count"], expected_count)
+    assert torch.equal(result["normalization_constant"], expected_count)
+    expected = result["squared_error_sum"] / (
+        result["squared_error_sum"] + expected_count
+    )
+    assert torch.allclose(result["per_sample_loss"], expected)
+
+
+def test_optimizer_parameter_ownership_rejects_cross_optimizer_overlap() -> None:
+    shared = nn.Parameter(torch.tensor(1.0))
+    first = torch.optim.AdamW([shared], lr=1.0e-3)
+    second = torch.optim.AdamW([shared], lr=1.0e-3)
+    with pytest.raises(RuntimeError, match="optimizer parameter overlap"):
+        validate_optimizer_parameter_ownership({"first": first, "second": second})
+
+
+def test_guidance_backward_updates_fake_and_classifier_but_not_student_or_teacher() -> None:
+    program = DMD2FlowProgram.__new__(DMD2FlowProgram)
+    nn.Module.__init__(program)
+    program.feature_source = "fake_score_features"
+    program.dmd_config = {"guidance_classifier_weight": 2.0}
+    program.fake_score = nn.Linear(1, 1, bias=False)
+    program.discriminator = nn.Linear(1, 1, bias=False)
+    program.student = nn.Linear(1, 1, bias=False)
+    program.teacher = nn.Linear(1, 1, bias=False)
+    calls: list[torch.Tensor] = []
+
+    def sample(self, batch, *, requires_grad):
+        assert not requires_grad
+        return self.student.weight.view(1, 1, 1).expand(1, 2, 1)
+
+    def fake(self, batch, generated=None):
+        calls.append(generated)
+        return self.fake_score.weight.square().sum(), {"denoising": 1.0}
+
+    def classifier(self, batch, generated=None):
+        calls.append(generated)
+        return self.discriminator.weight.square().sum(), {"classification": 1.0}
+
+    program._sample_student = MethodType(sample, program)
+    program._fake_loss = MethodType(fake, program)
+    program._discriminator_loss = MethodType(classifier, program)
+    loss, _ = program._guidance_loss({})
+    loss.backward()
+    assert len(calls) == 2 and calls[0] is calls[1] and not calls[0].requires_grad
+    assert program.fake_score.weight.grad is not None
+    assert program.discriminator.weight.grad is not None
+    assert program.student.weight.grad is None
+    assert program.teacher.weight.grad is None
+
+
+class _DMDStudent(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.anchor = nn.Parameter(torch.tensor(0.0))
+        self.policy = SimpleNamespace(prepare_action=lambda batch: batch["action"])
+        self.times: list[torch.Tensor] = []
+
+    def preprocess_observation(self, batch):
+        return batch
+
+    def encode_condition(self, batch):
+        return SimpleNamespace(batch_size=batch["action"].shape[0])
+
+    def velocity(self, condition, value, time):
+        self.times.append(time.detach().clone())
+        return torch.full_like(value, 2.0) + self.anchor * 0.0
+
+
+def test_fixed_noise_dmd2_v_transition_and_evaluation_use_one_shifted_grid(monkeypatch) -> None:
+    student = _DMDStudent()
+    program = DMD2FlowProgram.__new__(DMD2FlowProgram)
+    nn.Module.__init__(program)
+    program.student = student
+    program.dmd_config = {"discrete_outer_steps": 4, "student_time_shift_gamma": 5.0}
+    monkeypatch.setattr(torch, "randn_like", lambda value: torch.ones_like(value))
+    monkeypatch.setattr(
+        torch,
+        "randint",
+        lambda low, high, size, device=None: torch.full(size, 2, device=device, dtype=torch.long),
+    )
+    clean = torch.full((1, 2, 1), 3.0)
+    predicted = program._sample_student({"action": clean}, requires_grad=True)
+    grid = shifted_time_grid(4, 5.0, device=clean.device)
+    time = grid[2]
+    x_t = (1.0 - time) * clean + time * torch.ones_like(clean)
+    assert torch.allclose(predicted, x_t - time * torch.full_like(clean, 2.0))
+    assert torch.allclose(student.times[0], time.expand(1))
+
+    student.times.clear()
+    LeRobotSmolVLAStudent.sample(
+        student,
+        SimpleNamespace(batch_size=1),
+        torch.ones_like(clean),
+        4,
+        student_time_shift_gamma=5.0,
+    )
+    evaluation_grid = shifted_time_grid(4, 5.0, device=clean.device, descending=True)
+    assert torch.allclose(torch.stack([value[0] for value in student.times]), evaluation_grid[:-1])
+    assert torch.any(torch.isclose(evaluation_grid, time))

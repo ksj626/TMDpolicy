@@ -103,6 +103,25 @@ class TrainingProgram(nn.Module, ABC):
         """Fail fast on method-specific gradient-path invariants."""
 
 
+def validate_optimizer_parameter_ownership(optimizers: dict[str, Optimizer]) -> None:
+    """Reject parameters registered with more than one independently stepped optimizer."""
+
+    owners: dict[int, tuple[str, int, int]] = {}
+    for optimizer_name, optimizer in optimizers.items():
+        for group_index, group in enumerate(optimizer.param_groups):
+            for parameter_index, parameter in enumerate(group["params"]):
+                identity = id(parameter)
+                if identity in owners:
+                    previous_name, previous_group, previous_index = owners[identity]
+                    raise RuntimeError(
+                        "optimizer parameter overlap: "
+                        f"{previous_name}[group={previous_group},parameter={previous_index}] and "
+                        f"{optimizer_name}[group={group_index},parameter={parameter_index}] own "
+                        "the same parameter"
+                    )
+                owners[identity] = (optimizer_name, group_index, parameter_index)
+
+
 def seed_everything(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
@@ -314,6 +333,7 @@ def run_training(
     optimizers = program.make_optimizers(training)
     if set(optimizers) != set(program.phase_schedule()):
         raise RuntimeError("phase_schedule and optimizer names must contain the same unique phases")
+    validate_optimizer_parameter_ownership(optimizers)
     schedulers = {name: _scheduler(value, training) for name, value in optimizers.items()}
     scaler = torch.amp.GradScaler("cuda", enabled=training["mixed_precision"] == "fp16" and device.type == "cuda")
     compatibility = verify_installed_lerobot(
@@ -471,4 +491,10 @@ def run_training(
     return report
 
 
-__all__ = ["DeterministicBatchSampler", "TrainingProgram", "run_training", "seed_everything"]
+__all__ = [
+    "DeterministicBatchSampler",
+    "TrainingProgram",
+    "run_training",
+    "seed_everything",
+    "validate_optimizer_parameter_ownership",
+]

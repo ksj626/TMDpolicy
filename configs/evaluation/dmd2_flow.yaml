@@ -1,12 +1,12 @@
 method: evaluate_libero
-classification: trained paper DMD2-flow all-40-task evaluation
+classification: trained direct DMD2-v all-40-task evaluation
 backend: {lerobot_version: "0.6.1", expected_source_hashes: null, local_files_only: false}
 models:
   student: {id: lerobot/smolvla_libero, revision: 31d453f7edd78c839a8bbc39744a292686daf0de, processor_revision: 31d453f7edd78c839a8bbc39744a292686daf0de}
   teacher: {id: lerobot/pi05_libero_finetuned, revision: 8e174154ef5f6c60a8da12ae99c303d8963138c1, processor_revision: 8e174154ef5f6c60a8da12ae99c303d8963138c1}
 dataset: {id: lerobot/libero, revision: a1aaacb7f6cd6ee5fb43120f673cebb0cfea7dd4, cache: .cache/lerobot, manifest: artifacts/data/libero_expert/episode_manifest.json, validation_fraction: 0.1, test_fraction: 0.1, split_seed: 17, download_videos: true, video_backend: pyav}
 horizons: {prediction: 50, execution: 10}
-policy: {method: dmd2_flow, device: cuda:0, checkpoint: artifacts/training/dmd2_flow_paper/checkpoints/final.pt, checkpoint_sha256: auto, outer_steps: 4, inner_steps: 1}
+policy: {method: dmd2_flow, device: cuda:0, checkpoint: artifacts/training/dmd2_flow_paper/checkpoints/final.pt, checkpoint_sha256: auto}
 evaluation: &evaluation
   fps: 10
   benchmark:

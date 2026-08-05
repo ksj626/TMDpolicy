@@ -94,6 +94,12 @@ def _evaluate(args: argparse.Namespace) -> int:
         config["policy"]["checkpoint"] = args.checkpoint
     if args.checkpoint_sha256 is not None:
         config["policy"]["checkpoint_sha256"] = args.checkpoint_sha256
+    if (args.outer_steps is not None or args.inner_steps is not None) and config["policy"][
+        "method"
+    ] in {"dmd2_flow", "tmd_stage1", "tmd_stage2", "occupancy_tmd"}:
+        raise ValueError(
+            "distilled-policy evaluation step counts and shifted-grid gamma come from the checkpoint"
+        )
     if args.outer_steps is not None:
         config["policy"]["outer_steps"] = args.outer_steps
     if args.inner_steps is not None:

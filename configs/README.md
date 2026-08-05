@@ -21,13 +21,20 @@ feature defaults.
 
 Time sections `vsd_time`, `gan_time`, and `fake_score_time` require
 `0 <= minimum_time < maximum_time <= 1` and `time_shift_gamma >= 1`. TMD Stage 1
-separately configures outer and inner shifts, the discrete inference inner-step
-grid, condition dropout, `r=s` fraction, and adaptive normalization.
+uses `student_time_shift_gamma` for both discrete training/inference grids and
+`meanflow_time_shift_gamma` for continuous `s`. `discrete_outer_steps` and
+`discrete_inner_steps` are checkpoint architecture fields. Nonzero
+`condition_dropout_probability` is rejected because this conditional baseline
+has no CFG. `normalization_constant_scale: 1.0` yields `c=350` for `[50,7]`.
 
 `discriminator.feature_source` is explicitly `fake_score_features` for DMD2 and
 `teacher_features` for TMD Stage 2. Selected layers and separate-head aggregation
 are stored in provenance. Cached condition identity includes encoder/processor
 revision, layer, dtype, dimension, components, and detach policy.
+DMD2 also records `student_training_mode: real_data_outer_transition` and a
+separate `guidance_classifier_weight`; Stage 2 records
+`student_training_mode: tmd_stage1_outer_transition` and an explicit
+`discriminator_updates_per_generator`.
 
 `vsd_normalization` is method-locked: DMD2 uses
 `dmd2_teacher_residual_mean_abs`, while TMD Stage 2 uses

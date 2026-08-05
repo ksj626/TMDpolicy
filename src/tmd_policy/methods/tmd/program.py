@@ -8,6 +8,7 @@ import torch
 from torch import Tensor, nn
 
 from tmd_policy.backends.lerobot.smolvla_student import LeRobotSmolVLAStudent, SmolVLAConditionCache
+from tmd_policy.methods.flow_objectives import shifted_time_grid
 from tmd_policy.training.engine import TrainingProgram
 
 from .heads import GRUMeanFlowHead, SplitTransformerMeanFlowHead
@@ -22,6 +23,7 @@ def sample_stage1_generator(
     *,
     outer_steps: int,
     inner_steps: int,
+    student_time_shift_gamma: float,
     inner_noises: Tensor | None = None,
 ) -> Tensor:
     """The single Stage-1 sampler used by Stage 1, Stage 2, and evaluation."""
@@ -34,7 +36,13 @@ def sample_stage1_generator(
         )
     if inner_noises.shape != (outer_steps, *outer_noise.shape):
         raise ValueError("inner_noises must be [outer_steps,B,50,32]")
-    grid = torch.linspace(1.0, 0.0, outer_steps + 1, device=outer_noise.device, dtype=outer_noise.dtype)
+    grid = shifted_time_grid(
+        outer_steps,
+        student_time_shift_gamma,
+        device=outer_noise.device,
+        dtype=outer_noise.dtype,
+        descending=True,
+    )
     value = outer_noise
     for index, (current, target) in enumerate(zip(grid[:-1], grid[1:], strict=True)):
         time = current.expand(value.shape[0])
@@ -44,6 +52,7 @@ def sample_stage1_generator(
             inner_noises[index],
             features,
             num_steps=inner_steps,
+            student_time_shift_gamma=student_time_shift_gamma,
             base_velocity=base_velocity,
         )
         value = value + (target - current) * transition
@@ -55,6 +64,11 @@ class TMDStage1Program(TrainingProgram):
         super().__init__()
         self.student = student
         self.tmd_config = dict(config)
+        if float(config.get("condition_dropout_probability", 0.0)) != 0.0:
+            raise ValueError(
+                "conditional action-policy TMD does not implement CFG; "
+                "condition_dropout_probability must be 0.0"
+            )
         feature_dim = int(student.flow.vlm_with_expert.expert_hidden_size)
         variant = config["variant"]
         if variant == "tmd_split_transformer_head":
@@ -123,19 +137,14 @@ class TMDStage1Program(TrainingProgram):
         samples = sample_meanflow_batch(
             actions,
             flow_matching_fraction=float(self.tmd_config["flow_matching_fraction"]),
-            outer_time_shift_gamma=float(self.tmd_config.get("outer_time_shift_gamma", 1.0)),
-            inner_time_shift_gamma=float(self.tmd_config.get("inner_time_shift_gamma", 1.0)),
-            discrete_target_steps=int(self.tmd_config.get("inference_inner_steps", 1)),
+            student_time_shift_gamma=float(self.tmd_config["student_time_shift_gamma"]),
+            meanflow_time_shift_gamma=float(self.tmd_config["meanflow_time_shift_gamma"]),
+            discrete_outer_steps=int(self.tmd_config["discrete_outer_steps"]),
+            discrete_inner_steps=int(self.tmd_config["discrete_inner_steps"]),
         )
         outer_time = samples.outer_time
         x_t = (1.0 - outer_time[:, None, None]) * actions + outer_time[:, None, None] * samples.outer_noise
         base_velocity, features = self.student.velocity_with_features(condition, x_t, outer_time)
-        dropout = float(self.tmd_config.get("condition_dropout_probability", 0.0))
-        if not 0.0 <= dropout < 1.0:
-            raise ValueError("condition_dropout_probability must be in [0,1)")
-        if dropout:
-            keep = (torch.rand(actions.shape[0], device=actions.device) >= dropout).to(features.dtype)
-            features = features * keep[:, None, None]
         true_transition = samples.outer_noise - actions
         values = meanflow_loss(
             self.head,
@@ -146,7 +155,9 @@ class TMDStage1Program(TrainingProgram):
             context=features,
             base_velocity=base_velocity,
             valid_coordinates=self._coordinate_mask(valid),
-            normalization_constant=float(self.tmd_config["normalization_constant"]),
+            normalization_constant_scale=float(
+                self.tmd_config["normalization_constant_scale"]
+            ),
         )
         return values, samples, valid, condition
 
@@ -184,6 +195,7 @@ class TMDStage1Program(TrainingProgram):
             outer_noise,
             outer_steps=outer_steps,
             inner_steps=inner_steps,
+            student_time_shift_gamma=float(self.tmd_config["student_time_shift_gamma"]),
             inner_noises=inner_noises,
         )
 
@@ -212,6 +224,7 @@ class TMDStage1Program(TrainingProgram):
             "intended_trainable_parameter_names": list(self.intended_student_trainable_names),
             "attention_mode": getattr(self.head, "attention_mode", "recurrent"),
             "preconditioning": "u=z-(v_smolvla+Delta); zero Delta reproduces SmolVLA transition",
+            "conditioning": "conditional action-policy TMD adaptation without CFG",
         }
 
 

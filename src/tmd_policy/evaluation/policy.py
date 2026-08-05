@@ -26,6 +26,7 @@ class InferencePolicy(nn.Module):
         method: str,
         outer_steps: int,
         inner_steps: int,
+        student_time_shift_gamma: float,
         tmd_head: nn.Module | None = None,
         sampler_mode: str = "override",
     ) -> None:
@@ -34,6 +35,7 @@ class InferencePolicy(nn.Module):
         self.method = method
         self.outer_steps = outer_steps
         self.inner_steps = inner_steps
+        self.student_time_shift_gamma = student_time_shift_gamma
         self.tmd_head = tmd_head
         self.sampler_mode = sampler_mode
 
@@ -62,7 +64,12 @@ class InferencePolicy(nn.Module):
             return self.student.postprocessor(normalized)
         condition = self.student.encode_condition(processed)
         if self.tmd_head is None:
-            normalized = self.student.sample(condition, noise, self.outer_steps)
+            normalized = self.student.sample(
+                condition,
+                noise,
+                self.outer_steps,
+                student_time_shift_gamma=self.student_time_shift_gamma,
+            )
         else:
             inner = torch.stack(
                 [
@@ -84,6 +91,7 @@ class InferencePolicy(nn.Module):
                 noise,
                 outer_steps=self.outer_steps,
                 inner_steps=self.inner_steps,
+                student_time_shift_gamma=self.student_time_shift_gamma,
                 inner_noises=inner,
             )
         return self.student.postprocessor(normalized[..., :7])
@@ -175,6 +183,7 @@ def load_inference_policy(
                 method=method,
                 outer_steps=steps,
                 inner_steps=1,
+                student_time_shift_gamma=1.0,
                 sampler_mode=mode,
             ).eval(),
             {
@@ -220,11 +229,31 @@ def load_inference_policy(
         head = stage1.head
     elif method not in {"flow_sft", "dmd2_flow"}:
         raise ValueError(f"unsupported inference checkpoint method: {method}")
+    if method == "dmd2_flow":
+        sampling_architecture = checkpoint_config["dmd2"]
+        outer_steps = int(sampling_architecture["discrete_outer_steps"])
+        inner_steps = 1
+        student_time_shift_gamma = float(sampling_architecture["student_time_shift_gamma"])
+    elif method in {"tmd_stage1", "occupancy_tmd"}:
+        sampling_architecture = checkpoint_config["tmd"]
+        outer_steps = int(sampling_architecture["discrete_outer_steps"])
+        inner_steps = int(sampling_architecture["discrete_inner_steps"])
+        student_time_shift_gamma = float(sampling_architecture["student_time_shift_gamma"])
+    elif method == "tmd_stage2":
+        sampling_architecture = checkpoint_config["stage1_architecture"]
+        outer_steps = int(sampling_architecture["discrete_outer_steps"])
+        inner_steps = int(sampling_architecture["discrete_inner_steps"])
+        student_time_shift_gamma = float(sampling_architecture["student_time_shift_gamma"])
+    else:
+        outer_steps = int(policy_config["outer_steps"])
+        inner_steps = int(policy_config.get("inner_steps", 1))
+        student_time_shift_gamma = 1.0
     policy = InferencePolicy(
         student,
         method=method,
-        outer_steps=int(policy_config["outer_steps"]),
-        inner_steps=int(policy_config.get("inner_steps", 1)),
+        outer_steps=outer_steps,
+        inner_steps=inner_steps,
+        student_time_shift_gamma=student_time_shift_gamma,
         tmd_head=head,
     ).to(device).eval()
     return policy, {
@@ -235,6 +264,12 @@ def load_inference_policy(
         "training_global_step": payload["counters"]["global_step"],
         "model_revision": student.model_revision,
         "processor_revision": student.processor_revision,
+        "sampling_grid": {
+            "outer_steps": outer_steps,
+            "inner_steps": inner_steps,
+            "student_time_shift_gamma": student_time_shift_gamma,
+            "source": "checkpoint architecture" if method != "flow_sft" else "flow-SFT evaluation",
+        },
     }
 
 

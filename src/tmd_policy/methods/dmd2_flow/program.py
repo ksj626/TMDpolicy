@@ -20,6 +20,7 @@ from tmd_policy.methods.flow_objectives import (
     corrupt_rectified_flow,
     executable_coordinate_mask,
     sample_shifted_time,
+    shifted_time_grid,
     stopped_dmd2_direction,
     stopped_l1_score_direction,
     surrogate_vector_loss,
@@ -50,7 +51,7 @@ def _frozen_parameters(module: nn.Module):
 
 
 class DMD2FlowProgram(TrainingProgram):
-    """Faithful objective: VSD plus noised-feature GAN, with no data regression."""
+    """Direct DMD2-v outer-transition objective with VSD and feature GAN."""
 
     def __init__(
         self,
@@ -72,6 +73,15 @@ class DMD2FlowProgram(TrainingProgram):
         self.teacher = teacher
         self.bridge = bridge
         self.dmd_config = dict(config)
+        expected_training_mode = (
+            "tmd_stage1_outer_transition"
+            if preserve_student_trainability
+            else "real_data_outer_transition"
+        )
+        if config.get("student_training_mode") != expected_training_mode:
+            raise ValueError(
+                f"student_training_mode must be {expected_training_mode!r} for this baseline"
+            )
         self.fake_variant = str(config["fake_score_variant"])
         if self.fake_variant == "lightweight":
             fake_cfg = config["fake_score"]
@@ -146,7 +156,12 @@ class DMD2FlowProgram(TrainingProgram):
         ratio = int(self.dmd_config["fake_updates_per_generator"])
         if ratio < 1:
             raise ValueError("fake_updates_per_generator must be positive")
-        return ("fake",) * ratio + ("discriminator", "generator")
+        if self.feature_source == "fake_score_features":
+            return ("guidance",) * ratio + ("generator",)
+        discriminator_ratio = int(self.dmd_config["discriminator_updates_per_generator"])
+        if discriminator_ratio < 1:
+            raise ValueError("discriminator_updates_per_generator must be positive")
+        return ("fake",) * ratio + ("discriminator",) * discriminator_ratio + ("generator",)
 
     @property
     def student_device(self) -> torch.device:
@@ -178,13 +193,26 @@ class DMD2FlowProgram(TrainingProgram):
     def _sample_student(self, batch: dict[str, Any], *, requires_grad: bool) -> Tensor:
         processed = self.student.preprocess_observation(batch)
         condition = self.student.encode_condition(processed)
-        noise = torch.randn(condition.batch_size, 50, 32, device=self.student_device, dtype=torch.float32)
+        clean = self.student.policy.prepare_action(processed)
+        source = torch.randn_like(clean)
+        grid = shifted_time_grid(
+            int(self.dmd_config["discrete_outer_steps"]),
+            float(self.dmd_config["student_time_shift_gamma"]),
+            device=self.student_device,
+            dtype=torch.float32,
+        )
+        indices = torch.randint(1, grid.numel(), (condition.batch_size,), device=self.student_device)
+        time = grid[indices]
+        x_t = (1.0 - time[:, None, None]) * clean + time[:, None, None] * source
+
+        def predict() -> Tensor:
+            velocity = self.student.velocity(condition, x_t, time)
+            return self._denoised_prediction(x_t, time, velocity)
+
         if requires_grad:
-            return self.student.sample(condition, noise, int(self.dmd_config["generation_steps"]))
+            return predict()
         with torch.no_grad():
-            return self.student.sample(
-                condition, noise, int(self.dmd_config["generation_steps"])
-            ).detach()
+            return predict().detach()
 
     def _student_condition(self, batch: dict[str, Any]) -> SmolVLAConditionCache:
         return self.student.encode_condition(self.student.preprocess_observation(batch))
@@ -226,8 +254,14 @@ class DMD2FlowProgram(TrainingProgram):
         student_actions = self.student.policy.prepare_action(processed).detach()
         return self.bridge.student_to_teacher(student_actions, valid).values
 
-    def _fake_loss(self, batch: dict[str, Any]) -> tuple[Tensor, dict[str, float]]:
-        generated = self._sample_student(batch, requires_grad=False)
+    def _fake_loss(
+        self, batch: dict[str, Any], generated: Tensor | None = None
+    ) -> tuple[Tensor, dict[str, float]]:
+        generated = (
+            self._sample_student(batch, requires_grad=False)
+            if generated is None
+            else generated.detach()
+        )
         valid_student = self._valid(batch, self.student_device)
         clean = self.bridge.student_to_teacher(generated, valid_student).values.detach()
         fake_device = self._fake_score_device
@@ -285,8 +319,14 @@ class DMD2FlowProgram(TrainingProgram):
             raise TypeError("paper feature path requires IntermediateFeatureDiscriminator")
         return discriminator.layer_logits(features, time, valid)
 
-    def _discriminator_loss(self, batch: dict[str, Any]) -> tuple[Tensor, dict[str, float]]:
-        generated = self._sample_student(batch, requires_grad=False)
+    def _discriminator_loss(
+        self, batch: dict[str, Any], generated: Tensor | None = None
+    ) -> tuple[Tensor, dict[str, float]]:
+        generated = (
+            self._sample_student(batch, requires_grad=False)
+            if generated is None
+            else generated.detach()
+        )
         valid_student = self._valid(batch, self.student_device)
         real = self._real_actions_teacher(batch, valid_student)
         fake = self.bridge.student_to_teacher(generated, valid_student).values.detach()
@@ -326,6 +366,22 @@ class DMD2FlowProgram(TrainingProgram):
             "real_probability": float(real_values.sigmoid().mean().detach()),
             "fake_probability": float(fake_values.sigmoid().mean().detach()),
             "gan_noise_time": float(time.mean().detach()),
+        }
+
+    def _guidance_loss(self, batch: dict[str, Any]) -> tuple[Tensor, dict[str, float]]:
+        if self.feature_source != "fake_score_features":
+            raise ValueError("combined guidance is only valid for fake-score discriminator features")
+        generated = self._sample_student(batch, requires_grad=False).detach()
+        fake_loss, fake_metrics = self._fake_loss(batch, generated)
+        discriminator_loss, discriminator_metrics = self._discriminator_loss(batch, generated)
+        classifier_weight = float(self.dmd_config["guidance_classifier_weight"])
+        loss = fake_loss + classifier_weight * discriminator_loss
+        return loss, {
+            **{f"fake_score/{name}": value for name, value in fake_metrics.items()},
+            **{f"classifier/{name}": value for name, value in discriminator_metrics.items()},
+            "fake_score_loss": float(fake_loss.detach()),
+            "classifier_loss": float(discriminator_loss.detach()),
+            "classifier_weight": classifier_weight,
         }
 
     def _distribution_matching_loss(
@@ -421,6 +477,8 @@ class DMD2FlowProgram(TrainingProgram):
         }
 
     def loss(self, batch: dict[str, Any], phase: str) -> tuple[Tensor, dict[str, float]]:
+        if phase == "guidance":
+            return self._guidance_loss(batch)
         if phase == "fake":
             return self._fake_loss(batch)
         if phase == "discriminator":
@@ -440,7 +498,26 @@ class DMD2FlowProgram(TrainingProgram):
         fake_parameters = [parameter for parameter in self.fake_score.parameters() if parameter.requires_grad]
         discriminator_parameters = [parameter for parameter in self.discriminator.parameters() if parameter.requires_grad]
         if self.feature_source == "fake_score_features":
-            discriminator_parameters = [*discriminator_parameters, *fake_parameters]
+            return {
+                "guidance": torch.optim.AdamW(
+                    [
+                        {
+                            "params": fake_parameters,
+                            "lr": float(self.dmd_config["fake_score_learning_rate"]),
+                        },
+                        {
+                            "params": discriminator_parameters,
+                            "lr": float(self.dmd_config["discriminator_learning_rate"]),
+                        },
+                    ],
+                    **common,
+                ),
+                "generator": torch.optim.AdamW(
+                    [parameter for parameter in self.student.parameters() if parameter.requires_grad],
+                    lr=float(self.dmd_config["generator_learning_rate"]),
+                    **common,
+                ),
+            }
         return {
             "fake": torch.optim.AdamW(
                 fake_parameters, lr=float(self.dmd_config["fake_score_learning_rate"]), **common
@@ -471,7 +548,15 @@ class DMD2FlowProgram(TrainingProgram):
             "fake_score_parameters": getattr(self.fake_score, "parameter_report", None),
             "discriminator": discriminator,
             "teacher_device": str(self.teacher.device),
-            "sampler_identity": "LeRobotSmolVLAStudent.sample differentiable Euler simulation",
+            "sampler_identity": (
+                "DMD2-v real-data shifted outer transition during training; "
+                "checkpoint-grid deterministic Euler integration during evaluation"
+            ),
+            "guidance_objective": (
+                "fake_score_loss + guidance_classifier_weight * discriminator_loss"
+                if self.feature_source == "fake_score_features"
+                else "disjoint fake-score and discriminator update phases"
+            ),
             "resource_model": self.dmd_config.get("resource_estimate", {}),
         }
 

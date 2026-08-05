@@ -31,8 +31,6 @@ policy:
   checkpoint: artifacts/training/tmd_stage1/checkpoints/final.pt
   checkpoint_sha256: auto
   device: cuda:0
-  outer_steps: 2
-  inner_steps: 2
 collection:
   fps: 10
   benchmark:

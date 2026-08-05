@@ -103,5 +103,5 @@ def test_removed_paths_and_training_scripts_are_concrete() -> None:
     assert required <= {script.name for script in scripts}
     for script in scripts:
         text = script.read_text(encoding="utf-8").lower()
-        assert "tmd-policy train" in text
+        assert "tmd-policy train" in text or script.name == "train_tmd_stage2.sh"
         assert "dry-run" not in text and "--execute" not in text

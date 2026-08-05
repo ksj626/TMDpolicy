@@ -27,6 +27,27 @@ def shift_time(unit_time: Tensor, gamma: float) -> Tensor:
     return gamma * unit_time / ((gamma - 1.0) * unit_time + 1.0)
 
 
+def shifted_time_grid(
+    num_steps: int,
+    gamma: float,
+    *,
+    device: torch.device,
+    dtype: torch.dtype = torch.float32,
+    descending: bool = False,
+) -> Tensor:
+    """Return the common rationally shifted student grid, including both endpoints."""
+
+    if num_steps < 1:
+        raise ValueError("shifted time-grid step count must be positive")
+    if gamma < 1.0:
+        raise ValueError("time shift gamma must be at least 1")
+    grid = shift_time(
+        torch.linspace(0.0, 1.0, num_steps + 1, device=device, dtype=dtype),
+        gamma,
+    )
+    return grid.flip(0) if descending else grid
+
+
 def sample_shifted_time(
     batch_size: int,
     *,
@@ -152,6 +173,7 @@ __all__ = [
     "corrupt_rectified_flow",
     "executable_coordinate_mask",
     "sample_shifted_time",
+    "shifted_time_grid",
     "shift_time",
     "stopped_dmd2_direction",
     "stopped_l1_score_direction",

@@ -8,7 +8,7 @@ from typing import Protocol
 import torch
 from torch import Tensor, nn
 
-from tmd_policy.methods.flow_objectives import shift_time
+from tmd_policy.methods.flow_objectives import shift_time, shifted_time_grid
 
 
 def _expand(time: Tensor, reference: Tensor) -> Tensor:
@@ -35,12 +35,13 @@ def sample_meanflow_batch(
     reference: Tensor,
     *,
     flow_matching_fraction: float,
-    outer_time_shift_gamma: float = 1.0,
-    inner_time_shift_gamma: float = 1.0,
-    discrete_target_steps: int = 1,
+    student_time_shift_gamma: float,
+    meanflow_time_shift_gamma: float,
+    discrete_outer_steps: int,
+    discrete_inner_steps: int,
     generator: torch.Generator | None = None,
 ) -> MeanFlowBatch:
-    """Sample independent Gaussian sources and the paper's `0≤r≤s≤1` mixture."""
+    """Sample TMD outer-grid times and the paper's continuous/discrete `(s,r)` pair."""
 
     if not 0 <= flow_matching_fraction <= 1:
         raise ValueError("flow_matching_fraction must be in [0,1]")
@@ -48,23 +49,35 @@ def sample_meanflow_batch(
     kwargs = {"device": reference.device, "dtype": reference.dtype, "generator": generator}
     outer_noise = torch.randn(reference.shape, **kwargs)
     inner_source = torch.randn(reference.shape, **kwargs)
-    if discrete_target_steps < 1:
-        raise ValueError("discrete_target_steps must be positive")
+    outer_grid = shifted_time_grid(
+        discrete_outer_steps,
+        student_time_shift_gamma,
+        device=reference.device,
+        dtype=reference.dtype,
+    )
+    inner_grid = shifted_time_grid(
+        discrete_inner_steps,
+        student_time_shift_gamma,
+        device=reference.device,
+        dtype=reference.dtype,
+    )
     s = shift_time(
         torch.rand(batch, device=reference.device, dtype=reference.dtype, generator=generator),
-        inner_time_shift_gamma,
+        meanflow_time_shift_gamma,
     )
-    # Sample r from the inference-aligned grid and enforce r <= s.
-    maximum_index = torch.floor(s * discrete_target_steps).long()
-    random_fraction = torch.rand(batch, device=reference.device, generator=generator)
-    selected_index = torch.floor(random_fraction * (maximum_index + 1)).long()
-    r = selected_index.to(reference.dtype) / discrete_target_steps
+    # The non-FM target is the immediately preceding inference-grid point.
+    preceding = torch.searchsorted(inner_grid, s.contiguous(), right=True) - 1
+    r = inner_grid[preceding.clamp(min=0, max=discrete_inner_steps)]
     mixture = torch.rand(batch, device=reference.device, generator=generator) < flow_matching_fraction
     r = torch.where(mixture, s, r)
-    outer_time = shift_time(
-        torch.rand(batch, device=reference.device, dtype=reference.dtype, generator=generator),
-        outer_time_shift_gamma,
+    outer_indices = torch.randint(
+        1,
+        discrete_outer_steps + 1,
+        (batch,),
+        device=reference.device,
+        generator=generator,
     )
+    outer_time = outer_grid[outer_indices]
     return MeanFlowBatch(outer_noise, inner_source, outer_time, s, r, mixture)
 
 
@@ -104,7 +117,7 @@ def meanflow_loss(
     context: Tensor,
     base_velocity: Tensor | None = None,
     valid_coordinates: Tensor,
-    normalization_constant: float,
+    normalization_constant_scale: float,
 ) -> dict[str, Tensor]:
     """MeanFlow target with stop-gradient and per-sample adaptive normalization."""
 
@@ -112,8 +125,8 @@ def meanflow_loss(
         raise ValueError("transition/source/valid-coordinate tensors must have identical shapes")
     if torch.any(valid_coordinates.flatten(1).sum(dim=1) == 0):
         raise ValueError("every TMD sample must contain a valid environment coordinate")
-    if normalization_constant <= 0:
-        raise ValueError("normalization_constant must be positive")
+    if normalization_constant_scale <= 0:
+        raise ValueError("normalization_constant_scale must be positive")
     y_s = (1.0 - _expand(inner_time, target_transition)) * target_transition + _expand(
         inner_time, target_transition
     ) * inner_source
@@ -142,12 +155,16 @@ def meanflow_loss(
         - _expand(inner_time - target_time, conditional_velocity) * derivative
     ).detach()
     squared = (prediction - target).square() * valid_coordinates.to(prediction.dtype)
-    denominator = valid_coordinates.flatten(1).sum(dim=1).to(prediction.dtype)
-    per_sample_mse = squared.flatten(1).sum(dim=1) / denominator
-    adaptive = per_sample_mse / (per_sample_mse.detach() + normalization_constant)
+    valid_count = valid_coordinates.flatten(1).sum(dim=1).to(prediction.dtype)
+    squared_error_sum = squared.flatten(1).sum(dim=1)
+    normalization_constant = normalization_constant_scale * valid_count
+    adaptive = squared_error_sum / (squared_error_sum + normalization_constant).detach()
     return {
         "loss": adaptive.mean(),
         "per_sample_loss": adaptive,
+        "squared_error_sum": squared_error_sum,
+        "valid_coordinate_count": valid_count,
+        "normalization_constant": normalization_constant,
         "prediction": prediction,
         "residual": residual,
         "base_velocity": base_velocity if base_velocity is not None else torch.zeros_like(prediction),
@@ -164,13 +181,20 @@ def integrate_inner_flow(
     context: Tensor,
     *,
     num_steps: int,
+    student_time_shift_gamma: float,
     base_velocity: Tensor | None = None,
 ) -> Tensor:
     """Shared training/inference convention: descending Euler from `s=1` to `r=0`."""
 
     if num_steps < 1:
         raise ValueError("inner num_steps must be positive")
-    grid = torch.linspace(1.0, 0.0, num_steps + 1, device=source.device, dtype=source.dtype)
+    grid = shifted_time_grid(
+        num_steps,
+        student_time_shift_gamma,
+        device=source.device,
+        dtype=source.dtype,
+        descending=True,
+    )
     value = source
     if base_velocity is not None and base_velocity.shape != source.shape:
         raise ValueError("inner-flow base velocity must match the source")

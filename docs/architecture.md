@@ -27,7 +27,10 @@ dtype, and dimension.
 
 ## Objectives
 
-For each valid coordinate, corruption is `x_t=(1-t)x+t epsilon`. DMD2 uses
+For each valid coordinate, corruption is `x_t=(1-t)x+t epsilon`. DMD2-v samples
+`t` from the nonzero checkpoint-shifted student grid and predicts
+`x_hat=x_t-t*v_student(x_t,t)`. Deterministic evaluation traverses the same grid
+in descending order. DMD2 uses
 `stopgrad((mu_fake-mu_real)/(mean_valid(abs(x-mu_real))+epsilon))`. TMD-v instead uses
 
 ```text
@@ -44,7 +47,16 @@ TM-MF defines target transition `y=x1-x`, SmolVLA base `b`, independent inner
 source `z`, residual `Delta`, transition `h=b+Delta`, and average velocity
 `u=z-h`. The flow update is `y_r=y_s+(r-s)u`. Exact JVP builds the stopped
 MeanFlow target. A zero residual integrates to `b` for every supported inner
-step count.
+step count. For non-flow-matching rows, `r` is exactly the largest shifted inner
+student-grid value no greater than continuous shifted `s`. Adaptive loss is
+`||e||^2_valid / stopgrad(||e||^2_valid + scale*N_valid)`; scale `1.0` gives
+`350` for a full `[50,7]` chunk. This conditional adaptation has no CFG.
+
+Fake-score-feature DMD2 guidance performs five joint updates, each minimizing
+fake-score denoising plus an independently weighted classifier loss. TMD Stage 2
+uses teacher features, so its disjoint fake-score and classifier optimizers keep
+explicit update ratios. The engine rejects parameters owned by multiple
+optimizers.
 
 ## Rollouts and resume
 

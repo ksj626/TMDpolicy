@@ -81,7 +81,12 @@ def test_zero_residual_inner_flow_reproduces_smolvla_base_transition(steps: int)
     source = torch.randn(2, 5, 4)
     base = torch.randn_like(source)
     result = integrate_inner_flow(
-        _ZeroResidual(), source, torch.zeros(2, 5, 3), num_steps=steps, base_velocity=base
+        _ZeroResidual(),
+        source,
+        torch.zeros(2, 5, 3),
+        num_steps=steps,
+        student_time_shift_gamma=10.0,
+        base_velocity=base,
     )
     assert torch.allclose(result, base, atol=1.0e-6)
 
@@ -235,6 +240,9 @@ def test_stratified_sampler_is_source_task_paired_and_exactly_resumable() -> Non
 
 def test_default_baseline_configs_are_pi05_feature_based_and_have_no_data_loss() -> None:
     root = Path(__file__).resolve().parents[1]
+    stage1_config = load_config(root / "configs/methods/tmd_stage1.yaml")
+    assert stage1_config["tmd"]["normalization_constant_scale"] == 1.0
+    assert stage1_config["tmd"]["condition_dropout_probability"] == 0.0
     for name, section in (
         ("dmd2_flow_paper.yaml", "dmd2"),
         ("tmd_stage2_paper.yaml", "stage2"),
@@ -246,6 +254,9 @@ def test_default_baseline_configs_are_pi05_feature_based_and_have_no_data_loss()
     assert load_config(root / "configs/methods/dmd2_flow_paper.yaml")["dmd2"][
         "vsd_normalization"
     ] == "dmd2_teacher_residual_mean_abs"
+    assert load_config(root / "configs/methods/dmd2_flow_paper.yaml")["dmd2"][
+        "student_training_mode"
+    ] == "real_data_outer_transition"
     assert load_config(root / "configs/methods/tmd_stage2_paper.yaml")["stage2"][
         "vsd_normalization"
     ] == "tmd_fake_teacher_difference_l1"
@@ -271,6 +282,19 @@ def test_configs_fail_closed_on_unknown_and_legacy_data_loss(tmp_path: Path) -> 
     legacy.write_text(original.replace("  gan_weight: 0.003", "  gan_weight: 0.003\n  data_weight: 1.0"))
     with pytest.raises(ConfigError, match="no SFT/data loss"):
         load_config(legacy)
+    legacy_grid = tmp_path / "legacy-grid.yaml"
+    legacy_grid.write_text(
+        original.replace("  student_time_shift_gamma: 5.0", "  outer_time_shift_gamma: 5.0")
+    )
+    with pytest.raises(ConfigError, match="unknown or deprecated"):
+        load_config(legacy_grid)
+    tmd_original = (root / "configs/methods/tmd_stage1.yaml").read_text(encoding="utf-8")
+    legacy_normalization = tmp_path / "legacy-normalization.yaml"
+    legacy_normalization.write_text(
+        tmd_original.replace("normalization_constant_scale: 1.0", "normalization_constant: 350.0")
+    )
+    with pytest.raises(ConfigError, match="unknown or deprecated"):
+        load_config(legacy_normalization)
 
 
 def test_pi05_evaluation_does_not_construct_smolvla_and_returns_canonical(monkeypatch) -> None:

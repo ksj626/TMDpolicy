@@ -285,6 +285,7 @@ class OccupancyWeightedTMDProgram(TMDStage1Program):
             noise,
             outer_steps=int(self.occupancy_config["weight_sampler_outer_steps"]),
             inner_steps=int(self.occupancy_config["weight_sampler_inner_steps"]),
+            student_time_shift_gamma=float(self.tmd_config["student_time_shift_gamma"]),
         )
         plan_valid = torch.ones(batch_size, 50, device=device, dtype=torch.bool)
         time = sample_shifted_time(

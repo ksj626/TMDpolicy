@@ -45,3 +45,28 @@ PY
 
 bash scripts/preflight/preflight_tmd.sh
 conda run -n tmdpolicy tmd-policy train tmd-stage2 --config "$resolved_config" --output "$stage2_output/run"
+
+final_checkpoint="$stage2_output/run/checkpoints/final.pt"
+evaluation_resolved="$stage2_output/evaluation_resolved.yaml"
+conda run --no-capture-output -n tmdpolicy python - "$final_checkpoint" "$evaluation_resolved" <<'PY'
+import hashlib
+import pathlib
+import sys
+import torch
+import yaml
+
+checkpoint = pathlib.Path(sys.argv[1]).resolve()
+target = pathlib.Path(sys.argv[2])
+if not checkpoint.is_file():
+    raise SystemExit(f"Stage-2 training did not produce the expected checkpoint: {checkpoint}")
+payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+if payload.get("format") != "tmdpolicy.training/v1" or payload["config"].get("method") != "tmd_stage2":
+    raise SystemExit("Stage-2 provenance is incompatible: expected a tmd_stage2 v1 checkpoint")
+template = yaml.safe_load(pathlib.Path("configs/evaluation/tmd_stage2.yaml").read_text())
+for key in ("models", "dataset"):
+    if payload["config"][key] != template[key]:
+        raise SystemExit(f"Stage-2 {key} provenance does not match evaluation")
+template["policy"]["checkpoint"] = str(checkpoint)
+template["policy"]["checkpoint_sha256"] = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
+target.write_text(yaml.safe_dump(template, sort_keys=False))
+PY
