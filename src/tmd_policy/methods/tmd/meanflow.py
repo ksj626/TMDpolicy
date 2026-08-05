@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -183,6 +184,7 @@ def integrate_inner_flow(
     num_steps: int,
     student_time_shift_gamma: float,
     base_velocity: Tensor | None = None,
+    step_callback: Callable[[], None] | None = None,
 ) -> Tensor:
     """Shared training/inference convention: descending Euler from `s=1` to `r=0`."""
 
@@ -205,6 +207,8 @@ def integrate_inner_flow(
         residual = head(value, s, r, context)
         average_velocity = residual if base_velocity is None else source - (base_velocity + residual)
         value = value + (target - current) * average_velocity
+        if step_callback is not None:
+            step_callback()
     return value
 
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -18,6 +19,25 @@ from .compatibility import (
 )
 
 FineTuningMode = Literal["head_only", "expert_only", "lora", "full"]
+
+
+def resolve_trainable_state_keys(student: nn.Module) -> tuple[str, ...]:
+    """Map policy-relative trainable names to wrapper state-dict keys."""
+
+    state_keys = set(student.state_dict())
+    resolved = []
+    for parameter_name in getattr(student, "trainable_parameter_names", ()):
+        candidates = (str(parameter_name), f"policy.{parameter_name}")
+        matches = [candidate for candidate in candidates if candidate in state_keys]
+        if len(matches) != 1:
+            raise RuntimeError(
+                "cannot uniquely map trainable SmolVLA parameter to its wrapper state dict: "
+                f"{parameter_name!r} -> {matches}"
+            )
+        resolved.append(matches[0])
+    if not resolved:
+        raise RuntimeError("SmolVLA exposes no trainable state-dict keys")
+    return tuple(resolved)
 
 
 @dataclass(frozen=True)
@@ -85,6 +105,7 @@ class LeRobotSmolVLAStudent(nn.Module):
     ) -> "LeRobotSmolVLAStudent":
         verify_installed_lerobot(expected_source_hashes=expected_source_hashes)
         from huggingface_hub import snapshot_download
+        from lerobot.configs.policies import PreTrainedConfig
         from lerobot.policies.factory import make_pre_post_processors
         from lerobot.policies.smolvla import SmolVLAPolicy
 
@@ -104,7 +125,13 @@ class LeRobotSmolVLAStudent(nn.Module):
                 local_files_only=local_files_only,
             )
         )
-        policy = SmolVLAPolicy.from_pretrained(snapshot, strict=True).to(device)
+        policy_config = PreTrainedConfig.from_pretrained(snapshot)
+        policy_config.device = str(device)
+        policy = SmolVLAPolicy.from_pretrained(
+            snapshot,
+            config=policy_config,
+            strict=True,
+        )
         verify_checkpoint_projection_loaded(policy, snapshot)
         policy.config.device = str(device)
         preprocessor, postprocessor = make_pre_post_processors(
@@ -343,6 +370,7 @@ class LeRobotSmolVLAStudent(nn.Module):
         *,
         student_time_shift_gamma: float,
         time_grid: Tensor | None = None,
+        step_callback: Callable[[], None] | None = None,
     ) -> Tensor:
         """Shared differentiable sampler used by training simulation and inference."""
 
@@ -362,6 +390,8 @@ class LeRobotSmolVLAStudent(nn.Module):
         for current, target in zip(time_grid[:-1], time_grid[1:], strict=True):
             time = current.expand(condition.batch_size)
             value = value + (target - current).to(value.dtype) * self.velocity(condition, value, time)
+            if step_callback is not None:
+                step_callback()
         return value
 
     @torch.no_grad()
@@ -396,4 +426,9 @@ class LeRobotSmolVLAStudent(nn.Module):
         return self.postprocessor(normalized)
 
 
-__all__ = ["FineTuningMode", "LeRobotSmolVLAStudent", "SmolVLAConditionCache"]
+__all__ = [
+    "FineTuningMode",
+    "LeRobotSmolVLAStudent",
+    "SmolVLAConditionCache",
+    "resolve_trainable_state_keys",
+]

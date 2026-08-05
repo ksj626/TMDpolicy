@@ -12,6 +12,7 @@ import sys
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Iterator
+from itertools import islice
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +22,7 @@ from torch import Tensor, nn
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 from torch.utils.data import DataLoader, Dataset, Sampler
+from tqdm.auto import tqdm
 
 from tmd_policy.backends.lerobot.compatibility import verify_installed_lerobot
 from tmd_policy.config import project_path, save_resolved_config
@@ -101,6 +103,16 @@ class TrainingProgram(nn.Module, ABC):
 
     def validate_phase_gradients(self, phase: str) -> None:
         """Fail fast on method-specific gradient-path invariants."""
+
+    def backward_loss_scale(self, phase: str) -> float:
+        """Return a numerically safe scale that is removed before the optimizer step."""
+
+        return 1.0
+
+    def inference_state_dict(self) -> dict[str, Tensor] | None:
+        """Return a minimal evaluable state, or ``None`` when unsupported."""
+
+        return None
 
 
 def validate_optimizer_parameter_ownership(optimizers: dict[str, Optimizer]) -> None:
@@ -229,6 +241,114 @@ def _atomic_save(payload: dict[str, Any], target: Path) -> None:
     os.replace(temporary, target)
 
 
+def _inference_checkpoint_payload(
+    program: TrainingProgram,
+    *,
+    config: dict[str, Any],
+    provenance: dict[str, Any],
+    global_step: int,
+    epoch: int,
+) -> dict[str, Any] | None:
+    state = program.inference_state_dict()
+    if state is None:
+        return None
+    return {
+        "format": "tmdpolicy.inference/v1",
+        "program": state,
+        "counters": {"global_step": global_step, "epoch": epoch},
+        "config": config,
+        "provenance": provenance,
+        "trainable_parameter_names": sorted(state),
+        "base_model_contract": "immutable hub revision plus saved trainable delta",
+    }
+
+
+def _load_metric_history(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    rows = []
+    with path.open("r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            if not line.strip():
+                continue
+            value = json.loads(line)
+            if not isinstance(value, dict) or "global_step" not in value:
+                raise ValueError(f"invalid metrics row at {path}:{line_number}")
+            rows.append(value)
+    return rows
+
+
+def _loss_series(rows: list[dict[str, Any]]) -> dict[str, list[tuple[int, float]]]:
+    series: dict[str, list[tuple[int, float]]] = {}
+    for row in rows:
+        step = int(row["global_step"])
+        for name, value in row.items():
+            if (
+                name.endswith("/loss")
+                and isinstance(value, (int, float))
+                and math.isfinite(float(value))
+            ):
+                series.setdefault(name, []).append((step, float(value)))
+    return series
+
+
+def _append_loss_series(
+    series: dict[str, list[tuple[int, float]]], row: dict[str, Any]
+) -> None:
+    step = int(row["global_step"])
+    for name, value in row.items():
+        if (
+            name.endswith("/loss")
+            and isinstance(value, (int, float))
+            and math.isfinite(float(value))
+        ):
+            series.setdefault(name, []).append((step, float(value)))
+
+
+def _write_training_progress(
+    series: dict[str, list[tuple[int, float]]], target: Path, *, method: str
+) -> None:
+    """Atomically refresh a standalone plot of all persisted loss series."""
+
+    if not series:
+        return
+    import matplotlib
+
+    matplotlib.use("Agg")
+    from matplotlib import pyplot as plt
+
+    figure, axis = plt.subplots(figsize=(11, 6.5), constrained_layout=True)
+    for name, all_points in sorted(series.items()):
+        # A PNG cannot display every point from a 100k-step run. Bound redraw
+        # cost while retaining the first, last, and regularly sampled history.
+        stride = max(1, math.ceil(len(all_points) / 2_000))
+        points = all_points[::stride]
+        if points and points[-1] != all_points[-1]:
+            points.append(all_points[-1])
+        if points:
+            axis.plot(
+                [point[0] for point in points],
+                [point[1] for point in points],
+                label=name,
+                linewidth=1.5,
+            )
+    axis.set_title(f"{method} training progress")
+    axis.set_xlabel("global step")
+    axis.set_ylabel("loss")
+    axis.set_yscale("symlog", linthresh=1.0e-4)
+    axis.grid(True, alpha=0.25)
+    axis.legend(loc="best", fontsize="small")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(f".{target.stem}.partial{target.suffix}")
+    try:
+        figure.savefig(temporary, format="png", dpi=150)
+        os.replace(temporary, target)
+    finally:
+        plt.close(figure)
+        if temporary.exists():
+            temporary.unlink()
+
+
 def _load_checkpoint(
     path: Path,
     program: TrainingProgram,
@@ -286,9 +406,16 @@ def _validate(
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
     losses: list[float] = []
     metrics: dict[str, list[float]] = {}
-    for index, batch in enumerate(loader):
-        if index >= max_batches:
-            break
+    validation_batches = min(max_batches, len(loader))
+    batches = tqdm(
+        islice(loader, validation_batches),
+        total=validation_batches,
+        desc="validation",
+        unit="batch",
+        leave=False,
+        dynamic_ncols=True,
+    )
+    for batch in batches:
         with _autocast(device, precision):
             loss, values = program.validation_loss(batch)
         losses.append(float(loss.detach()))
@@ -331,7 +458,8 @@ def run_training(
     (output / "trainable_parameters.json").write_text(json.dumps(names, indent=2) + "\n", encoding="utf-8")
 
     optimizers = program.make_optimizers(training)
-    if set(optimizers) != set(program.phase_schedule()):
+    phase_schedule = program.phase_schedule()
+    if set(optimizers) != set(phase_schedule):
         raise RuntimeError("phase_schedule and optimizer names must contain the same unique phases")
     validate_optimizer_parameter_ownership(optimizers)
     schedulers = {name: _scheduler(value, training) for name, value in optimizers.items()}
@@ -381,9 +509,19 @@ def run_training(
             Path(resume), program, optimizers, schedulers, scaler, config, sampler
         )
     metrics_path = output / "metrics.jsonl"
+    progress_plot_path = output / "training_progress.png"
+    loss_series = _loss_series(_load_metric_history(metrics_path))
     clip = float(training["gradient_clip_norm"])
+    maximum_steps = int(training["max_steps"])
+    progress = tqdm(
+        total=maximum_steps,
+        initial=global_step,
+        desc=f"train {config['method']}",
+        unit="step",
+        dynamic_ncols=True,
+    )
 
-    while global_step < int(training["max_steps"]):
+    while global_step < maximum_steps:
         sampler.epoch = epoch
         sampler.start_batch = next_batch
         loader = DataLoader(
@@ -394,7 +532,7 @@ def run_training(
             persistent_workers=bool(training.get("num_workers", 0)),
         )
         iterator = iter(loader)
-        while global_step < int(training["max_steps"]):
+        while global_step < maximum_steps:
             microbatches = []
             for _ in range(accumulation):
                 try:
@@ -406,22 +544,49 @@ def run_training(
                 next_batch = 0
                 break
             step_metrics: dict[str, float] = {}
-            for phase in program.phase_schedule():
+            for phase_index, phase in enumerate(phase_schedule, start=1):
+                progress.set_postfix_str(
+                    f"phase={phase} {phase_index}/{len(phase_schedule)} microbatch=0/{accumulation}",
+                    refresh=True,
+                )
                 optimizer = optimizers[phase]
                 optimizer.zero_grad(set_to_none=True)
+                backward_scale = float(program.backward_loss_scale(phase))
+                if not math.isfinite(backward_scale) or backward_scale <= 0.0:
+                    raise RuntimeError(
+                        f"{phase} backward loss scale must be positive and finite, got {backward_scale}"
+                    )
                 phase_losses = []
                 phase_values: dict[str, list[float]] = {}
-                for batch in microbatches:
+                for microbatch_index, batch in enumerate(microbatches, start=1):
                     with _autocast(device, training["mixed_precision"]):
                         loss, values = program.loss(batch, phase)
-                        scaled_loss = loss / accumulation
+                        if loss.numel() != 1 or not torch.isfinite(loss.detach()).all():
+                            raise RuntimeError(f"{phase} loss contains NaN/Inf before backward")
+                        scaled_loss = loss * backward_scale / accumulation
                     scaler.scale(scaled_loss).backward()
                     phase_losses.append(float(loss.detach()))
                     for name, value in values.items():
                         phase_values.setdefault(name, []).append(float(value))
+                    progress.set_postfix_str(
+                        f"phase={phase} {phase_index}/{len(phase_schedule)} "
+                        f"microbatch={microbatch_index}/{accumulation}",
+                        refresh=True,
+                    )
                 scaler.unscale_(optimizer)
+                if backward_scale != 1.0:
+                    for group in optimizer.param_groups:
+                        for parameter in group["params"]:
+                            if parameter.grad is not None:
+                                parameter.grad.div_(backward_scale)
                 program.validate_phase_gradients(phase)
                 parameters = [parameter for group in optimizer.param_groups for parameter in group["params"]]
+                if any(
+                    parameter.grad is not None
+                    and not torch.isfinite(parameter.grad).all()
+                    for parameter in parameters
+                ):
+                    raise RuntimeError(f"{phase} optimizer gradient contains NaN/Inf before step")
                 gradient_norm = torch.nn.utils.clip_grad_norm_(parameters, clip)
                 scaler.step(optimizer)
                 scaler.update()
@@ -448,6 +613,21 @@ def run_training(
                 )
             with metrics_path.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(row, sort_keys=True) + "\n")
+            _append_loss_series(loss_series, row)
+            _write_training_progress(
+                loss_series,
+                progress_plot_path,
+                method=str(config["method"]),
+            )
+            progress.update(1)
+            progress.set_postfix(
+                {
+                    key.removeprefix("train/").removesuffix("/loss"): f"{value:.4g}"
+                    for key, value in step_metrics.items()
+                    if key.endswith("/loss")
+                },
+                refresh=True,
+            )
             if global_step % int(training["checkpoint_interval"]) == 0:
                 payload = _checkpoint_payload(
                     program,
@@ -464,6 +644,28 @@ def run_training(
                 checkpoint = output / "checkpoints" / f"step-{global_step:08d}.pt"
                 _atomic_save(payload, checkpoint)
                 _atomic_save(payload, output / "checkpoints" / "latest.pt")
+            inference_interval = int(training.get("inference_checkpoint_interval", 0))
+            if inference_interval and global_step % inference_interval == 0:
+                inference_payload = _inference_checkpoint_payload(
+                    program,
+                    config=config,
+                    provenance=provenance,
+                    global_step=global_step,
+                    epoch=epoch,
+                )
+                if inference_payload is not None:
+                    inference_checkpoint = (
+                        output
+                        / "inference_checkpoints"
+                        / f"step-{global_step:08d}.pt"
+                    )
+                    _atomic_save(inference_payload, inference_checkpoint)
+                    _atomic_save(
+                        inference_payload,
+                        output / "inference_checkpoints" / "latest.pt",
+                    )
+
+    progress.close()
 
     final_payload = _checkpoint_payload(
         program,
@@ -479,6 +681,17 @@ def run_training(
     )
     final_checkpoint = output / "checkpoints" / "final.pt"
     _atomic_save(final_payload, final_checkpoint)
+    final_inference_payload = _inference_checkpoint_payload(
+        program,
+        config=config,
+        provenance=provenance,
+        global_step=global_step,
+        epoch=epoch,
+    )
+    final_inference_checkpoint = None
+    if final_inference_payload is not None:
+        final_inference_checkpoint = output / "inference_checkpoints" / "final.pt"
+        _atomic_save(final_inference_payload, final_inference_checkpoint)
     report = {
         "method": config["method"],
         "global_step": global_step,
@@ -486,6 +699,12 @@ def run_training(
         "checkpoint": str(final_checkpoint.resolve()),
         "trainable_parameters": len(names),
         "metrics": str(metrics_path.resolve()),
+        "progress_plot": str(progress_plot_path.resolve()),
+        "inference_checkpoint": (
+            str(final_inference_checkpoint.resolve())
+            if final_inference_checkpoint is not None
+            else None
+        ),
     }
     (output / "training_report.json").write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return report

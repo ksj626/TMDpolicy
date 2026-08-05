@@ -43,7 +43,7 @@ training:
   max_steps: 100000
   validation_interval: 500
   validation_batches: 8
-  checkpoint_interval: 1000
+  checkpoint_interval: 10
 stage1_architecture:
   variant: tmd_split_transformer_head
   attention_mode: bidirectional

@@ -43,9 +43,12 @@ attention.
 Regression tests were added for shifted grid membership/predecessors, shared
 training/evaluation grids, adaptive normalization and padding, optimizer
 ownership, guidance gradient isolation, DMD2-v clean prediction, strict legacy
-config rejection, and canonical config loading. In accordance with the task
-constraint, these tests were not executed. No training, evaluation, rollout,
-download, checkpoint load, or real PI0.5/SmolVLA construction was performed.
+config rejection, canonical config loading, cycle-safe imports, and FP32
+MeanFlow/discriminator behavior under BF16 autocast. They were initially left
+unexecuted as required; during the subsequent import/precision bug-fix request,
+the eight directly affected lightweight tests passed. No training, evaluation,
+rollout, download, checkpoint load, or real PI0.5/SmolVLA construction was
+performed during that verification.
 
 ## Fidelity and resources
 

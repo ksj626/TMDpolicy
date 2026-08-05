@@ -18,10 +18,10 @@ horizons: {prediction: 50, execution: 10}
 training:
   seed: 7
   device: cuda:0
-  batch_size: 4
-  num_workers: 0
+  batch_size: 8
+  num_workers: 4
   mixed_precision: bf16
-  gradient_accumulation: 8
+  gradient_accumulation: 4
   gradient_clip_norm: 1.0
   learning_rate: 1.0e-5
   weight_decay: 1.0e-4
@@ -33,6 +33,7 @@ training:
   validation_interval: 500
   validation_batches: 8
   checkpoint_interval: 1000
+  inference_checkpoint_interval: 10
 dmd2:
   student_fine_tuning: head_only
   fake_score_variant: pi05_clone

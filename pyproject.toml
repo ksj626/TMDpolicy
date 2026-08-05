@@ -9,9 +9,11 @@ description = "Executable PI0.5-to-SmolVLA flow distillation on LIBERO"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+  "matplotlib>=3.10,<4",
   "numpy>=2.2,<2.3",
   "pyyaml>=6.0,<7",
   "torch==2.11.0",
+  "tqdm>=4.67,<5",
   "lerobot[training,pi,smolvla,libero,evaluation]==0.6.1",
 ]
 

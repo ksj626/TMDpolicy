@@ -93,16 +93,18 @@ def test_primary_split_transformer_supports_meanflow_jvp_and_backward() -> None:
         horizon=5,
     )
     target = torch.randn(2, 5, 4)
-    values = meanflow_loss(
-        head,
-        target_transition=target,
-        inner_source=torch.randn_like(target),
-        inner_time=torch.tensor([0.4, 0.8]),
-        target_time=torch.tensor([0.1, 0.8]),
-        context=torch.randn(2, 5, 6),
-        valid_coordinates=torch.ones_like(target, dtype=torch.bool),
-        normalization_constant_scale=1.0,
-    )
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        values = meanflow_loss(
+            head,
+            target_transition=target,
+            inner_source=torch.randn_like(target),
+            inner_time=torch.tensor([0.4, 0.8]),
+            target_time=torch.tensor([0.1, 0.8]),
+            context=torch.randn(2, 5, 6, dtype=torch.bfloat16),
+            valid_coordinates=torch.ones_like(target, dtype=torch.bool),
+            normalization_constant_scale=1.0,
+        )
+    assert values["prediction"].dtype == torch.float32
     values["loss"].backward()
     assert torch.isfinite(values["total_derivative"]).all()
     assert any(parameter.grad is not None for parameter in head.parameters())

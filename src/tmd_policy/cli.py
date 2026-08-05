@@ -94,6 +94,8 @@ def _evaluate(args: argparse.Namespace) -> int:
         config["policy"]["checkpoint"] = args.checkpoint
     if args.checkpoint_sha256 is not None:
         config["policy"]["checkpoint_sha256"] = args.checkpoint_sha256
+    if args.device is not None:
+        config["policy"]["device"] = args.device
     if (args.outer_steps is not None or args.inner_steps is not None) and config["policy"][
         "method"
     ] in {"dmd2_flow", "tmd_stage1", "tmd_stage2", "occupancy_tmd"}:
@@ -104,6 +106,42 @@ def _evaluate(args: argparse.Namespace) -> int:
         config["policy"]["outer_steps"] = args.outer_steps
     if args.inner_steps is not None:
         config["policy"]["inner_steps"] = args.inner_steps
+    evaluation = config["evaluation"]
+    sampled = False
+    if args.suite:
+        requested_suites = set(args.suite)
+        available_suites = {str(value["suite"]) for value in evaluation["benchmark"]}
+        missing_suites = requested_suites.difference(available_suites)
+        if missing_suites:
+            raise ValueError(f"evaluation suites are not configured: {sorted(missing_suites)}")
+        evaluation["benchmark"] = [
+            value
+            for value in evaluation["benchmark"]
+            if str(value["suite"]) in requested_suites
+        ]
+        sampled = True
+    if args.task_ids is not None:
+        task_ids = [int(value) for value in args.task_ids]
+        if not task_ids or len(task_ids) != len(set(task_ids)) or not all(
+            0 <= value <= 9 for value in task_ids
+        ):
+            raise ValueError("LIBERO --task-ids must be unique integers in [0,9]")
+        for suite_spec in evaluation["benchmark"]:
+            suite_spec["task_ids"] = task_ids
+        sampled = True
+    if args.reset_seeds is not None:
+        reset_seeds = [int(value) for value in args.reset_seeds]
+        if not reset_seeds or len(reset_seeds) != len(set(reset_seeds)) or min(reset_seeds) < 0:
+            raise ValueError("--reset-seeds must be unique nonnegative integers")
+        evaluation["reset_seeds"] = reset_seeds
+        sampled = True
+    if args.max_episode_steps is not None:
+        if args.max_episode_steps < 1:
+            raise ValueError("--max-episode-steps must be positive")
+        evaluation["max_episode_steps"] = int(args.max_episode_steps)
+        sampled = True
+    if sampled:
+        config["classification"] = f"{config['classification']}; CLI-scoped sampled evaluation"
     report = evaluate_libero(config, _output(args, config))
     print(json.dumps(report["summary"], indent=2, sort_keys=True))
     return 0
@@ -163,8 +201,35 @@ def build_parser() -> argparse.ArgumentParser:
     )
     libero.add_argument("--checkpoint")
     libero.add_argument("--checkpoint-sha256")
+    libero.add_argument(
+        "--device",
+        help="inference device override, for example cuda:2",
+    )
     libero.add_argument("--outer-steps", type=int)
     libero.add_argument("--inner-steps", type=int)
+    libero.add_argument(
+        "--suite",
+        action="append",
+        choices=("libero_spatial", "libero_object", "libero_goal", "libero_10"),
+        help="restrict evaluation to one or more suites; repeat this flag for multiple suites",
+    )
+    libero.add_argument(
+        "--task-ids",
+        type=int,
+        nargs="+",
+        help="suite-local LIBERO task IDs to evaluate (0-9)",
+    )
+    libero.add_argument(
+        "--reset-seeds",
+        type=int,
+        nargs="+",
+        help="episode reset seeds to evaluate",
+    )
+    libero.add_argument(
+        "--max-episode-steps",
+        type=int,
+        help="optional shortened horizon for a smoke test; use 600 for reportable evaluation",
+    )
     libero.set_defaults(handler=_evaluate)
     comparison = evaluate_commands.add_parser("compare")
     comparison.add_argument("--config", default="configs/experiments/motivation.yaml")

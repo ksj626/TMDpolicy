@@ -6,7 +6,11 @@ import pytest
 import torch
 from torch import nn
 
-from tmd_policy.backends.action_coordinates import ActionCoordinateBridge, ActionNormalizer
+from tmd_policy.backends.action_coordinates import (
+    ActionCoordinateBridge,
+    ActionNormalizer,
+    safe_device_transfer,
+)
 from tmd_policy.backends.lerobot.compatibility import verify_installed_lerobot
 from tmd_policy.backends.lerobot.pi05_teacher import LeRobotPI05Teacher, PI05ConditionCache, cache_fingerprint
 
@@ -81,6 +85,14 @@ def test_coordinate_bridge_padding_mask_and_gradient() -> None:
     assert torch.count_nonzero(result.values[..., 7:]) == 0
     result.values[..., :7].square().mean().backward()
     assert value.grad is not None and torch.count_nonzero(value.grad[:, :-3]) > 0
+
+
+def test_safe_device_transfer_preserves_values_and_autograd() -> None:
+    value = torch.randn(3, 4, requires_grad=True)
+    transferred = safe_device_transfer(value, "cpu")
+    assert transferred is value
+    transferred.square().mean().backward()
+    assert value.grad is not None and torch.isfinite(value.grad).all()
 
 
 class _FakeCore(nn.Module):

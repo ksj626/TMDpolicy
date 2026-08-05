@@ -12,7 +12,6 @@ import torch
 from torch import Tensor
 
 ROLLOUT_SCHEMA = "tmdpolicy.libero-replans/v2"
-_SUITE_OFFSETS = {"libero_spatial": 0, "libero_object": 10, "libero_goal": 20, "libero_10": 30}
 
 
 def _sha256(value: str, field: str) -> None:
@@ -51,8 +50,14 @@ class ReplanRecord:
             raise ValueError(f"unknown LIBERO suite: {self.suite}")
         if not 0 <= self.suite_task_id < 10 or not 0 <= self.global_task_index < 40:
             raise ValueError("LIBERO task identities are outside the all-40-task contract")
-        if self.global_task_index != _SUITE_OFFSETS[self.suite] + self.suite_task_id:
-            raise ValueError("suite-local and global LIBERO task identities disagree")
+        # lerobot/libero's immutable dataset task ordering is not grouped in
+        # LIBERO suite order. `global_task_index` is therefore the manifest
+        # identity resolved from the instruction, not suite_offset+local_id.
+        expected_uid_prefix = f"libero:{self.global_task_index:02d}:"
+        if not self.canonical_task_uid.startswith(expected_uid_prefix):
+            raise ValueError(
+                "canonical LIBERO task UID disagrees with the dataset-global task identity"
+            )
         if not self.canonical_task_uid or not self.instruction:
             raise ValueError("canonical task UID and instruction must be nonempty")
         if self.state.shape != (8,) or not torch.isfinite(self.state).all():

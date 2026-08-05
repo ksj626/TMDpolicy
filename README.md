@@ -121,7 +121,13 @@ conda run -n tmdpolicy tmd-policy train occupancy-discriminator \
 
 Training batches for occupancy are deterministic source-paired/task-stratified
 and resume from an exact epoch/batch cursor. Validation is never oversampled and
-reports source, macro/task, and aggregate metrics.
+reports source, macro/task, and aggregate metrics. Every trainer displays global
+step and validation progress and atomically refreshes `training_progress.png` in
+its output directory after each completed step.
+
+The paper DMD2 configuration keeps effective batch size 32 as `8 × 4`, reuses
+each immutable PI0.5 condition cache within a loss, and writes a lightweight
+student-delta checkpoint every 50 steps under `inference_checkpoints/`.
 
 ## Evaluation
 
@@ -135,11 +141,32 @@ bash scripts/evaluate/evaluate_dmd2.sh
 bash scripts/evaluate/evaluate_tmd.sh
 ```
 
+Evaluate two spatial tasks from an intermediate DMD2 inference checkpoint:
+
+```bash
+bash scripts/evaluate/evaluate_dmd2.sh \
+  --checkpoint artifacts/training/dmd2_flow_paper/inference_checkpoints/step-00000050.pt \
+  --checkpoint-sha256 auto \
+  --device cuda:2 \
+  --suite libero_spatial \
+  --task-ids 0 5 \
+  --reset-seeds 0 \
+  --max-episode-steps 600 \
+  --output artifacts/evaluation/dmd2_step50_spatial_0_5
+```
+
+The `inference_checkpoints` files contain only the trained student delta and
+are for evaluation. Use full files under `checkpoints/` with `--resume` when
+continuing training. A shortened episode horizon is a smoke test, not a
+reportable LIBERO success-rate evaluation.
+
 Use `configs/evaluation/tmd_stage1.yaml` as the first argument to
 `evaluate_tmd.sh` for Stage 1. Evaluation actions are canonical `[B,50,7]` and
 comparison requires identical `(suite, task_id, reset_seed)` grids. Motivation
 and main comparison configs include PI0.5 official, SmolVLA official-10, and the
-explicit four-step ablation.
+explicit four-step ablation. Evaluation and rollout collection display both
+overall episode progress, per-plan NFE progress, and the environment-step progress
+of the active episode.
 
 ## Memory and fidelity
 

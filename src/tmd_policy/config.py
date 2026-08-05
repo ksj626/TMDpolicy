@@ -162,6 +162,7 @@ def validate_config(config: dict[str, Any], *, expected_method: str | None = Non
                 "gradient_accumulation", "gradient_clip_norm", "learning_rate", "weight_decay",
                 "betas", "epsilon", "warmup_steps", "minimum_lr_scale", "max_steps",
                 "validation_interval", "validation_batches", "checkpoint_interval",
+                "inference_checkpoint_interval",
             },
             "training",
         )
@@ -171,6 +172,8 @@ def validate_config(config: dict[str, Any], *, expected_method: str | None = Non
             raise ConfigError("training.mixed_precision must be no, fp16, or bf16")
         if int(training.get("gradient_accumulation", 0)) < 1:
             raise ConfigError("training.gradient_accumulation must be positive")
+        if int(training.get("inference_checkpoint_interval", 1)) < 1:
+            raise ConfigError("training.inference_checkpoint_interval must be positive when set")
     _reject_unknown(_require(config, "output", "config"), {"directory"}, "output")
     if "preflight" in config:
         _reject_unknown(config["preflight"], {"minimum_total_memory_gib"}, "preflight")

@@ -59,6 +59,7 @@ def test_tmd_training_sampler_and_both_inference_loops_share_shifted_grid() -> N
     head = _RecordingHead()
     noise = torch.zeros(2, 5, 4)
     gamma = 10.0
+    completed_work = []
     sample_stage1_generator(
         student,
         head,
@@ -68,7 +69,9 @@ def test_tmd_training_sampler_and_both_inference_loops_share_shifted_grid() -> N
         inner_steps=2,
         student_time_shift_gamma=gamma,
         inner_noises=torch.zeros(3, 2, 5, 4),
+        step_callback=lambda: completed_work.append(1),
     )
+    assert len(completed_work) == 3 * (2 + 1)
     outer = shifted_time_grid(3, gamma, device=noise.device, descending=True)
     inner = shifted_time_grid(2, gamma, device=noise.device, descending=True)
     assert torch.allclose(torch.stack([value[0] for value in student.times]), outer[:-1])
@@ -127,20 +130,29 @@ def test_guidance_backward_updates_fake_and_classifier_but_not_student_or_teache
     program.student = nn.Linear(1, 1, bias=False)
     program.teacher = nn.Linear(1, 1, bias=False)
     calls: list[torch.Tensor] = []
+    conditions: list[object] = []
+    shared_condition = object()
 
     def sample(self, batch, *, requires_grad):
         assert not requires_grad
         return self.student.weight.view(1, 1, 1).expand(1, 2, 1)
 
-    def fake(self, batch, generated=None):
+    def teacher_condition(self, batch):
+        conditions.append(shared_condition)
+        return shared_condition
+
+    def fake(self, batch, generated=None, *, teacher_condition=None):
+        assert teacher_condition is shared_condition
         calls.append(generated)
         return self.fake_score.weight.square().sum(), {"denoising": 1.0}
 
-    def classifier(self, batch, generated=None):
+    def classifier(self, batch, generated=None, *, teacher_condition=None):
+        assert teacher_condition is shared_condition
         calls.append(generated)
         return self.discriminator.weight.square().sum(), {"classification": 1.0}
 
     program._sample_student = MethodType(sample, program)
+    program._teacher_condition = MethodType(teacher_condition, program)
     program._fake_loss = MethodType(fake, program)
     program._discriminator_loss = MethodType(classifier, program)
     loss, _ = program._guidance_loss({})
@@ -150,6 +162,30 @@ def test_guidance_backward_updates_fake_and_classifier_but_not_student_or_teache
     assert program.discriminator.weight.grad is not None
     assert program.student.weight.grad is None
     assert program.teacher.weight.grad is None
+    assert len(conditions) == 1
+
+
+def test_dmd2_runtime_gradient_contract_keeps_teacher_and_backbone_frozen() -> None:
+    program = DMD2FlowProgram.__new__(DMD2FlowProgram)
+    nn.Module.__init__(program)
+    program.teacher = SimpleNamespace(policy=nn.Linear(2, 2))
+    program.teacher.policy.requires_grad_(False)
+    program.fake_score = nn.Linear(2, 2)
+    program.discriminator = nn.Linear(2, 1)
+    program.student = nn.Sequential(nn.Linear(2, 2), nn.Linear(2, 1))
+    program.student[0].requires_grad_(False)
+
+    program.fake_score.weight.grad = torch.ones_like(program.fake_score.weight)
+    program.discriminator.weight.grad = torch.ones_like(program.discriminator.weight)
+    program.validate_phase_gradients("guidance")
+    assert all(parameter.grad is None for parameter in program.teacher.policy.parameters())
+    assert all(parameter.grad is None for parameter in program.student[0].parameters())
+
+    program.student[1].weight.grad = torch.ones_like(program.student[1].weight)
+    program.validate_phase_gradients("generator")
+    program.teacher.policy.weight.requires_grad_(True)
+    with pytest.raises(RuntimeError, match="teacher must be completely frozen"):
+        program.validate_phase_gradients("generator")
 
 
 class _DMDStudent(nn.Module):

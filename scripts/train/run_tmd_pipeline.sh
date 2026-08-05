@@ -44,7 +44,7 @@ target.write_text(yaml.safe_dump(template, sort_keys=False))
 PY
 
 bash scripts/preflight/preflight_tmd.sh
-conda run -n tmdpolicy tmd-policy train tmd-stage2 --config "$resolved_config" --output "$stage2_output/run"
+conda run --no-capture-output -n tmdpolicy tmd-policy train tmd-stage2 --config "$resolved_config" --output "$stage2_output/run"
 
 final_checkpoint="$stage2_output/run/checkpoints/final.pt"
 evaluation_resolved="$stage2_output/evaluation_resolved.yaml"

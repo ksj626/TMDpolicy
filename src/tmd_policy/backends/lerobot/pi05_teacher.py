@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -362,6 +363,7 @@ class LeRobotPI05Teacher:
         noise: Tensor,
         num_steps: int,
         time_grid: Tensor | None = None,
+        step_callback: Callable[[], None] | None = None,
     ) -> Tensor:
         if num_steps < 1:
             raise ValueError("num_steps must be positive")
@@ -373,6 +375,8 @@ class LeRobotPI05Teacher:
         for current, target in zip(time_grid[:-1], time_grid[1:], strict=True):
             times = current.expand(condition.batch_size)
             value = value + (target - current).to(value.dtype) * self.velocity(condition, value, times)
+            if step_callback is not None:
+                step_callback()
         return value
 
     def postprocess_action(self, normalized_32d: Tensor) -> Tensor:

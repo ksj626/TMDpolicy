@@ -101,15 +101,20 @@ class PI05CloneFakeScore(nn.Module):
         before = cache_fingerprint(condition.past_key_values)
         if before != condition.fingerprint:
             raise RuntimeError("shared PI0.5 prefix cache changed before fake-score query")
-        time_embedding = create_sinusoidal_pos_embedding(
-            time,
-            self.action_in_proj.out_features,
-            min_period=self.config.min_period,
-            max_period=self.config.max_period,
-            device=time.device,
-        ).to(time.dtype)
-        suffix = self.action_in_proj(x_t)
-        time_embedding = F.silu(self.time_mlp_out(F.silu(self.time_mlp_in(time_embedding))))
+        # PI0.5 keeps its action/time projections in FP32 while the large
+        # Gemma expert runs in its checkpoint-native BF16 precision.
+        with torch.autocast(device_type=x_t.device.type, enabled=False):
+            time_embedding = create_sinusoidal_pos_embedding(
+                time.float(),
+                self.action_in_proj.out_features,
+                min_period=self.config.min_period,
+                max_period=self.config.max_period,
+                device=time.device,
+            ).float()
+            suffix = self.action_in_proj(x_t.float())
+            time_embedding = F.silu(
+                self.time_mlp_out(F.silu(self.time_mlp_in(time_embedding)))
+            )
         suffix_pad = torch.ones(x_t.shape[:2], dtype=torch.bool, device=x_t.device)
         suffix_att = torch.zeros_like(suffix_pad)
         suffix_att[:, 0] = True
@@ -152,7 +157,8 @@ class PI05CloneFakeScore(nn.Module):
         finally:
             for handle in handles:
                 handle.remove()
-        velocity = self.action_out_proj(output[:, -50:].float())
+        with torch.autocast(device_type=x_t.device.type, enabled=False):
+            velocity = self.action_out_proj(output[:, -50:].float())
         if cache_fingerprint(condition.past_key_values) != before:
             raise RuntimeError("PI0.5 fake-score suffix mutated the shared prefix cache")
         return velocity, OrderedDict((index, captured[index]) for index in selected_layers)

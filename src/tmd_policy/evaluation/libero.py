@@ -10,6 +10,7 @@ from typing import Any
 
 import numpy as np
 import torch
+from tqdm.auto import tqdm
 
 from tmd_policy.config import project_path, save_resolved_config
 from tmd_policy.backends.lerobot.compatibility import verify_installed_lerobot
@@ -102,6 +103,7 @@ def run_episode(
     max_steps: int,
     synchronize_cuda: bool,
     replan_metadata: dict[str, Any],
+    progress_description: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     from lerobot.envs.utils import NEW_ROLLOUT_OPTION
 
@@ -115,6 +117,14 @@ def run_episode(
     successful = _success(info)
     terminated_value = truncated_value = False
     replans = 0
+    step_progress = tqdm(
+        total=max_steps,
+        desc=progress_description or "LIBERO episode",
+        unit="env-step",
+        leave=False,
+        dynamic_ncols=True,
+        disable=progress_description is None,
+    )
     while len(actions) < max_steps and not (terminated_value or truncated_value):
         model_batch = dict(observation)
         model_batch["task"] = [instruction]
@@ -124,7 +134,22 @@ def run_episode(
         stored_images, image_metadata = _stored_observations(observation)
         _sync(policy.device, synchronize_cuda)
         started = time.perf_counter()
-        plan = policy.plan(model_batch, noise_seed=seed)[0].detach().cpu()
+        plan_progress = tqdm(
+            total=policy.inference_work_units,
+            desc=f"{progress_description or 'LIBERO episode'} plan {replans + 1}",
+            unit="NFE",
+            leave=False,
+            dynamic_ncols=True,
+            disable=progress_description is None,
+        )
+        try:
+            plan = policy.plan(
+                model_batch,
+                noise_seed=seed,
+                step_callback=lambda: plan_progress.update(1),
+            )[0].detach().cpu()
+        finally:
+            plan_progress.close()
         _sync(policy.device, synchronize_cuda)
         model_latencies.append(time.perf_counter() - started)
         if plan.shape != (50, 7):
@@ -139,6 +164,7 @@ def run_episode(
             environment_latencies.append(time.perf_counter() - environment_started)
             actions.append(action.float())
             executed_this_plan.append(action.float())
+            step_progress.update(1)
             observation = _canonical_observation(raw, env_processor)
             terminated_value = bool(np.asarray(terminated).reshape(-1)[0])
             truncated_value = bool(np.asarray(truncated).reshape(-1)[0])
@@ -180,6 +206,8 @@ def run_episode(
             )
         )
         replans += 1
+        step_progress.set_postfix(replans=replans, success=successful, refresh=True)
+    step_progress.close()
     if len(actions) >= max_steps and not terminated_value:
         truncated_value = True
     action_path = torch.stack(actions)
@@ -253,15 +281,40 @@ def summarize(episodes: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def evaluate_libero(config: dict[str, Any], output_dir: str | Path) -> dict[str, Any]:
+    print("Starting LIBERO evaluation", flush=True)
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=False)
+    initialization = tqdm(
+        total=3,
+        desc="initialize LIBERO evaluation",
+        unit="stage",
+        dynamic_ncols=True,
+    )
+    initialization.set_postfix_str("loading policy and processors", refresh=True)
     policy, identity = load_inference_policy(config)
+    initialization.update(1)
+    initialization.set_postfix_str("loading dataset manifest", refresh=True)
     save_resolved_config(config, output / "resolved_config.yaml")
     evaluation = config["evaluation"]
     manifest = load_episode_manifest(project_path(config["dataset"]["manifest"]))
+    initialization.update(1)
+    initialization.set_postfix_str("importing LIBERO environment", refresh=True)
     from lerobot.envs.configs import LiberoEnv
 
+    initialization.update(1)
+    initialization.close()
+
     episodes: list[dict[str, Any]] = []
+    total_episodes = sum(
+        len(suite_spec["task_ids"]) * len(evaluation["reset_seeds"])
+        for suite_spec in evaluation["benchmark"]
+    )
+    episode_progress = tqdm(
+        total=total_episodes,
+        desc="evaluate LIBERO",
+        unit="episode",
+        dynamic_ncols=True,
+    )
     rollout_store = None
     if bool(evaluation.get("save_rollouts", False)):
         rollout_store = RolloutStore(output / "rollouts")
@@ -275,6 +328,7 @@ def evaluate_libero(config: dict[str, Any], output_dir: str | Path) -> dict[str,
     for suite_spec in evaluation["benchmark"]:
         suite = suite_spec["suite"]
         task_ids = [int(value) for value in suite_spec["task_ids"]]
+        episode_progress.set_postfix_str(f"creating environments for {suite}", refresh=True)
         env_config = LiberoEnv(
             task=suite,
             task_ids=task_ids,
@@ -303,6 +357,7 @@ def evaluate_libero(config: dict[str, Any], output_dir: str | Path) -> dict[str,
                         execution_horizon=int(config["horizons"]["execution"]),
                         max_steps=int(evaluation["max_episode_steps"]),
                         synchronize_cuda=bool(evaluation.get("synchronize_cuda", True)),
+                        progress_description=f"{suite}:{task_id} seed={int(reset_seed)}",
                         replan_metadata={
                             "suite": suite,
                             "suite_task_id": task_id,
@@ -326,6 +381,14 @@ def evaluate_libero(config: dict[str, Any], output_dir: str | Path) -> dict[str,
                         **metrics,
                     }
                     episodes.append(row)
+                    episode_progress.update(1)
+                    episode_progress.set_postfix(
+                        suite=suite,
+                        task=task_id,
+                        seed=int(reset_seed),
+                        success=bool(metrics["success"]),
+                        refresh=True,
+                    )
                     if rollout_store is not None:
                         rollout_store.append(
                             RolloutEpisode(replans=payload["replans"], split="test")
@@ -334,6 +397,7 @@ def evaluate_libero(config: dict[str, Any], output_dir: str | Path) -> dict[str,
             for group in environments.values():
                 for env in group.values():
                     env.close()
+    episode_progress.close()
     report = {
         "data": "real complete-episode LIBERO",
         "policy": identity,
@@ -356,10 +420,24 @@ def evaluate_libero(config: dict[str, Any], output_dir: str | Path) -> dict[str,
 
 def collect_student_rollouts(config: dict[str, Any], output_dir: str | Path) -> dict[str, Any]:
     output = Path(output_dir)
+    initialization = tqdm(
+        total=3,
+        desc="initialize LIBERO rollout collection",
+        unit="stage",
+        dynamic_ncols=True,
+    )
+    initialization.set_postfix_str("loading policy and processors", refresh=True)
     policy, identity = load_inference_policy(config)
+    initialization.update(1)
+    initialization.set_postfix_str("loading dataset manifest", refresh=True)
     collection = config["collection"]
     manifest = load_episode_manifest(project_path(config["dataset"]["manifest"]))
+    initialization.update(1)
+    initialization.set_postfix_str("importing LIBERO environment", refresh=True)
     from lerobot.envs.configs import LiberoEnv
+
+    initialization.update(1)
+    initialization.close()
 
     store = RolloutStore(output)
     store.initialize(
@@ -376,9 +454,24 @@ def collect_student_rollouts(config: dict[str, Any], output_dir: str | Path) -> 
         }
     )
     save_resolved_config(config, output / "resolved_config.yaml")
+    total_episodes = sum(
+        len(suite_spec["task_ids"])
+        * (
+            len(collection["train_reset_seeds"])
+            + len(collection["validation_reset_seeds"])
+        )
+        for suite_spec in collection["benchmark"]
+    )
+    episode_progress = tqdm(
+        total=total_episodes,
+        desc="collect LIBERO rollouts",
+        unit="episode",
+        dynamic_ncols=True,
+    )
     for suite_spec in collection["benchmark"]:
         suite = str(suite_spec["suite"])
         task_ids = [int(value) for value in suite_spec["task_ids"]]
+        episode_progress.set_postfix_str(f"creating environments for {suite}", refresh=True)
         env_config = LiberoEnv(
             task=suite,
             task_ids=task_ids,
@@ -411,6 +504,9 @@ def collect_student_rollouts(config: dict[str, Any], output_dir: str | Path) -> 
                             execution_horizon=int(config["horizons"]["execution"]),
                             max_steps=int(collection["max_episode_steps"]),
                             synchronize_cuda=True,
+                            progress_description=(
+                                f"{suite}:{task_id} {split} seed={int(reset_seed)}"
+                            ),
                             replan_metadata={
                                 "suite": suite,
                                 "suite_task_id": task_id,
@@ -425,10 +521,19 @@ def collect_student_rollouts(config: dict[str, Any], output_dir: str | Path) -> 
                             },
                         )
                         store.append(RolloutEpisode(replans=payload["replans"], split=split))
+                        episode_progress.update(1)
+                        episode_progress.set_postfix(
+                            suite=suite,
+                            task=task_id,
+                            split=split,
+                            seed=int(reset_seed),
+                            refresh=True,
+                        )
         finally:
             for group in environments.values():
                 for env in group.values():
                     env.close()
+    episode_progress.close()
     report = store.validate()
     (output / "collection_report.json").write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return report

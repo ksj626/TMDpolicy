@@ -31,10 +31,13 @@ class _LayerClassifier(nn.Module):
     def forward(self, features: Tensor, time_embedding: Tensor, valid: Tensor) -> Tensor:
         if features.ndim != 3 or valid.shape != features.shape[:2]:
             raise ValueError("intermediate features and valid mask must be [B,H,C] and [B,H]")
-        hidden = self.feature(features.float()) + self.time(time_embedding.float())[:, None]
-        weights = valid.to(hidden.dtype).unsqueeze(-1)
-        pooled = (hidden * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(1.0)
-        return self.output(pooled).squeeze(-1)
+        # These small heads intentionally stay FP32. The surrounding training
+        # autocast must not turn classifier logits/action gradients into BF16.
+        with torch.autocast(device_type=features.device.type, enabled=False):
+            hidden = self.feature(features.float()) + self.time(time_embedding.float())[:, None]
+            weights = valid.to(hidden.dtype).unsqueeze(-1)
+            pooled = (hidden * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(1.0)
+            return self.output(pooled).squeeze(-1)
 
 
 class IntermediateFeatureDiscriminator(nn.Module):
@@ -122,15 +125,18 @@ class CachedVLAFeatureDiscriminator(nn.Module):
     ) -> Tensor:
         if noised_action.ndim != 3 or valid.shape != noised_action.shape[:2]:
             raise ValueError("cached discriminator action/valid tensors must be [B,H,D]/[B,H]")
-        hidden = self.action(noised_action)
-        hidden = hidden + self.condition(condition_features.detach())[:, None]
-        hidden = hidden + self.task(task_index.long().flatten())[:, None]
-        hidden = hidden + self.time(_time_embedding(time.float(), self.time_dim))[:, None]
-        hidden = hidden + self.position(torch.arange(noised_action.shape[1], device=noised_action.device))[None]
-        hidden = self.transformer(hidden, src_key_padding_mask=~valid)
-        mask = valid.to(hidden.dtype).unsqueeze(-1)
-        pooled = (hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1.0)
-        return self.output(pooled).squeeze(-1)
+        with torch.autocast(device_type=noised_action.device.type, enabled=False):
+            hidden = self.action(noised_action.float())
+            hidden = hidden + self.condition(condition_features.detach().float())[:, None]
+            hidden = hidden + self.task(task_index.long().flatten())[:, None]
+            hidden = hidden + self.time(_time_embedding(time.float(), self.time_dim))[:, None]
+            hidden = hidden + self.position(
+                torch.arange(noised_action.shape[1], device=noised_action.device)
+            )[None]
+            hidden = self.transformer(hidden, src_key_padding_mask=~valid)
+            mask = valid.to(hidden.dtype).unsqueeze(-1)
+            pooled = (hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1.0)
+            return self.output(pooled).squeeze(-1)
 
     @staticmethod
     def provenance(cache_identity: Mapping[str, Any]) -> dict[str, Any]:

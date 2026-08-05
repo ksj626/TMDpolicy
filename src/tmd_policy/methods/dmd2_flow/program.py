@@ -9,9 +9,13 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from tmd_policy.backends.action_coordinates import ActionCoordinateBridge
+from tmd_policy.backends.action_coordinates import ActionCoordinateBridge, safe_device_transfer
 from tmd_policy.backends.lerobot.pi05_teacher import LeRobotPI05Teacher, PI05ConditionCache
-from tmd_policy.backends.lerobot.smolvla_student import LeRobotSmolVLAStudent, SmolVLAConditionCache
+from tmd_policy.backends.lerobot.smolvla_student import (
+    LeRobotSmolVLAStudent,
+    SmolVLAConditionCache,
+    resolve_trainable_state_keys,
+)
 from tmd_policy.methods.discriminators import (
     CachedVLAFeatureDiscriminator,
     IntermediateFeatureDiscriminator,
@@ -36,6 +40,77 @@ def _masked_mean(values: Tensor, valid_coordinates: Tensor) -> Tensor:
     mask = valid_coordinates.to(values.dtype)
     denominator = mask.flatten(1).sum(dim=1).clamp_min(1)
     return (values * mask).flatten(1).sum(dim=1) / denominator
+
+
+class _CapturedFirstOrderGradient(torch.autograd.Function):
+    """Return an exact scalar value while replaying a captured input gradient."""
+
+    @staticmethod
+    def forward(ctx: Any, value: Tensor, gradient: Tensor, reported_loss: Tensor) -> Tensor:
+        if value.shape != gradient.shape or value.device != gradient.device:
+            raise ValueError("captured first-order gradient must match its input tensor")
+        ctx.save_for_backward(gradient)
+        return reported_loss.detach().clone()
+
+    @staticmethod
+    def backward(ctx: Any, output_gradient: Tensor) -> tuple[Tensor, None, None]:
+        (gradient,) = ctx.saved_tensors
+        multiplier = safe_device_transfer(output_gradient, gradient.device).to(gradient.dtype)
+        return multiplier * gradient, None, None
+
+
+def _stable_first_order_surrogate(
+    loss: Tensor,
+    value: Tensor,
+    *,
+    scales: tuple[float, ...] = (1.0, 2.0**-8, 2.0**-16, 2.0**-24),
+) -> tuple[Tensor, float]:
+    """Capture a finite first-order gradient without replaying an unstable graph.
+
+    PI0.5's checkpoint-native BF16 suffix can produce a finite discriminator
+    loss but overflow while differentiating that loss with respect to its
+    action input. Scaling the scalar loss down and dividing the resulting FP32
+    gradient by the same factor is mathematically identical at first order.
+    The returned linear surrogate makes the training engine apply that captured
+    gradient to the student without traversing the large suffix a second time.
+    """
+
+    if loss.numel() != 1 or not torch.isfinite(loss.detach()).all():
+        raise RuntimeError("generator GAN loss contains NaN/Inf before backward")
+    saw_connected = False
+    saw_finite = False
+    for scale in scales:
+        raw_gradient = torch.autograd.grad(
+            loss * scale,
+            value,
+            retain_graph=True,
+            allow_unused=True,
+        )[0]
+        if raw_gradient is None:
+            continue
+        saw_connected = True
+        gradient = raw_gradient.float() / scale
+        if not torch.isfinite(gradient).all():
+            continue
+        saw_finite = True
+        if torch.count_nonzero(gradient) == 0:
+            continue
+        gradient = gradient.to(value.dtype).detach()
+        surrogate = _CapturedFirstOrderGradient.apply(
+            value,
+            gradient,
+            loss.detach(),
+        )
+        if not torch.isfinite(surrogate.detach()).all():
+            raise RuntimeError("captured generator GAN surrogate changed a finite loss to NaN/Inf")
+        return surrogate, scale
+    if not saw_connected:
+        raise RuntimeError("generator GAN gradient is disconnected")
+    if saw_finite:
+        raise RuntimeError("generator GAN gradient is exactly zero")
+    raise RuntimeError(
+        "generator GAN gradient contains NaN/Inf at all safe backward scales"
+    )
 
 
 @contextmanager
@@ -145,11 +220,68 @@ class DMD2FlowProgram(TrainingProgram):
         if not preserve_student_trainability:
             self.student.configure_trainable(str(config["student_fine_tuning"]))
         self._fake_score_device = next(self.fake_score.parameters()).device
+        self._validate_freezing_contract()
+
+    def _validate_freezing_contract(self) -> None:
+        teacher_parameters = list(self.teacher.policy.parameters())
+        if not teacher_parameters or any(parameter.requires_grad for parameter in teacher_parameters):
+            raise RuntimeError("PI0.5 teacher must be completely frozen")
+        if any(parameter.grad is not None for parameter in teacher_parameters):
+            raise RuntimeError("PI0.5 teacher contains stale gradients")
+        if not any(parameter.requires_grad for parameter in self.fake_score.parameters()):
+            raise RuntimeError("fake-score model contains no trainable parameters")
+        if not any(parameter.requires_grad for parameter in self.discriminator.parameters()):
+            raise RuntimeError("DMD2 discriminator contains no trainable parameters")
+
+    @staticmethod
+    def _require_module_gradient(module: nn.Module, label: str) -> None:
+        gradients = [
+            parameter.grad
+            for parameter in module.parameters()
+            if parameter.requires_grad and parameter.grad is not None
+        ]
+        if not gradients:
+            raise RuntimeError(f"{label} received no gradient")
+        if not any(torch.count_nonzero(gradient) > 0 for gradient in gradients):
+            raise RuntimeError(f"{label} received only zero gradients")
+        if any(not torch.isfinite(gradient).all() for gradient in gradients):
+            raise RuntimeError(f"{label} gradient contains NaN/Inf")
+
+    def validate_phase_gradients(self, phase: str) -> None:
+        self._validate_freezing_contract()
+        frozen_student = [
+            parameter
+            for parameter in self.student.parameters()
+            if not parameter.requires_grad
+        ]
+        if any(parameter.grad is not None for parameter in frozen_student):
+            raise RuntimeError("frozen SmolVLA parameters unexpectedly received gradients")
+        if phase in {"guidance", "fake"}:
+            self._require_module_gradient(self.fake_score, "fake-score model")
+        if phase in {"guidance", "discriminator"}:
+            self._require_module_gradient(self.discriminator, "DMD2 discriminator")
+        if phase == "generator":
+            self._require_module_gradient(self.student, "SmolVLA student")
 
     def to(self, *args: Any, **kwargs: Any) -> "DMD2FlowProgram":
-        super().to(*args, **kwargs)
-        self.fake_score.to(self._fake_score_device)
-        self.discriminator.to(self._discriminator_device)
+        # This is a deliberately model-parallel program. Calling nn.Module.to
+        # on the parent first would migrate the large PI0.5 fake suffix from
+        # its designated GPU to the student GPU and then back. Besides doubling
+        # peak traffic, BF16 peer-device round trips have corrupted expert
+        # tensors on the supported stack. Move only student-owned state here.
+        self.student.to(*args, **kwargs)
+        self.bridge.to(*args, **kwargs)
+        fake_devices = {parameter.device for parameter in self.fake_score.parameters()}
+        if fake_devices != {self._fake_score_device}:
+            raise RuntimeError(
+                f"fake-score parameters left their designated device {self._fake_score_device}: "
+                f"{sorted(map(str, fake_devices))}"
+            )
+        discriminator_devices = {
+            parameter.device for parameter in self.discriminator.parameters()
+        }
+        if discriminator_devices != {self._discriminator_device}:
+            self.discriminator.to(self._discriminator_device)
         return self
 
     def phase_schedule(self) -> tuple[str, ...]:
@@ -162,6 +294,14 @@ class DMD2FlowProgram(TrainingProgram):
         if discriminator_ratio < 1:
             raise ValueError("discriminator_updates_per_generator must be positive")
         return ("fake",) * ratio + ("discriminator",) * discriminator_ratio + ("generator",)
+
+    def backward_loss_scale(self, phase: str) -> float:
+        # The combined guidance phase differentiates through the trainable BF16
+        # PI0.5 suffix. A downscale avoids overflowing intermediate backward
+        # values; the engine removes it before clipping and AdamW.
+        if phase == "guidance" and self.fake_variant == "pi05_clone":
+            return 2.0**-8
+        return 1.0
 
     @property
     def student_device(self) -> torch.device:
@@ -238,12 +378,21 @@ class DMD2FlowProgram(TrainingProgram):
     ) -> Tensor:
         if self.fake_variant == "lightweight":
             state, task = self._raw_state_task(batch)
-            return self.fake_score(
-                x_t.to(self.student_device), time.to(self.student_device), state, task
-            ).to(x_t.device)
+            prediction = self.fake_score(
+                safe_device_transfer(x_t, self.student_device),
+                safe_device_transfer(time, self.student_device),
+                state,
+                task,
+            )
+            return safe_device_transfer(prediction, x_t.device)
         target_device = next(self.fake_score.parameters()).device
         condition = condition if condition is not None else self._fake_condition(batch)
-        return self.fake_score(condition, x_t.to(target_device), time.to(target_device)).to(x_t.device)
+        prediction = self.fake_score(
+            condition,
+            safe_device_transfer(x_t, target_device),
+            safe_device_transfer(time, target_device),
+        )
+        return safe_device_transfer(prediction, x_t.device)
 
     @staticmethod
     def _denoised_prediction(x_t: Tensor, time: Tensor, velocity: Tensor) -> Tensor:
@@ -255,7 +404,11 @@ class DMD2FlowProgram(TrainingProgram):
         return self.bridge.student_to_teacher(student_actions, valid).values
 
     def _fake_loss(
-        self, batch: dict[str, Any], generated: Tensor | None = None
+        self,
+        batch: dict[str, Any],
+        generated: Tensor | None = None,
+        *,
+        teacher_condition: PI05ConditionCache | None = None,
     ) -> tuple[Tensor, dict[str, float]]:
         generated = (
             self._sample_student(batch, requires_grad=False)
@@ -265,13 +418,16 @@ class DMD2FlowProgram(TrainingProgram):
         valid_student = self._valid(batch, self.student_device)
         clean = self.bridge.student_to_teacher(generated, valid_student).values.detach()
         fake_device = self._fake_score_device
-        clean = clean.to(fake_device)
-        valid = executable_coordinate_mask(valid_student.to(fake_device), 32)
+        clean = safe_device_transfer(clean, fake_device)
+        valid = executable_coordinate_mask(
+            safe_device_transfer(valid_student, fake_device), 32
+        )
         time = self._sample_time("fake_score_time", clean.shape[0], fake_device)
         noise = torch.randn_like(clean)
         noised = corrupt_rectified_flow(clean, time, noise)
         target_velocity = noise - clean
-        teacher_condition = self._teacher_condition(batch) if self.fake_variant == "pi05_clone" else None
+        if self.fake_variant == "pi05_clone" and teacher_condition is None:
+            teacher_condition = self._teacher_condition(batch)
         condition = self._fake_condition(batch, teacher_condition)
         prediction = self._fake_velocity(batch, noised, time, condition)
         per_sample = _masked_mean((prediction - target_velocity).square(), valid)
@@ -320,7 +476,11 @@ class DMD2FlowProgram(TrainingProgram):
         return discriminator.layer_logits(features, time, valid)
 
     def _discriminator_loss(
-        self, batch: dict[str, Any], generated: Tensor | None = None
+        self,
+        batch: dict[str, Any],
+        generated: Tensor | None = None,
+        *,
+        teacher_condition: PI05ConditionCache | None = None,
     ) -> tuple[Tensor, dict[str, float]]:
         generated = (
             self._sample_student(batch, requires_grad=False)
@@ -332,12 +492,17 @@ class DMD2FlowProgram(TrainingProgram):
         fake = self.bridge.student_to_teacher(generated, valid_student).values.detach()
         if self.discriminator_variant == "pi05_intermediate_features":
             device = self._discriminator_device
-            real, fake = real.to(device), fake.to(device)
+            real = safe_device_transfer(real, device)
+            fake = safe_device_transfer(fake, device)
             time = self._sample_time("gan_time", real.shape[0], device)
             real_noised = corrupt_rectified_flow(real, time, torch.randn_like(real))
             fake_noised = corrupt_rectified_flow(fake, time, torch.randn_like(fake))
-            condition = self._teacher_condition(batch)
-            valid = valid_student.to(device)
+            condition = (
+                teacher_condition
+                if teacher_condition is not None
+                else self._teacher_condition(batch)
+            )
+            valid = safe_device_transfer(valid_student, device)
             real_logits = self._paper_layer_logits(
                 condition, real_noised, time, valid, require_input_grad=False
             )
@@ -355,10 +520,12 @@ class DMD2FlowProgram(TrainingProgram):
             condition = self._student_condition(batch)
             device = self._discriminator_device
             time = self._sample_time("gan_time", real.shape[0], device)
-            real_noised = corrupt_rectified_flow(real.to(device), time, torch.randn_like(real.to(device)))
-            fake_noised = corrupt_rectified_flow(fake.to(device), time, torch.randn_like(fake.to(device)))
+            real = safe_device_transfer(real, device)
+            fake = safe_device_transfer(fake, device)
+            real_noised = corrupt_rectified_flow(real, time, torch.randn_like(real))
+            fake_noised = corrupt_rectified_flow(fake, time, torch.randn_like(fake))
             task = torch.as_tensor(batch["task_index"], device=device).long().flatten()
-            valid = valid_student.to(device)
+            valid = safe_device_transfer(valid_student, device)
             real_values = self.discriminator(real_noised, time, condition.condition_features, task, valid)
             fake_values = self.discriminator(fake_noised, time, condition.condition_features, task, valid)
             loss = F.softplus(-real_values).mean() + F.softplus(fake_values).mean()
@@ -371,9 +538,25 @@ class DMD2FlowProgram(TrainingProgram):
     def _guidance_loss(self, batch: dict[str, Any]) -> tuple[Tensor, dict[str, float]]:
         if self.feature_source != "fake_score_features":
             raise ValueError("combined guidance is only valid for fake-score discriminator features")
+        # The frozen 3.45B-parameter PI0.5 prefix depends only on this
+        # observation/language batch. Reuse its immutable KV cache for all
+        # fake-score and classifier suffix queries in this loss.
+        teacher_condition = self._teacher_condition(batch)
         generated = self._sample_student(batch, requires_grad=False).detach()
-        fake_loss, fake_metrics = self._fake_loss(batch, generated)
-        discriminator_loss, discriminator_metrics = self._discriminator_loss(batch, generated)
+        fake_loss, fake_metrics = self._fake_loss(
+            batch,
+            generated,
+            teacher_condition=teacher_condition,
+        )
+        if not torch.isfinite(fake_loss.detach()).all():
+            raise RuntimeError("PI0.5 fake-score guidance loss contains NaN/Inf")
+        discriminator_loss, discriminator_metrics = self._discriminator_loss(
+            batch,
+            generated,
+            teacher_condition=teacher_condition,
+        )
+        if not torch.isfinite(discriminator_loss.detach()).all():
+            raise RuntimeError("PI0.5 feature-discriminator guidance loss contains NaN/Inf")
         classifier_weight = float(self.dmd_config["guidance_classifier_weight"])
         loss = fake_loss + classifier_weight * discriminator_loss
         return loss, {
@@ -385,17 +568,28 @@ class DMD2FlowProgram(TrainingProgram):
         }
 
     def _distribution_matching_loss(
-        self, batch: dict[str, Any], generated: Tensor, valid_student: Tensor
+        self,
+        batch: dict[str, Any],
+        generated: Tensor,
+        valid_student: Tensor,
+        *,
+        teacher_condition: PI05ConditionCache | None = None,
     ) -> tuple[Tensor, dict[str, float]]:
-        teacher_generated = self.bridge.student_to_teacher(generated, valid_student).values.to(
-            self.teacher.device
+        teacher_generated = safe_device_transfer(
+            self.bridge.student_to_teacher(generated, valid_student).values,
+            self.teacher.device,
         )
         valid_coordinates = executable_coordinate_mask(
-            valid_student.to(self.teacher.device), teacher_generated.shape[-1]
+            safe_device_transfer(valid_student, self.teacher.device),
+            teacher_generated.shape[-1],
         )
         time = self._sample_time("vsd_time", teacher_generated.shape[0], self.teacher.device)
         noised = corrupt_rectified_flow(teacher_generated, time, torch.randn_like(teacher_generated))
-        condition = self._teacher_condition(batch)
+        condition = (
+            teacher_condition
+            if teacher_condition is not None
+            else self._teacher_condition(batch)
+        )
         teacher_velocity = self.teacher.velocity(condition, noised.detach(), time).detach()
         with torch.no_grad():
             fake_velocity = self._fake_velocity(batch, noised.detach(), time, condition).detach()
@@ -423,28 +617,37 @@ class DMD2FlowProgram(TrainingProgram):
         return loss, {name: float(value.mean()) for name, value in values.items()}
 
     def _generator_gan_loss(
-        self, batch: dict[str, Any], generated: Tensor, valid_student: Tensor
+        self,
+        batch: dict[str, Any],
+        generated: Tensor,
+        valid_student: Tensor,
+        *,
+        teacher_condition: PI05ConditionCache | None = None,
     ) -> Tensor:
         fake = self.bridge.student_to_teacher(generated, valid_student).values
         if self.discriminator_variant == "pi05_intermediate_features":
             device = self._discriminator_device
-            fake = fake.to(device)
+            fake = safe_device_transfer(fake, device)
             time = self._sample_time("gan_time", fake.shape[0], device)
             noised = corrupt_rectified_flow(fake, time, torch.randn_like(fake))
-            condition = self._teacher_condition(batch)
+            condition = (
+                teacher_condition
+                if teacher_condition is not None
+                else self._teacher_condition(batch)
+            )
             with _frozen_parameters(self.discriminator):
                 logits = self._paper_layer_logits(
                     condition,
                     noised,
                     time,
-                    valid_student.to(device),
+                    safe_device_transfer(valid_student, device),
                     require_input_grad=True,
                 )
                 loss = torch.stack([F.softplus(-value).mean() for value in logits.values()]).mean()
         else:
             condition = self._student_condition(batch)
             device = self._discriminator_device
-            fake = fake.to(device)
+            fake = safe_device_transfer(fake, device)
             time = self._sample_time("gan_time", fake.shape[0], device)
             noised = corrupt_rectified_flow(fake, time, torch.randn_like(fake))
             task = torch.as_tensor(batch["task_index"], device=device).long().flatten()
@@ -454,26 +657,38 @@ class DMD2FlowProgram(TrainingProgram):
                     time,
                     condition.condition_features,
                     task,
-                    valid_student.to(device),
+                    safe_device_transfer(valid_student, device),
                 )
                 loss = F.softplus(-logits).mean()
-        action_gradient = torch.autograd.grad(loss, generated, retain_graph=True, allow_unused=True)[0]
-        if action_gradient is None or not torch.isfinite(action_gradient).all() or action_gradient.abs().sum() == 0:
-            raise RuntimeError("generator GAN path produced no nonzero finite gradient to fake actions")
+        loss, backward_scale = _stable_first_order_surrogate(loss, generated)
+        self._last_gan_backward_scale = backward_scale
         if any(parameter.grad is not None for parameter in self.teacher.policy.parameters()):
             raise RuntimeError("frozen PI0.5 teacher unexpectedly received gradients")
         return loss
 
     def _generator_loss(self, batch: dict[str, Any]) -> tuple[Tensor, dict[str, float]]:
+        # VSD and feature-GAN queries share the same frozen PI0.5 condition.
+        teacher_condition = self._teacher_condition(batch)
         generated = self._sample_student(batch, requires_grad=True)
         valid = self._valid(batch, self.student_device)
-        vsd, metrics = self._distribution_matching_loss(batch, generated, valid)
-        gan = self._generator_gan_loss(batch, generated, valid)
+        vsd, metrics = self._distribution_matching_loss(
+            batch,
+            generated,
+            valid,
+            teacher_condition=teacher_condition,
+        )
+        gan = self._generator_gan_loss(
+            batch,
+            generated,
+            valid,
+            teacher_condition=teacher_condition,
+        )
         total = vsd + float(self.dmd_config["gan_weight"]) * gan
         return total, {
             **metrics,
             "distribution_matching": float(vsd.detach()),
             "gan": float(gan.detach()),
+            "gan_backward_scale": float(getattr(self, "_last_gan_backward_scale", 1.0)),
         }
 
     def loss(self, batch: dict[str, Any], phase: str) -> tuple[Tensor, dict[str, float]]:
@@ -533,6 +748,13 @@ class DMD2FlowProgram(TrainingProgram):
                 **common,
             ),
         }
+
+    def inference_state_dict(self) -> dict[str, Tensor]:
+        """Save only the trained student delta on top of the immutable hub model."""
+
+        student_state = self.student.state_dict()
+        selected = resolve_trainable_state_keys(self.student)
+        return {f"student.{name}": student_state[name].detach().cpu() for name in selected}
 
     def extra_provenance(self) -> dict[str, Any]:
         if isinstance(self.discriminator, IntermediateFeatureDiscriminator):

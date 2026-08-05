@@ -14,8 +14,8 @@ evaluation:
     - {suite: libero_object, task_ids: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]}
     - {suite: libero_goal, task_ids: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]}
     - {suite: libero_10, task_ids: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]}
-  reset_seeds: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+  reset_seeds: [0]
   max_episode_steps: 600
-  save_rollouts: false
+  save_rollouts: true
   synchronize_cuda: true
 output: {directory: artifacts/evaluation/smolvla_4step_ablation}

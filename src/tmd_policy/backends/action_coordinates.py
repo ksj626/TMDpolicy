@@ -9,6 +9,22 @@ import torch
 from torch import Tensor, nn
 
 
+def safe_device_transfer(value: Tensor, device: str | torch.device) -> Tensor:
+    """Transfer tensors without relying on CUDA peer-to-peer copies.
+
+    The supported multi-GPU workstation intermittently corrupts direct peer
+    copies under the current PyTorch/CUDA stack. Two explicit copy operations
+    preserve autograd while routing cross-GPU values through host memory.
+    """
+
+    target = torch.device(device)
+    if value.device == target:
+        return value
+    if value.device.type == "cuda" and target.type == "cuda":
+        return value.to("cpu", non_blocking=False).to(target, non_blocking=False)
+    return value.to(target)
+
+
 def _mode_name(value: Any) -> str:
     return str(getattr(value, "value", value)).upper()
 
@@ -188,4 +204,9 @@ class ActionCoordinateBridge(nn.Module):
         return self.canonical_to_student(self.teacher_to_canonical(teacher_values))
 
 
-__all__ = ["ActionCoordinateBridge", "ActionNormalizer", "CoordinateResult"]
+__all__ = [
+    "ActionCoordinateBridge",
+    "ActionNormalizer",
+    "CoordinateResult",
+    "safe_device_transfer",
+]

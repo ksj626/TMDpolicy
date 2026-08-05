@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 import torch
@@ -25,6 +26,7 @@ def sample_stage1_generator(
     inner_steps: int,
     student_time_shift_gamma: float,
     inner_noises: Tensor | None = None,
+    step_callback: Callable[[], None] | None = None,
 ) -> Tensor:
     """The single Stage-1 sampler used by Stage 1, Stage 2, and evaluation."""
 
@@ -47,6 +49,8 @@ def sample_stage1_generator(
     for index, (current, target) in enumerate(zip(grid[:-1], grid[1:], strict=True)):
         time = current.expand(value.shape[0])
         base_velocity, features = student.velocity_with_features(condition, value, time)
+        if step_callback is not None:
+            step_callback()
         transition = integrate_inner_flow(
             head,
             inner_noises[index],
@@ -54,6 +58,7 @@ def sample_stage1_generator(
             num_steps=inner_steps,
             student_time_shift_gamma=student_time_shift_gamma,
             base_velocity=base_velocity,
+            step_callback=step_callback,
         )
         value = value + (target - current) * transition
     return value

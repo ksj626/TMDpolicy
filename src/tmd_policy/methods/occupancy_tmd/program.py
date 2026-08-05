@@ -8,7 +8,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from tmd_policy.backends.action_coordinates import ActionCoordinateBridge
+from tmd_policy.backends.action_coordinates import ActionCoordinateBridge, safe_device_transfer
 from tmd_policy.backends.lerobot.pi05_teacher import LeRobotPI05Teacher
 from tmd_policy.backends.lerobot.smolvla_student import LeRobotSmolVLAStudent
 from tmd_policy.methods.discriminators import CachedVLAFeatureDiscriminator, IntermediateFeatureDiscriminator
@@ -88,7 +88,9 @@ class ReplanOccupancyDiscriminatorProgram(TrainingProgram):
         valid = torch.as_tensor(batch["action_valid"], device=self.student.device).bool()
         if self.variant == "pi05_intermediate_features":
             assert self.bridge is not None
-            internal_actions = self.bridge.canonical_to_teacher(clean, valid).values.to(device)
+            internal_actions = safe_device_transfer(
+                self.bridge.canonical_to_teacher(clean, valid).values, device
+            )
         else:
             processed = self.student.preprocess_observation(batch)
             internal_actions = self.student.policy.prepare_action(processed).detach().to(device)
@@ -101,7 +103,7 @@ class ReplanOccupancyDiscriminatorProgram(TrainingProgram):
             gamma=float(self.config["time_shift_gamma"]),
         )
         noised = corrupt_rectified_flow(internal_actions, time, torch.randn_like(internal_actions))
-        valid_device = valid.to(device)
+        valid_device = safe_device_transfer(valid, device)
         labels = torch.as_tensor(batch["source_label"], device=device).float().flatten()
         if self.variant == "pi05_intermediate_features":
             assert self.teacher is not None
@@ -299,10 +301,11 @@ class OccupancyWeightedTMDProgram(TMDStage1Program):
         if self.occupancy_variant == "pi05_intermediate_features":
             assert self.occupancy_teacher is not None and self.occupancy_bridge is not None
             teacher_device = self.occupancy_teacher.device
-            teacher_action = self.occupancy_bridge.student_to_teacher(generated, plan_valid).values.to(
-                teacher_device
+            teacher_action = safe_device_transfer(
+                self.occupancy_bridge.student_to_teacher(generated, plan_valid).values,
+                teacher_device,
             )
-            teacher_time = time.to(teacher_device)
+            teacher_time = safe_device_transfer(time, teacher_device)
             noised = corrupt_rectified_flow(
                 teacher_action, teacher_time, torch.randn_like(teacher_action)
             )
@@ -316,7 +319,9 @@ class OccupancyWeightedTMDProgram(TMDStage1Program):
             logits = torch.stack(
                 list(
                     self.occupancy_discriminator.layer_logits(
-                        features, teacher_time, plan_valid.to(teacher_device)
+                        features,
+                        teacher_time,
+                        safe_device_transfer(plan_valid, teacher_device),
                     ).values()
                 )
             ).mean(dim=0)

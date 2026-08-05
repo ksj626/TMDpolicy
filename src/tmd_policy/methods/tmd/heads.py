@@ -110,14 +110,20 @@ class SplitTransformerMeanFlowHead(nn.Module):
         nn.init.zeros_(self.output_projection.bias)
 
     def forward(self, y_s: Tensor, s: Tensor, r: Tensor, context: Tensor) -> Tensor:
-        batch, horizon, _ = y_s.shape
-        times = torch.cat((_time_embedding(s, 2), _time_embedding(r, 2)), dim=-1)
-        hidden = self.input_projection(torch.cat((y_s, context), dim=-1))
-        hidden = hidden + self.time_projection(times)[:, None]
-        hidden = hidden + self.position(torch.arange(horizon, device=y_s.device))[None]
-        for block in self.transformer:
-            hidden = block(hidden)
-        return self.output_projection(self.output_norm(hidden))
+        # Exact MeanFlow JVPs and their adaptive squared norms are evaluated in
+        # FP32 even when the surrounding VLA training step uses BF16 autocast.
+        with torch.autocast(device_type=y_s.device.type, enabled=False):
+            y_s = y_s.float()
+            context = context.float()
+            s, r = s.float(), r.float()
+            _, horizon, _ = y_s.shape
+            times = torch.cat((_time_embedding(s, 2), _time_embedding(r, 2)), dim=-1)
+            hidden = self.input_projection(torch.cat((y_s, context), dim=-1))
+            hidden = hidden + self.time_projection(times)[:, None]
+            hidden = hidden + self.position(torch.arange(horizon, device=y_s.device))[None]
+            for block in self.transformer:
+                hidden = block(hidden)
+            return self.output_projection(self.output_norm(hidden))
 
 
 class GRUMeanFlowHead(nn.Module):
@@ -132,10 +138,16 @@ class GRUMeanFlowHead(nn.Module):
         nn.init.zeros_(self.output_projection.bias)
 
     def forward(self, y_s: Tensor, s: Tensor, r: Tensor, context: Tensor) -> Tensor:
-        times = torch.cat((_time_embedding(s, 2), _time_embedding(r, 2)), dim=-1)
-        values = torch.cat((y_s, context, times[:, None].expand(-1, y_s.shape[1], -1)), dim=-1)
-        hidden, _ = self.gru(torch.nn.functional.silu(self.input_projection(values)))
-        return self.output_projection(hidden)
+        with torch.autocast(device_type=y_s.device.type, enabled=False):
+            y_s = y_s.float()
+            context = context.float()
+            s, r = s.float(), r.float()
+            times = torch.cat((_time_embedding(s, 2), _time_embedding(r, 2)), dim=-1)
+            values = torch.cat(
+                (y_s, context, times[:, None].expand(-1, y_s.shape[1], -1)), dim=-1
+            )
+            hidden, _ = self.gru(torch.nn.functional.silu(self.input_projection(values)))
+            return self.output_projection(hidden)
 
 
 __all__ = ["GRUMeanFlowHead", "SplitTransformerMeanFlowHead"]

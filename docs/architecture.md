@@ -5,6 +5,12 @@ coordinate conversion. Method programs own losses and optimizer phases. The
 training engine owns deterministic sampling, accumulation, checkpoints, RNG,
 and resume. No production path patches LeRobot.
 
+The large PI0.5/SmolVLA backbones retain checkpoint-native mixed precision.
+Repository-owned PI0.5 action/time projections, MeanFlow JVP heads, and
+discriminator heads execute in FP32 even inside a BF16 training step, preventing
+autocast from silently reducing the precision of clean predictions and GAN
+action gradients.
+
 ## Coordinates and cache identity
 
 Canonical LIBERO actions are `[B,50,7]`. SmolVLA and PI0.5 internal flow values

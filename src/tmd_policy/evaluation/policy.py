@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 import torch
 from torch import Tensor, nn
 
+from tmd_policy.backends.lerobot.smolvla_student import resolve_trainable_state_keys
 from tmd_policy.config import project_path
 from tmd_policy.methods.tmd import TMDStage1Program, sample_stage1_generator
 from tmd_policy.training.builders import build_student, build_teacher, file_sha256
@@ -16,6 +18,35 @@ from tmd_policy.training.builders import build_student, build_teacher, file_sha2
 
 def _substate(state: dict[str, Tensor], prefix: str) -> dict[str, Tensor]:
     return {key.removeprefix(prefix): value for key, value in state.items() if key.startswith(prefix)}
+
+
+def _load_student_checkpoint_state(
+    student: Any,
+    state: dict[str, Tensor],
+    *,
+    checkpoint_format: str,
+    trainable_parameter_names: list[str] | tuple[str, ...],
+) -> None:
+    student_state = _substate(state, "student.")
+    if checkpoint_format == "tmdpolicy.inference/v1":
+        expected_delta = set(resolve_trainable_state_keys(student))
+        if set(student_state) != expected_delta:
+            raise ValueError(
+                "inference checkpoint student delta does not match the checkpoint's "
+                f"fine-tuning contract: {sorted(student_state)} != {sorted(expected_delta)}"
+            )
+        stored_names = set(trainable_parameter_names)
+        expected_stored_names = {f"student.{name}" for name in expected_delta}
+        if stored_names != expected_stored_names:
+            raise ValueError("inference checkpoint trainable-parameter manifest is inconsistent")
+        incompatible = student.load_state_dict(student_state, strict=False)
+        if incompatible.unexpected_keys or expected_delta.intersection(incompatible.missing_keys):
+            raise RuntimeError(
+                "failed to apply the complete trained student delta: "
+                f"missing={incompatible.missing_keys}, unexpected={incompatible.unexpected_keys}"
+            )
+    else:
+        student.load_state_dict(student_state, strict=True)
 
 
 class InferencePolicy(nn.Module):
@@ -46,8 +77,20 @@ class InferencePolicy(nn.Module):
     def reset(self) -> None:
         self.student.policy.reset()
 
+    @property
+    def inference_work_units(self) -> int:
+        if self.tmd_head is not None:
+            return self.outer_steps * (self.inner_steps + 1)
+        return self.outer_steps
+
     @torch.no_grad()
-    def plan(self, canonical_batch: dict[str, Any], *, noise_seed: int) -> Tensor:
+    def plan(
+        self,
+        canonical_batch: dict[str, Any],
+        *,
+        noise_seed: int,
+        step_callback: Callable[[], None] | None = None,
+    ) -> Tensor:
         processed = self.student.preprocess_observation(canonical_batch)
         generator = torch.Generator(device=self.student.device).manual_seed(noise_seed)
         batch_size = int(torch.as_tensor(processed["observation.state"]).shape[0])
@@ -60,7 +103,16 @@ class InferencePolicy(nn.Module):
             generator=generator,
         )
         if self.tmd_head is None and self.sampler_mode == "official":
-            normalized = self.student.policy.predict_action_chunk(processed, noise=noise)
+            handle = None
+            if step_callback is not None:
+                handle = self.student.flow.action_out_proj.register_forward_hook(
+                    lambda _module, _inputs, _output: step_callback()
+                )
+            try:
+                normalized = self.student.policy.predict_action_chunk(processed, noise=noise)
+            finally:
+                if handle is not None:
+                    handle.remove()
             return self.student.postprocessor(normalized)
         condition = self.student.encode_condition(processed)
         if self.tmd_head is None:
@@ -69,6 +121,7 @@ class InferencePolicy(nn.Module):
                 noise,
                 self.outer_steps,
                 student_time_shift_gamma=self.student_time_shift_gamma,
+                step_callback=step_callback,
             )
         else:
             inner = torch.stack(
@@ -93,6 +146,7 @@ class InferencePolicy(nn.Module):
                 inner_steps=self.inner_steps,
                 student_time_shift_gamma=self.student_time_shift_gamma,
                 inner_noises=inner,
+                step_callback=step_callback,
             )
         return self.student.postprocessor(normalized[..., :7])
 
@@ -115,8 +169,18 @@ class PI05InferencePolicy(nn.Module):
         if hasattr(self.teacher.policy, "reset"):
             self.teacher.policy.reset()
 
+    @property
+    def inference_work_units(self) -> int:
+        return self.num_steps
+
     @torch.no_grad()
-    def plan(self, canonical_batch: dict[str, Any], *, noise_seed: int) -> Tensor:
+    def plan(
+        self,
+        canonical_batch: dict[str, Any],
+        *,
+        noise_seed: int,
+        step_callback: Callable[[], None] | None = None,
+    ) -> Tensor:
         processed = self.teacher.preprocess_observation(canonical_batch)
         condition = self.teacher.encode_condition(processed)
         generator = torch.Generator(device=self.device).manual_seed(noise_seed)
@@ -128,7 +192,12 @@ class PI05InferencePolicy(nn.Module):
             dtype=torch.float32,
             generator=generator,
         )
-        normalized = self.teacher.sample(condition, noise, self.num_steps)
+        normalized = self.teacher.sample(
+            condition,
+            noise,
+            self.num_steps,
+            step_callback=step_callback,
+        )
         canonical = self.teacher.postprocess_action(normalized)
         if canonical.shape != (condition.batch_size, 50, 7):
             raise RuntimeError(f"PI0.5 postprocessor returned {tuple(canonical.shape)}, expected [B,50,7]")
@@ -206,7 +275,14 @@ def load_inference_policy(
         expected_sha = actual_sha
     if actual_sha != expected_sha:
         raise RuntimeError(f"policy checkpoint SHA-256 mismatch: {actual_sha} != {expected_sha}")
-    payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    # Full resume checkpoints contain large fake-score/optimizer tensors that
+    # inference never reads. Memory-map their storages so evaluating an
+    # intermediate checkpoint does not materialize the whole training state in
+    # host RAM. Lightweight inference checkpoints benefit as well.
+    payload = torch.load(checkpoint, map_location="cpu", weights_only=False, mmap=True)
+    checkpoint_format = str(payload.get("format", ""))
+    if checkpoint_format not in {"tmdpolicy.training/v1", "tmdpolicy.inference/v1"}:
+        raise ValueError(f"unsupported inference checkpoint format: {checkpoint_format!r}")
     checkpoint_config = payload["config"]
     if checkpoint_config["method"] != method:
         raise ValueError(f"checkpoint method {checkpoint_config['method']} does not match requested {method}")
@@ -217,7 +293,12 @@ def load_inference_policy(
         student.configure_trainable(**checkpoint_config["fine_tuning"])
     elif method == "dmd2_flow":
         student.configure_trainable(checkpoint_config["dmd2"]["student_fine_tuning"])
-    student.load_state_dict(_substate(state, "student."), strict=True)
+    _load_student_checkpoint_state(
+        student,
+        state,
+        checkpoint_format=checkpoint_format,
+        trainable_parameter_names=payload.get("trainable_parameter_names", ()),
+    )
     head = None
     if method in {"tmd_stage1", "occupancy_tmd"}:
         stage1 = TMDStage1Program(student, checkpoint_config["tmd"])
@@ -261,6 +342,7 @@ def load_inference_policy(
         "checkpoint": str(checkpoint.resolve()),
         "checkpoint_sha256": actual_sha,
         "checkpoint_identity_kind": "sha256-of-checkpoint-file",
+        "checkpoint_format": checkpoint_format,
         "training_global_step": payload["counters"]["global_step"],
         "model_revision": student.model_revision,
         "processor_revision": student.processor_revision,

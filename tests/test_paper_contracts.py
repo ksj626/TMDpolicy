@@ -9,10 +9,12 @@ import pytest
 import torch
 from torch import nn
 
+from tmd_policy.cli import build_parser
 from tmd_policy.config import ConfigError, load_config
 from tmd_policy.data.occupancy import DeterministicStratifiedBatchSampler
+from tmd_policy.evaluation.policy import _load_student_checkpoint_state
 from tmd_policy.methods.discriminators import IntermediateFeatureDiscriminator
-from tmd_policy.methods.dmd2_flow.program import DMD2FlowProgram
+from tmd_policy.methods.dmd2_flow.program import DMD2FlowProgram, _stable_first_order_surrogate
 from tmd_policy.methods.flow_objectives import (
     corrupt_rectified_flow,
     executable_coordinate_mask,
@@ -36,6 +38,47 @@ def test_timestep_shift_and_rectified_corruption_match_equations() -> None:
     assert torch.allclose(corrupted[:, 0, 0], value)
     corrupted.sum().backward()
     assert torch.allclose(clean.grad[:, 0, 0], 1 - value)
+
+
+def test_first_order_surrogate_recovers_gradient_with_safe_backward_scale() -> None:
+    class FiniteOnlyWhenScaled(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, value: torch.Tensor) -> torch.Tensor:
+            return value.sum()
+
+        @staticmethod
+        def backward(ctx, output_gradient: torch.Tensor) -> tuple[torch.Tensor]:
+            if float(output_gradient.abs()) > 0.01:
+                return (torch.full((3,), float("inf")),)
+            return (output_gradient.expand(3) * 4.0,)
+
+    value = torch.ones(3, requires_grad=True)
+    unstable_loss = FiniteOnlyWhenScaled.apply(value)
+    surrogate, scale = _stable_first_order_surrogate(
+        unstable_loss, value, scales=(1.0, 2.0**-8)
+    )
+    surrogate.backward()
+    assert scale == 2.0**-8
+    assert torch.equal(value.grad, torch.full((3,), 4.0))
+
+
+def test_first_order_surrogate_does_not_form_overflowing_gradient_dot_product() -> None:
+    class FiniteLossHugeGradient(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, value: torch.Tensor) -> torch.Tensor:
+            return value.new_tensor(1.25)
+
+        @staticmethod
+        def backward(ctx, output_gradient: torch.Tensor) -> tuple[torch.Tensor]:
+            return (output_gradient.expand(3) * 1.0e20,)
+
+    value = torch.full((3,), 1.0e30, requires_grad=True)
+    loss = FiniteLossHugeGradient.apply(value)
+    surrogate, scale = _stable_first_order_surrogate(loss, value)
+    assert scale == 1.0
+    assert torch.equal(surrogate.detach(), torch.tensor(1.25))
+    surrogate.backward()
+    assert torch.equal(value.grad, torch.full((3,), 1.0e20))
 
 
 def test_tmd_v_l1_direction_masks_padding_and_non_executable_dimensions() -> None:
@@ -117,8 +160,11 @@ def test_separate_layer_heads_average_logits_and_preserve_input_gradient() -> No
     }
     time = torch.tensor([0.2, 0.5, 0.8])
     valid = torch.ones(3, 5, dtype=torch.bool)
-    per_layer = model.layer_logits(features, time, valid)
-    aggregate = model(features, time, valid)
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        per_layer = model.layer_logits(features, time, valid)
+        aggregate = model(features, time, valid)
+    assert aggregate.dtype == torch.float32
+    assert all(value.dtype == torch.float32 for value in per_layer.values())
     assert torch.allclose(aggregate, torch.stack(list(per_layer.values())).mean(dim=0))
     torch.nn.functional.softplus(-aggregate).mean().backward()
     assert all(value.grad is not None and value.grad.abs().sum() > 0 for value in features.values())
@@ -145,16 +191,54 @@ def test_faithful_dmd_generator_never_calls_flow_sft() -> None:
     program._valid = types.MethodType(
         lambda self, batch, device: torch.ones(1, 50, dtype=torch.bool), program
     )
+    condition = object()
+    program._teacher_condition = types.MethodType(lambda self, batch: condition, program)
     program._distribution_matching_loss = types.MethodType(
-        lambda self, batch, generated, valid: (generated.mean(), {}), program
+        lambda self, batch, generated, valid, teacher_condition=None: (
+            generated.mean(),
+            {"condition_reused": float(teacher_condition is condition)},
+        ),
+        program,
     )
     program._generator_gan_loss = types.MethodType(
-        lambda self, batch, generated, valid: generated.square().mean(), program
+        lambda self, batch, generated, valid, teacher_condition=None: (
+            generated.square().mean()
+            if teacher_condition is condition
+            else torch.tensor(float("nan"))
+        ),
+        program,
     )
     loss, metrics = program._generator_loss({})
     loss.backward()
     assert anchor.grad is not None
     assert "data" not in metrics
+    assert metrics["condition_reused"] == 1.0
+
+
+def test_dmd_model_parallel_to_never_migrates_fake_score() -> None:
+    class TrackedModule(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = nn.Parameter(torch.ones(1))
+            self.moves: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+        def to(self, *args, **kwargs):
+            self.moves.append((args, kwargs))
+            return super().to(*args, **kwargs)
+
+    program = DMD2FlowProgram.__new__(DMD2FlowProgram)
+    nn.Module.__init__(program)
+    program.student = TrackedModule()
+    program.bridge = TrackedModule()
+    program.fake_score = TrackedModule()
+    program.discriminator = TrackedModule()
+    program._fake_score_device = torch.device("cpu")
+    program._discriminator_device = torch.device("cpu")
+    program.to("cpu")
+    assert len(program.student.moves) == 1
+    assert len(program.bridge.moves) == 1
+    assert program.fake_score.moves == []
+    assert program.discriminator.moves == []
 
 
 def _replan(*, environment_step: int, executed: int, truncated: bool) -> ReplanRecord:
@@ -192,6 +276,28 @@ def _replan(*, environment_step: int, executed: int, truncated: bool) -> ReplanR
         processor_revision="c" * 40,
         dataset_revision="d" * 40,
     )
+
+
+def test_replan_keeps_suite_local_and_manifest_global_task_ids_distinct() -> None:
+    record = _replan(environment_step=0, executed=10, truncated=False)
+    values = dict(record.__dict__)
+    values.update(
+        suite="libero_spatial",
+        suite_task_id=0,
+        global_task_index=30,
+        canonical_task_uid="libero:30:test",
+    )
+    remapped = ReplanRecord(**values)
+    assert remapped.suite_task_id == 0
+    assert remapped.global_task_index == 30
+
+
+def test_replan_rejects_manifest_uid_global_id_mismatch() -> None:
+    record = _replan(environment_step=0, executed=10, truncated=False)
+    values = dict(record.__dict__)
+    values.update(global_task_index=30, canonical_task_uid="libero:29:test")
+    with pytest.raises(ValueError, match="dataset-global"):
+        ReplanRecord(**values)
 
 
 def test_rollout_v2_round_trip_preserves_full_plans_observations_and_partial_prefix(tmp_path: Path) -> None:
@@ -257,6 +363,11 @@ def test_default_baseline_configs_are_pi05_feature_based_and_have_no_data_loss()
     assert load_config(root / "configs/methods/dmd2_flow_paper.yaml")["dmd2"][
         "student_training_mode"
     ] == "real_data_outer_transition"
+    optimized_training = load_config(root / "configs/methods/dmd2_flow_paper.yaml")["training"]
+    assert optimized_training["batch_size"] == 8
+    assert optimized_training["gradient_accumulation"] == 4
+    assert optimized_training["batch_size"] * optimized_training["gradient_accumulation"] == 32
+    assert optimized_training["inference_checkpoint_interval"] == 50
     assert load_config(root / "configs/methods/tmd_stage2_paper.yaml")["stage2"][
         "vsd_normalization"
     ] == "tmd_fake_teacher_difference_l1"
@@ -269,6 +380,86 @@ def test_default_baseline_configs_are_pi05_feature_based_and_have_no_data_loss()
         "libero_goal": set(range(10)),
         "libero_10": set(range(10)),
     }
+
+
+def test_sampled_evaluation_cli_accepts_intermediate_checkpoint_scope() -> None:
+    args = build_parser().parse_args(
+        [
+            "evaluate",
+            "libero",
+            "--checkpoint",
+            "inference_checkpoints/step-00000050.pt",
+            "--checkpoint-sha256",
+            "auto",
+            "--device",
+            "cuda:2",
+            "--suite",
+            "libero_spatial",
+            "--task-ids",
+            "0",
+            "5",
+            "--reset-seeds",
+            "0",
+            "--max-episode-steps",
+            "600",
+        ]
+    )
+    assert args.suite == ["libero_spatial"]
+    assert args.device == "cuda:2"
+    assert args.task_ids == [0, 5]
+    assert args.reset_seeds == [0]
+
+
+def test_lightweight_inference_delta_loads_only_declared_trainable_parameters() -> None:
+    class Policy(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.model = nn.Linear(2, 1)
+            self.frozen = nn.Linear(2, 2)
+
+    class Student(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.policy = Policy()
+            self.trainable_parameter_names = ("model.weight", "model.bias")
+
+    student = Student()
+    frozen_before = student.policy.frozen.weight.detach().clone()
+    delta = {
+        "student.policy.model.weight": torch.full_like(student.policy.model.weight, 3.0),
+        "student.policy.model.bias": torch.full_like(student.policy.model.bias, -2.0),
+    }
+    _load_student_checkpoint_state(
+        student,
+        delta,
+        checkpoint_format="tmdpolicy.inference/v1",
+        trainable_parameter_names=list(delta),
+    )
+    assert torch.equal(student.policy.model.weight, delta["student.policy.model.weight"])
+    assert torch.equal(student.policy.model.bias, delta["student.policy.model.bias"])
+    assert torch.equal(student.policy.frozen.weight, frozen_before)
+
+
+def test_dmd2_inference_checkpoint_contains_only_trainable_student_delta() -> None:
+    class Policy(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.model = nn.Linear(2, 1)
+            self.frozen = nn.Linear(2, 2)
+            self.frozen.requires_grad_(False)
+
+    class Student(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.policy = Policy()
+            self.trainable_parameter_names = ("model.weight", "model.bias")
+
+    program = DMD2FlowProgram.__new__(DMD2FlowProgram)
+    nn.Module.__init__(program)
+    program.student = Student()
+    state = program.inference_state_dict()
+    assert set(state) == {"student.policy.model.weight", "student.policy.model.bias"}
+    assert all(value.device.type == "cpu" and not value.requires_grad for value in state.values())
 
 
 def test_configs_fail_closed_on_unknown_and_legacy_data_loss(tmp_path: Path) -> None:
@@ -313,8 +504,11 @@ def test_pi05_evaluation_does_not_construct_smolvla_and_returns_canonical(monkey
         def encode_condition(self, batch):
             return SimpleNamespace(batch_size=1)
 
-        def sample(self, condition, noise, num_steps):
+        def sample(self, condition, noise, num_steps, step_callback=None):
             assert num_steps == 10
+            for _ in range(num_steps):
+                if step_callback is not None:
+                    step_callback()
             return noise
 
         def postprocess_action(self, value):
@@ -329,18 +523,28 @@ def test_pi05_evaluation_does_not_construct_smolvla_and_returns_canonical(monkey
     policy, identity = policy_module.load_inference_policy(
         {"policy": {"method": "pi05", "device": "cpu", "num_steps": 10}}
     )
-    plan = policy.plan({"observation.state": torch.zeros(1, 8)}, noise_seed=7)
+    completed_work = []
+    plan = policy.plan(
+        {"observation.state": torch.zeros(1, 8)},
+        noise_seed=7,
+        step_callback=lambda: completed_work.append(1),
+    )
     assert plan.shape == (1, 50, 7)
+    assert len(completed_work) == 10
     assert identity["num_steps"] == 10
 
 
 def test_smolvla_official_mode_uses_checkpoint_10_steps_with_fixed_noise_parity(monkeypatch) -> None:
     import tmd_policy.evaluation.policy as policy_module
 
+    action_out_proj = nn.Identity()
+
     class OfficialPolicy:
         config = SimpleNamespace(num_steps=10)
 
         def predict_action_chunk(self, batch, *, noise):
+            for _ in range(self.config.num_steps):
+                action_out_proj(noise)
             return noise + 2.0
 
         def reset(self):
@@ -352,6 +556,7 @@ def test_smolvla_official_mode_uses_checkpoint_10_steps_with_fixed_noise_parity(
         model_revision = "c" * 40
         processor_revision = "d" * 40
         policy = OfficialPolicy()
+        flow = SimpleNamespace(action_out_proj=action_out_proj)
 
         def preprocess_observation(self, batch):
             return batch
@@ -365,10 +570,16 @@ def test_smolvla_official_mode_uses_checkpoint_10_steps_with_fixed_noise_parity(
         {"policy": {"method": "smolvla", "device": "cpu", "sampler_mode": "official"}}
     )
     seed = 13
-    actual = policy.plan({"observation.state": torch.zeros(1, 8)}, noise_seed=seed)
+    completed_work = []
+    actual = policy.plan(
+        {"observation.state": torch.zeros(1, 8)},
+        noise_seed=seed,
+        step_callback=lambda: completed_work.append(1),
+    )
     expected_noise = torch.randn(
         1, 50, 32, generator=torch.Generator(device="cpu").manual_seed(seed)
     )
     expected = student.postprocessor(student.policy.predict_action_chunk({}, noise=expected_noise))
     assert identity["num_steps"] == 10
+    assert len(completed_work) == 10
     assert torch.equal(actual, expected)
