@@ -160,7 +160,6 @@ class LeRobotSmolVLAStudent(nn.Module):
     def _head_modules(self) -> list[nn.Module]:
         flow = self.flow
         return [
-            flow.state_proj,
             flow.action_in_proj,
             flow.action_out_proj,
             flow.action_time_mlp_in,

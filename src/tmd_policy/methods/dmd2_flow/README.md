@@ -42,5 +42,7 @@ TMD-v valid-L1 normalization.
 The robotics covariate-shift adaptation is explicit: a balanced all-40-task
 student rollout is collected before optimization and refreshed asynchronously
 every 500 generator updates. It is not claimed as a DMD2 paper mechanism.
-Guidance and discriminator-real updates continue to use expert-state batches;
-generator VSD/GAN conditioning can be sampled from the bounded replay.
+Within each combined guidance update, fake-score score matching uses a
+student-replay condition and independently sampled student action, while GAN
+real/fake classification remains expert-conditioned. Generator VSD/GAN
+conditioning can be sampled from the bounded replay.

@@ -37,6 +37,10 @@ from .fake_scores import PI05CloneFakeScore, SmolVLACloneFakeScore
 from .networks import ActionScoreTransformer
 
 
+_GUIDANCE_EXPERT_BATCH = "_dmd2_guidance_expert_batch"
+_GUIDANCE_FAKE_SCORE_BATCH = "_dmd2_guidance_fake_score_batch"
+
+
 def _masked_mean(values: Tensor, valid_coordinates: Tensor) -> Tensor:
     mask = valid_coordinates.to(values.dtype)
     denominator = mask.flatten(1).sum(dim=1).clamp_min(1)
@@ -470,12 +474,26 @@ class DMD2FlowProgram(TrainingProgram):
         self._student_replay = replay
 
     def prepare_phase_batch(self, batch: dict[str, Any], phase: str) -> dict[str, Any]:
-        """Use replay observations for generator objectives, never GAN real updates."""
+        """Route conditional objectives to their intended state distributions.
 
-        if phase != "generator" or self._student_replay is None:
+        Fake-score score matching estimates the current student's conditional
+        distribution, so it uses student-visited replay observations.  The GAN
+        classifier still receives an expert minibatch for both its real action
+        and its expert-conditioned fake action.  A combined guidance update
+        therefore carries both batches explicitly.
+        """
+
+        if self._student_replay is None or phase not in {"guidance", "fake", "generator"}:
             return batch
         replay_batch = self._student_replay.sample_like(batch)
-        return batch if replay_batch is None else replay_batch
+        if replay_batch is None:
+            return batch
+        if phase == "guidance":
+            return {
+                _GUIDANCE_EXPERT_BATCH: batch,
+                _GUIDANCE_FAKE_SCORE_BATCH: replay_batch,
+            }
+        return replay_batch
 
     @staticmethod
     def _tensor_metrics(prefix: str, value: Tensor) -> dict[str, float]:
@@ -848,22 +866,38 @@ class DMD2FlowProgram(TrainingProgram):
     def _guidance_loss(self, batch: dict[str, Any]) -> tuple[Tensor, dict[str, float]]:
         if self.feature_source != "fake_score_features":
             raise ValueError("combined guidance is only valid for fake-score discriminator features")
-        # The frozen 3.45B-parameter PI0.5 prefix depends only on this
-        # observation/language batch. Reuse its immutable KV cache for all
-        # fake-score and classifier suffix queries in this loss.
-        teacher_condition = self._teacher_condition(batch)
-        generated = self._sample_student(batch, requires_grad=False).detach()
+        expert_batch = batch.get(_GUIDANCE_EXPERT_BATCH, batch)
+        fake_score_batch = batch.get(_GUIDANCE_FAKE_SCORE_BATCH, expert_batch)
+
+        # When replay is unavailable, retain the original shared sample/cache
+        # path. Once replay exists, fake-score score matching and GAN
+        # classification intentionally use separate conditional samples.
+        fake_condition = self._teacher_condition(fake_score_batch)
+        fake_generated = self._sample_student(
+            fake_score_batch,
+            requires_grad=False,
+        ).detach()
         fake_loss, fake_metrics = self._fake_loss(
-            batch,
-            generated,
-            teacher_condition=teacher_condition,
+            fake_score_batch,
+            fake_generated,
+            teacher_condition=fake_condition,
         )
         if not torch.isfinite(fake_loss.detach()).all():
             raise RuntimeError("PI0.5 fake-score guidance loss contains NaN/Inf")
+
+        if expert_batch is fake_score_batch:
+            expert_condition = fake_condition
+            expert_generated = fake_generated
+        else:
+            expert_condition = self._teacher_condition(expert_batch)
+            expert_generated = self._sample_student(
+                expert_batch,
+                requires_grad=False,
+            ).detach()
         discriminator_loss, discriminator_metrics = self._discriminator_loss(
-            batch,
-            generated,
-            teacher_condition=teacher_condition,
+            expert_batch,
+            expert_generated,
+            teacher_condition=expert_condition,
         )
         if not torch.isfinite(discriminator_loss.detach()).all():
             raise RuntimeError("PI0.5 feature-discriminator guidance loss contains NaN/Inf")
@@ -877,6 +911,12 @@ class DMD2FlowProgram(TrainingProgram):
             "classifier_loss": float(discriminator_loss.detach()),
             "discriminator_loss": float(discriminator_loss.detach()),
             "classifier_weight": classifier_weight,
+            "fake_score_replay_state_fraction": float(
+                bool(fake_score_batch.get("_student_replay_batch", False))
+            ),
+            "gan_expert_state_fraction": float(
+                not bool(expert_batch.get("_student_replay_batch", False))
+            ),
         }
 
     def _distribution_matching_loss(

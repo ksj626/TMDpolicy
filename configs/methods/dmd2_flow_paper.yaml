@@ -39,7 +39,7 @@ dmd2:
   student_fine_tuning: head_only
   fake_score_variant: pi05_clone
   fake_updates_per_generator: 5
-  guidance_classifier_weight: 1.0
+  guidance_classifier_weight: 0.01
   student_training_mode: backward_simulation_denoise_renoise
   discrete_outer_steps: 4
   student_time_shift_gamma: 5.0
@@ -64,7 +64,7 @@ dmd2:
     max_episode_steps: 600
     batch_size: 1
   vsd_time: {minimum_time: 0.001, maximum_time: 0.999, time_shift_gamma: 5.0}
-  gan_time: {minimum_time: 0.001, maximum_time: 0.999, time_shift_gamma: 1.0}
+  gan_time: {minimum_time: 0.001, maximum_time: 0.8, time_shift_gamma: 1.0}
   fake_score_time: {minimum_time: 0.001, maximum_time: 0.999, time_shift_gamma: 5.0}
   discriminator:
     variant: pi05_intermediate_features

@@ -129,40 +129,76 @@ def test_guidance_backward_updates_fake_and_classifier_but_not_student_or_teache
     program.discriminator = nn.Linear(1, 1, bias=False)
     program.student = nn.Linear(1, 1, bias=False)
     program.teacher = nn.Linear(1, 1, bias=False)
-    calls: list[torch.Tensor] = []
-    conditions: list[object] = []
-    shared_condition = object()
+    calls: list[tuple[dict, torch.Tensor, object]] = []
+    conditions: list[dict] = []
+    expert_batch = {"source": "expert"}
+    replay_batch = {"source": "replay", "_student_replay_batch": True}
 
     def sample(self, batch, *, requires_grad):
         assert not requires_grad
-        return self.student.weight.view(1, 1, 1).expand(1, 2, 1)
+        marker = 1.0 if batch is replay_batch else 2.0
+        return torch.full((1, 2, 1), marker)
 
     def teacher_condition(self, batch):
-        conditions.append(shared_condition)
-        return shared_condition
+        conditions.append(batch)
+        return batch
 
     def fake(self, batch, generated=None, *, teacher_condition=None):
-        assert teacher_condition is shared_condition
-        calls.append(generated)
+        assert batch is replay_batch and teacher_condition is replay_batch
+        calls.append((batch, generated, teacher_condition))
         return self.fake_score.weight.square().sum(), {"denoising": 1.0}
 
     def classifier(self, batch, generated=None, *, teacher_condition=None):
-        assert teacher_condition is shared_condition
-        calls.append(generated)
+        assert batch is expert_batch and teacher_condition is expert_batch
+        calls.append((batch, generated, teacher_condition))
         return self.discriminator.weight.square().sum(), {"classification": 1.0}
 
     program._sample_student = MethodType(sample, program)
     program._teacher_condition = MethodType(teacher_condition, program)
     program._fake_loss = MethodType(fake, program)
     program._discriminator_loss = MethodType(classifier, program)
-    loss, _ = program._guidance_loss({})
+    loss, metrics = program._guidance_loss(
+        {
+            "_dmd2_guidance_expert_batch": expert_batch,
+            "_dmd2_guidance_fake_score_batch": replay_batch,
+        }
+    )
     loss.backward()
-    assert len(calls) == 2 and calls[0] is calls[1] and not calls[0].requires_grad
+    assert len(calls) == 2
+    assert calls[0][0] is replay_batch and calls[1][0] is expert_batch
+    assert not calls[0][1].requires_grad and not calls[1][1].requires_grad
+    assert calls[0][1].unique().item() == 1.0
+    assert calls[1][1].unique().item() == 2.0
     assert program.fake_score.weight.grad is not None
     assert program.discriminator.weight.grad is not None
     assert program.student.weight.grad is None
     assert program.teacher.weight.grad is None
-    assert len(conditions) == 1
+    assert conditions == [replay_batch, expert_batch]
+    assert metrics["fake_score_replay_state_fraction"] == 1.0
+    assert metrics["gan_expert_state_fraction"] == 1.0
+
+
+def test_dmd2_phase_batch_routes_fake_score_to_replay_and_gan_to_expert() -> None:
+    program = DMD2FlowProgram.__new__(DMD2FlowProgram)
+    nn.Module.__init__(program)
+    expert_batch = {"observation.state": torch.zeros(2, 8)}
+    replay_batch = {
+        "observation.state": torch.ones(2, 8),
+        "_student_replay_batch": True,
+    }
+
+    class Replay:
+        def sample_like(self, batch):
+            assert batch is expert_batch
+            return replay_batch
+
+    program._student_replay = Replay()
+    guidance = program.prepare_phase_batch(expert_batch, "guidance")
+    assert guidance["_dmd2_guidance_expert_batch"] is expert_batch
+    assert guidance["_dmd2_guidance_fake_score_batch"] is replay_batch
+    assert program.prepare_phase_batch(expert_batch, "fake") is replay_batch
+    assert program.prepare_phase_batch(expert_batch, "generator") is replay_batch
+    assert program.prepare_phase_batch(expert_batch, "discriminator") is expert_batch
 
 
 def test_dmd2_runtime_gradient_contract_keeps_teacher_and_backbone_frozen() -> None:

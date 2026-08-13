@@ -68,9 +68,12 @@ At the configured actual-generator-update interval, training writes another
 immutable student snapshot and starts a coordinator whose serial workers use the
 configured rollout devices. The trainer continues optimizing while they run and
 ingests a round only after its merged atomic rollout store is complete. The bounded replay samples tasks in
-round-robin order. Guidance/fake-score and discriminator-real updates always use
-expert-state minibatches. The generator's DMD and GAN objectives use replay
-observations when the buffer is available.
+round-robin order. Within a combined guidance update, fake-score score matching
+uses replay observations and an independently sampled student action, while GAN
+real/fake classification uses the expert minibatch and an expert-conditioned
+student action. The generator's DMD and GAN objectives use replay observations
+when the buffer is available. Before the initial replay is available, guidance
+falls back to the expert batch for both branches.
 
 Collector state is under
 `<training-output>/student_rollout_replay/`: resolved round configs, asynchronous
