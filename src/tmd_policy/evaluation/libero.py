@@ -102,7 +102,7 @@ def run_episode(
     execution_horizon: int,
     max_steps: int,
     synchronize_cuda: bool,
-    replan_metadata: dict[str, Any],
+    replan_metadata: dict[str, Any] | None,
     progress_description: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     from lerobot.envs.utils import NEW_ROLLOUT_OPTION
@@ -130,8 +130,14 @@ def run_episode(
         model_batch["task"] = [instruction]
         seed = 100_000_007 * task_index + 10_007 * reset_seed + replans
         start_step = len(actions)
-        start_state = torch.as_tensor(observation["observation.state"])[0, :8].float().cpu().clone()
-        stored_images, image_metadata = _stored_observations(observation)
+        if replan_metadata is not None:
+            start_state = (
+                torch.as_tensor(observation["observation.state"])[0, :8]
+                .float()
+                .cpu()
+                .clone()
+            )
+            stored_images, image_metadata = _stored_observations(observation)
         _sync(policy.device, synchronize_cuda)
         started = time.perf_counter()
         plan_progress = tqdm(
@@ -178,33 +184,34 @@ def run_episode(
             if executed_this_plan
             else torch.empty(0, 7, dtype=plan.dtype)
         )
-        replan_records.append(
-            ReplanRecord(
-                suite=str(replan_metadata["suite"]),
-                suite_task_id=int(replan_metadata["suite_task_id"]),
-                global_task_index=task_index,
-                canonical_task_uid=str(replan_metadata["canonical_task_uid"]),
-                instruction=instruction,
-                reset_seed=reset_seed,
-                policy_checkpoint=str(replan_metadata["policy_checkpoint"]),
-                policy_checkpoint_sha256=str(replan_metadata["policy_checkpoint_sha256"]),
-                policy_version=str(replan_metadata["policy_version"]),
-                collection_round=int(replan_metadata["collection_round"]),
-                environment_step=start_step,
-                state=start_state,
-                observations=stored_images,
-                observation_metadata=image_metadata,
-                planned_actions=plan.float(),
-                executed_prefix_length=len(executed_this_plan),
-                executed_actions=executed_tensor,
-                terminated=terminated_value,
-                truncated=truncated_value,
-                success=successful,
-                model_revision=str(replan_metadata["model_revision"]),
-                processor_revision=str(replan_metadata["processor_revision"]),
-                dataset_revision=str(replan_metadata["dataset_revision"]),
+        if replan_metadata is not None:
+            replan_records.append(
+                ReplanRecord(
+                    suite=str(replan_metadata["suite"]),
+                    suite_task_id=int(replan_metadata["suite_task_id"]),
+                    global_task_index=task_index,
+                    canonical_task_uid=str(replan_metadata["canonical_task_uid"]),
+                    instruction=instruction,
+                    reset_seed=reset_seed,
+                    policy_checkpoint=str(replan_metadata["policy_checkpoint"]),
+                    policy_checkpoint_sha256=str(replan_metadata["policy_checkpoint_sha256"]),
+                    policy_version=str(replan_metadata["policy_version"]),
+                    collection_round=int(replan_metadata["collection_round"]),
+                    environment_step=start_step,
+                    state=start_state,
+                    observations=stored_images,
+                    observation_metadata=image_metadata,
+                    planned_actions=plan.float(),
+                    executed_prefix_length=len(executed_this_plan),
+                    executed_actions=executed_tensor,
+                    terminated=terminated_value,
+                    truncated=truncated_value,
+                    success=successful,
+                    model_revision=str(replan_metadata["model_revision"]),
+                    processor_revision=str(replan_metadata["processor_revision"]),
+                    dataset_revision=str(replan_metadata["dataset_revision"]),
+                )
             )
-        )
         replans += 1
         step_progress.set_postfix(replans=replans, success=successful, refresh=True)
     step_progress.close()

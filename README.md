@@ -16,10 +16,13 @@ Pinned assets:
 trainable action-expert suffix, five fake-score updates per generator update,
 VSD, and a noised-action GAN on selected fake-score layers. Its generator loss
 is exactly `L_VSD + lambda_GAN L_GAN`; it has no Flow-SFT or data regression.
-The direct baseline is DMD2-v: training predicts a clean action from one
-real-data outer transition, while evaluation deterministically integrates the
-checkpoint's shifted descending student grid. The five guidance updates jointly
-train fake-score and classifier parameters from one detached student sample.
+The direct baseline converts the student's rectified-flow velocity to a clean
+prediction and implements DMD2 backward simulation. Training and evaluation
+both start from Gaussian noise; every prefix step predicts clean action and
+independently re-noises it at the next shifted-grid time. Five guidance updates
+jointly train fake-score and classifier parameters for every generator update.
+Their warmup/decay schedules are measured in their actual optimizer-update
+counts, not global generator steps.
 
 TMD uses the repository-owned SmolVLA action-space transformer adaptation:
 
@@ -127,7 +130,11 @@ its output directory after each completed step.
 
 The paper DMD2 configuration keeps effective batch size 32 as `8 × 4`, reuses
 each immutable PI0.5 condition cache within a loss, and writes a lightweight
-student-delta checkpoint every 50 steps under `inference_checkpoints/`.
+student-delta checkpoint every 10 steps under `inference_checkpoints/`. Before
+optimization it collects one balanced all-40-task student rollout. It refreshes
+that replay asynchronously every 500 actual generator updates on `cuda:2`;
+guidance/discriminator real batches remain expert-state batches, while the
+generator objectives use replay states when available.
 
 ## Evaluation
 
@@ -139,6 +146,50 @@ bash scripts/evaluate/evaluate_pi05.sh
 bash scripts/evaluate/evaluate_smolvla10.sh
 bash scripts/evaluate/evaluate_dmd2.sh
 bash scripts/evaluate/evaluate_tmd.sh
+```
+
+DMD2 evaluation uses the same denoise--renoise sampler as training backward
+simulation. `--outer-steps 1` is a supported one-step DMD2 checkpoint ablation.
+
+LIBERO-Plus replaces the Python `libero` package, so it has a separate cloned
+Conda environment. Full evaluation is streamed one task at a time and resumes
+from `episodes.jsonl`:
+
+```bash
+bash scripts/setup/create_libero_plus_environment.sh
+bash scripts/evaluate/evaluate_libero_plus_dmd2.sh \
+  --checkpoint artifacts/training/dmd2_flow_paper/inference_checkpoints/final.pt \
+  --checkpoint-sha256 auto \
+  --output artifacts/evaluation/libero_plus_dmd2_full
+
+# Continue an interrupted 10,030-task run
+bash scripts/evaluate/evaluate_libero_plus_dmd2.sh \
+  --checkpoint artifacts/training/dmd2_flow_paper/inference_checkpoints/final.pt \
+  --checkpoint-sha256 auto \
+  --output artifacts/evaluation/libero_plus_dmd2_full \
+  --resume
+```
+
+Run a category-balanced 70-episode performance check (10 tasks from each of
+the seven LIBERO-Plus perturbation categories):
+
+```bash
+bash scripts/evaluate/evaluate_libero_plus_dmd2.sh \
+  --checkpoint artifacts/training/dmd2_flow_paper_run1/inference_checkpoints/step-00000060.pt \
+  --checkpoint-sha256 auto \
+  --device cuda:3 \
+  --sample-per-category 10 \
+  --sample-seed 0 \
+  --output artifacts/evaluation/libero_plus_dmd2_category10
+```
+
+Start a new DMD2 run from an existing balanced rollout round, skipping the
+blocking rollout before optimization:
+
+```bash
+bash scripts/train/train_dmd2_flow_paper.sh \
+  --initial-rollout-replay /home/dmsdmswns/TMDpolicy/artifacts/training/dmd2_flow_paper_run1/student_rollout_replay/round-000000 \
+  --output artifacts/training/dmd2_flow_paper_run2
 ```
 
 Evaluate two spatial tasks from an intermediate DMD2 inference checkpoint:
@@ -185,5 +236,6 @@ and loss exclusions are preserved within the labeled adaptation.
 The current conditional action-policy TMD has no CFG; nonzero condition dropout
 is rejected rather than partially dropping only captured features.
 
-See [architecture](docs/architecture.md), [experiment protocol](docs/experiment_protocol.md),
+See [DMD2 fidelity and operations](docs/dmd2_fidelity.md),
+[architecture](docs/architecture.md), [experiment protocol](docs/experiment_protocol.md),
 [config reference](configs/README.md), and the method/data/evaluation READMEs.

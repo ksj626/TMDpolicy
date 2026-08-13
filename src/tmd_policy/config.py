@@ -102,6 +102,10 @@ def validate_config(config: dict[str, Any], *, expected_method: str | None = Non
             "method", "classification", "backend", "models", "dataset", "horizons", "policy",
             "evaluation", "output"
         },
+        "evaluate_libero_plus": {
+            "method", "classification", "backend", "models", "dataset", "horizons", "policy",
+            "evaluation", "output"
+        },
     }
     if method not in root_fields:
         raise ConfigError(f"unknown production method: {method!r}")
@@ -162,7 +166,7 @@ def validate_config(config: dict[str, Any], *, expected_method: str | None = Non
                 "gradient_accumulation", "gradient_clip_norm", "learning_rate", "weight_decay",
                 "betas", "epsilon", "warmup_steps", "minimum_lr_scale", "max_steps",
                 "validation_interval", "validation_batches", "checkpoint_interval",
-                "inference_checkpoint_interval",
+                "inference_checkpoint_interval", "diagnostics_interval",
             },
             "training",
         )
@@ -174,6 +178,8 @@ def validate_config(config: dict[str, Any], *, expected_method: str | None = Non
             raise ConfigError("training.gradient_accumulation must be positive")
         if int(training.get("inference_checkpoint_interval", 1)) < 1:
             raise ConfigError("training.inference_checkpoint_interval must be positive when set")
+        if int(training.get("diagnostics_interval", 1)) < 1:
+            raise ConfigError("training.diagnostics_interval must be positive")
     _reject_unknown(_require(config, "output", "config"), {"directory"}, "output")
     if "preflight" in config:
         _reject_unknown(config["preflight"], {"minimum_total_memory_gib"}, "preflight")
@@ -224,7 +230,7 @@ def validate_config(config: dict[str, Any], *, expected_method: str | None = Non
             "vsd_normalization",
             "teacher_device", "teacher_dtype", "fake_score_device",
             "vsd_time", "gan_time", "fake_score_time", "discriminator", "resource_estimate",
-            "fake_score", "data_weight",
+            "fake_score", "data_weight", "student_rollout_replay",
         }
         if method == "tmd_stage2":
             objective_fields |= {
@@ -252,7 +258,7 @@ def validate_config(config: dict[str, Any], *, expected_method: str | None = Non
                 f"{section_name}.vsd_normalization must be {expected_normalization} for {method}"
             )
         expected_training_mode = (
-            "real_data_outer_transition"
+            "backward_simulation_denoise_renoise"
             if method == "dmd2_flow"
             else "tmd_stage1_outer_transition"
         )
@@ -267,6 +273,26 @@ def validate_config(config: dict[str, Any], *, expected_method: str | None = Non
                 raise ConfigError("dmd2.discrete_outer_steps must be positive")
             if float(objective["student_time_shift_gamma"]) < 1:
                 raise ConfigError("dmd2.student_time_shift_gamma must be at least one")
+            replay = _require(objective, "student_rollout_replay", "dmd2")
+            _reject_unknown(
+                replay,
+                {
+                    "enabled", "initial_blocking", "refresh_generator_updates",
+                    "capacity_replans", "device", "fps", "base_reset_seed",
+                    "max_episode_steps",
+                },
+                "dmd2.student_rollout_replay",
+            )
+            if not bool(replay.get("enabled", False)):
+                raise ConfigError("configured DMD2 student replay must be enabled")
+            if not bool(replay.get("initial_blocking", False)):
+                raise ConfigError("DMD2 student replay must collect a balanced initial rollout")
+            if int(replay.get("refresh_generator_updates", 0)) != 500:
+                raise ConfigError("DMD2 student replay refresh must be every 500 generator updates")
+            if int(replay.get("capacity_replans", 0)) < 40:
+                raise ConfigError("DMD2 student replay capacity must be at least 40 replans")
+            if int(replay.get("max_episode_steps", 0)) < 1:
+                raise ConfigError("DMD2 student replay max_episode_steps must be positive")
         if objective.get("fake_score_variant") != "pi05_clone" and "ablation" not in str(
             config.get("classification", "")
         ).lower():
@@ -372,7 +398,7 @@ def validate_config(config: dict[str, Any], *, expected_method: str | None = Non
         if not 0 <= minimum < maximum <= 1 or gamma < 1:
             raise ConfigError("invalid occupancy discriminator time range/shift")
 
-    if method == "evaluate_libero":
+    if method in {"evaluate_libero", "evaluate_libero_plus"}:
         policy = _require(config, "policy", "config")
         policy_method = str(_require(policy, "method", "policy"))
         if policy_method not in {
@@ -387,7 +413,11 @@ def validate_config(config: dict[str, Any], *, expected_method: str | None = Non
             )
         else:
             sampling_override_fields = (
-                {"outer_steps", "inner_steps"} if policy_method == "flow_sft" else set()
+                {"outer_steps", "inner_steps"}
+                if policy_method == "flow_sft"
+                else {"outer_steps"}
+                if policy_method == "dmd2_flow"
+                else set()
             )
             _reject_unknown(
                 policy,
@@ -401,6 +431,58 @@ def validate_config(config: dict[str, Any], *, expected_method: str | None = Non
                 raise ConfigError("official SmolVLA evaluation forbids step overrides")
             if mode == "override" and "ablation" not in str(policy.get("classification", "")).lower():
                 raise ConfigError("SmolVLA override mode must be classified as an ablation")
+
+    if method == "evaluate_libero_plus":
+        evaluation = _require(config, "evaluation", "config")
+        _reject_unknown(
+            evaluation,
+            {
+                "fps", "suites", "task_ids", "reset_seeds", "suite_max_episode_steps",
+                "expected_total_tasks", "synchronize_cuda", "control_mode", "hard_reset",
+                "sample_per_category", "sample_seed",
+            },
+            "evaluation",
+        )
+        suites = [str(value) for value in _require(evaluation, "suites", "evaluation")]
+        expected_suites = ["libero_spatial", "libero_object", "libero_goal", "libero_10"]
+        if not suites or len(suites) != len(set(suites)) or any(
+            suite not in expected_suites for suite in suites
+        ):
+            raise ConfigError(
+                "LIBERO-Plus evaluation.suites must be a unique nonempty subset of the four suites"
+            )
+        if int(_require(evaluation, "expected_total_tasks", "evaluation")) != 10_030:
+            raise ConfigError("the full four-suite LIBERO-Plus contract contains exactly 10,030 tasks")
+        task_ids = evaluation.get("task_ids")
+        sample_per_category = evaluation.get("sample_per_category")
+        if task_ids is not None and sample_per_category is not None:
+            raise ConfigError(
+                "LIBERO-Plus task_ids and sample_per_category are mutually exclusive"
+            )
+        if task_ids is not None:
+            normalized_ids = [int(value) for value in task_ids]
+            if (
+                not normalized_ids
+                or len(normalized_ids) != len(set(normalized_ids))
+                or min(normalized_ids) < 0
+            ):
+                raise ConfigError("LIBERO-Plus task_ids must be unique nonnegative integers")
+        if sample_per_category is not None and int(sample_per_category) < 1:
+            raise ConfigError("LIBERO-Plus sample_per_category must be positive")
+        if int(evaluation.get("sample_seed", 0)) < 0:
+            raise ConfigError("LIBERO-Plus sample_seed must be nonnegative")
+        reset_seeds = [int(value) for value in _require(evaluation, "reset_seeds", "evaluation")]
+        if not reset_seeds or len(reset_seeds) != len(set(reset_seeds)) or min(reset_seeds) < 0:
+            raise ConfigError("LIBERO-Plus reset_seeds must be unique nonnegative integers")
+        episode_steps = _require(evaluation, "suite_max_episode_steps", "evaluation")
+        if set(episode_steps) != set(expected_suites) or min(
+            int(value) for value in episode_steps.values()
+        ) < 1:
+            raise ConfigError("LIBERO-Plus suite_max_episode_steps must cover all four suites")
+        if int(evaluation.get("fps", 0)) < 1:
+            raise ConfigError("LIBERO-Plus evaluation.fps must be positive")
+        if evaluation.get("control_mode", "relative") not in {"relative", "absolute"}:
+            raise ConfigError("LIBERO-Plus control_mode must be relative or absolute")
 
 
 def load_config(path: str | Path, *, expected_method: str | None = None) -> dict[str, Any]:

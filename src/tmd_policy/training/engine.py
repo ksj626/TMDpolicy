@@ -11,6 +11,7 @@ import subprocess
 import sys
 import time
 from abc import ABC, abstractmethod
+from collections import Counter
 from collections.abc import Iterator
 from itertools import islice
 from pathlib import Path
@@ -114,6 +115,20 @@ class TrainingProgram(nn.Module, ABC):
 
         return None
 
+    def set_step_context(self, **values: Any) -> None:
+        """Receive non-persistent trainer counters for diagnostics."""
+
+    def prepare_phase_batch(self, batch: dict[str, Any], phase: str) -> dict[str, Any]:
+        """Optionally replace a phase's conditioning batch."""
+
+        return batch
+
+    def gradient_diagnostics(self, phase: str) -> dict[str, float]:
+        return {}
+
+    def optimizer_step_diagnostics(self, phase: str, optimizer: Optimizer) -> dict[str, float]:
+        return {}
+
 
 def validate_optimizer_parameter_ownership(optimizers: dict[str, Optimizer]) -> None:
     """Reject parameters registered with more than one independently stepped optimizer."""
@@ -178,9 +193,19 @@ def _git_provenance() -> dict[str, Any]:
         return {"repository": str(root), "commit": None, "dirty": None}
 
 
-def _scheduler(optimizer: Optimizer, training: dict[str, Any]) -> LRScheduler:
-    warmup = int(training.get("warmup_steps", 0))
-    total = int(training["max_steps"])
+def _scheduler(
+    optimizer: Optimizer,
+    training: dict[str, Any],
+    *,
+    updates_per_global_step: int,
+) -> LRScheduler:
+    if updates_per_global_step < 1:
+        raise ValueError("scheduler update multiplicity must be positive")
+    # max_steps and warmup_steps are generator/global-step units. TTUR phases
+    # may update several times per global step, so each optimizer gets a
+    # schedule expressed in its own actual update count.
+    warmup = int(training.get("warmup_steps", 0)) * updates_per_global_step
+    total = int(training["max_steps"]) * updates_per_global_step
 
     def factor(step: int) -> float:
         if warmup and step < warmup:
@@ -209,6 +234,7 @@ def _checkpoint_payload(
     epoch: int,
     next_batch: int,
     sampler: Sampler[list[int]],
+    optimizer_updates: dict[str, int],
 ) -> dict[str, Any]:
     sampler_state = dict(sampler.state_dict()) if hasattr(sampler, "state_dict") else {}
     sampler_state.update(
@@ -225,7 +251,12 @@ def _checkpoint_payload(
         "optimizers": {name: value.state_dict() for name, value in optimizers.items()},
         "schedulers": {name: value.state_dict() for name, value in schedulers.items()},
         "scaler": scaler.state_dict(),
-        "counters": {"global_step": global_step, "epoch": epoch, "next_batch": next_batch},
+        "counters": {
+            "global_step": global_step,
+            "epoch": epoch,
+            "next_batch": next_batch,
+            "optimizer_updates": dict(optimizer_updates),
+        },
         "sampler": sampler_state,
         "rng": _rng_state(),
         "config": config,
@@ -357,7 +388,7 @@ def _load_checkpoint(
     scaler: torch.amp.GradScaler,
     config: dict[str, Any],
     sampler: Sampler[list[int]],
-) -> tuple[int, int, int]:
+) -> tuple[int, int, int, dict[str, int]]:
     payload = torch.load(path, map_location="cpu", weights_only=False)
     if payload.get("format") != "tmdpolicy.training/v1":
         raise ValueError(f"unsupported checkpoint format in {path}")
@@ -388,7 +419,13 @@ def _load_checkpoint(
         )
     _restore_rng(payload["rng"])
     counters = payload["counters"]
-    return int(counters["global_step"]), int(counters["epoch"]), int(counters["next_batch"])
+    global_step = int(counters["global_step"])
+    stored_updates = counters.get("optimizer_updates")
+    if stored_updates is None:
+        multiplicity = Counter(program.phase_schedule())
+        stored_updates = {name: global_step * multiplicity[name] for name in optimizers}
+    optimizer_updates = {name: int(stored_updates[name]) for name in optimizers}
+    return global_step, int(counters["epoch"]), int(counters["next_batch"]), optimizer_updates
 
 
 @torch.no_grad()
@@ -437,6 +474,7 @@ def run_training(
     output_dir: str | Path,
     resume: str | Path | None = None,
     train_batch_sampler: Sampler[list[int]] | None = None,
+    initial_rollout_replay: str | Path | None = None,
 ) -> dict[str, Any]:
     """Run real DataLoader/model updates; no dry-run branch exists."""
 
@@ -462,7 +500,15 @@ def run_training(
     if set(optimizers) != set(phase_schedule):
         raise RuntimeError("phase_schedule and optimizer names must contain the same unique phases")
     validate_optimizer_parameter_ownership(optimizers)
-    schedulers = {name: _scheduler(value, training) for name, value in optimizers.items()}
+    phase_counts = Counter(phase_schedule)
+    schedulers = {
+        name: _scheduler(
+            value,
+            training,
+            updates_per_global_step=phase_counts[name],
+        )
+        for name, value in optimizers.items()
+    }
     scaler = torch.amp.GradScaler("cuda", enabled=training["mixed_precision"] == "fp16" and device.type == "cuda")
     compatibility = verify_installed_lerobot(
         expected_version=config["backend"]["lerobot_version"],
@@ -504,10 +550,52 @@ def run_training(
         raise TypeError("training batch samplers must expose epoch and start_batch for exact resume")
 
     global_step = epoch = next_batch = 0
+    optimizer_updates = {name: 0 for name in optimizers}
     if resume is not None:
-        global_step, epoch, next_batch = _load_checkpoint(
+        global_step, epoch, next_batch, optimizer_updates = _load_checkpoint(
             Path(resume), program, optimizers, schedulers, scaler, config, sampler
         )
+
+    rollout_manager = None
+    replay_settings = config.get("dmd2", {}).get("student_rollout_replay", {})
+    if bool(replay_settings.get("enabled", False)):
+        from tmd_policy.training.rollout_replay import AsyncStudentRolloutManager
+
+        rollout_manager = AsyncStudentRolloutManager(
+            config=config,
+            output=output,
+            initial_round=initial_rollout_replay,
+        )
+        program.set_student_replay(rollout_manager.replay)
+
+        def rollout_snapshot() -> Path:
+            payload = _inference_checkpoint_payload(
+                program,
+                config=config,
+                provenance=provenance,
+                global_step=global_step,
+                epoch=epoch,
+            )
+            if payload is None:
+                raise RuntimeError("student replay requires lightweight inference checkpoints")
+            target = (
+                output
+                / "student_rollout_replay"
+                / "snapshots"
+                / f"generator-{optimizer_updates.get('generator', 0):08d}.pt"
+            )
+            _atomic_save(payload, target)
+            return target
+
+        if rollout_manager.replay.size == 0:
+            if not bool(replay_settings.get("initial_blocking", True)):
+                raise RuntimeError("DMD2 fidelity requires a blocking initial balanced student rollout")
+            rollout_manager.launch(
+                rollout_snapshot(),
+                generator_updates=optimizer_updates.get("generator", 0),
+                blocking=True,
+            )
+        rollout_manager.write_status()
     metrics_path = output / "metrics.jsonl"
     progress_plot_path = output / "training_progress.png"
     loss_series = _loss_series(_load_metric_history(metrics_path))
@@ -543,8 +631,22 @@ def run_training(
                 epoch += 1
                 next_batch = 0
                 break
-            step_metrics: dict[str, float] = {}
+            step_metric_values: dict[str, list[float]] = {}
+            phase_occurrences: Counter[str] = Counter()
             for phase_index, phase in enumerate(phase_schedule, start=1):
+                phase_occurrences[phase] += 1
+                diagnostics_interval = int(training.get("diagnostics_interval", 1))
+                diagnostics_enabled = (
+                    (global_step + 1) % diagnostics_interval == 0
+                    and phase_occurrences[phase] == 1
+                )
+                program.set_step_context(
+                    global_step=global_step,
+                    phase=phase,
+                    phase_occurrence=phase_occurrences[phase],
+                    optimizer_update_count=optimizer_updates[phase],
+                    diagnostics_enabled=diagnostics_enabled,
+                )
                 progress.set_postfix_str(
                     f"phase={phase} {phase_index}/{len(phase_schedule)} microbatch=0/{accumulation}",
                     refresh=True,
@@ -559,8 +661,9 @@ def run_training(
                 phase_losses = []
                 phase_values: dict[str, list[float]] = {}
                 for microbatch_index, batch in enumerate(microbatches, start=1):
+                    phase_batch = program.prepare_phase_batch(batch, phase)
                     with _autocast(device, training["mixed_precision"]):
-                        loss, values = program.loss(batch, phase)
+                        loss, values = program.loss(phase_batch, phase)
                         if loss.numel() != 1 or not torch.isfinite(loss.detach()).all():
                             raise RuntimeError(f"{phase} loss contains NaN/Inf before backward")
                         scaled_loss = loss * backward_scale / accumulation
@@ -587,18 +690,64 @@ def run_training(
                     for parameter in parameters
                 ):
                     raise RuntimeError(f"{phase} optimizer gradient contains NaN/Inf before step")
+                phase_diagnostics = program.gradient_diagnostics(phase)
                 gradient_norm = torch.nn.utils.clip_grad_norm_(parameters, clip)
                 scaler.step(optimizer)
                 scaler.update()
+                optimizer_updates[phase] += 1
                 schedulers[phase].step()
-                step_metrics[f"train/{phase}/loss"] = float(np.mean(phase_losses))
-                step_metrics[f"train/{phase}/gradient_norm"] = float(gradient_norm)
-                step_metrics[f"train/{phase}/learning_rate"] = float(optimizer.param_groups[0]["lr"])
+                phase_diagnostics.update(program.optimizer_step_diagnostics(phase, optimizer))
+                phase_diagnostics["gradient/nonfinite_fraction"] = 0.0
+                phase_diagnostics["optimizer_update_count"] = float(optimizer_updates[phase])
+                phase_diagnostics["scheduler_step"] = float(schedulers[phase].last_epoch)
+                step_metric_values.setdefault(f"train/{phase}/loss", []).append(
+                    float(np.mean(phase_losses))
+                )
+                step_metric_values.setdefault(f"train/{phase}/gradient_norm", []).append(
+                    float(gradient_norm)
+                )
+                step_metric_values.setdefault(f"train/{phase}/learning_rate", []).append(
+                    float(optimizer.param_groups[0]["lr"])
+                )
                 for name, values in phase_values.items():
-                    step_metrics[f"train/{phase}/{name}"] = float(np.mean(values))
+                    step_metric_values.setdefault(f"train/{phase}/{name}", []).append(
+                        float(np.mean(values))
+                    )
+                for name, value in phase_diagnostics.items():
+                    step_metric_values.setdefault(f"train/{phase}/{name}", []).append(float(value))
+            step_metrics = {
+                name: float(np.mean(values)) for name, values in step_metric_values.items()
+            }
             global_step += 1
             next_batch += accumulation
-            row: dict[str, Any] = {"global_step": global_step, "epoch": epoch, **step_metrics}
+            row: dict[str, Any] = {
+                "global_step": global_step,
+                "epoch": epoch,
+                **{
+                    f"{name}_update_count": optimizer_updates[name]
+                    for name in sorted(optimizer_updates)
+                },
+                **{
+                    f"optimizer/{name}/learning_rate": float(optimizers[name].param_groups[0]["lr"])
+                    for name in sorted(optimizers)
+                },
+                **{
+                    f"optimizer/{name}/scheduler_step": int(schedulers[name].last_epoch)
+                    for name in sorted(schedulers)
+                },
+                **step_metrics,
+            }
+            if rollout_manager is not None:
+                rollout_manager.poll()
+                generator_updates = optimizer_updates.get("generator", 0)
+                if rollout_manager.should_refresh(generator_updates):
+                    rollout_manager.launch(
+                        rollout_snapshot(),
+                        generator_updates=generator_updates,
+                        blocking=False,
+                    )
+                rollout_manager.write_status()
+                row.update(rollout_manager.metrics())
             if global_step % int(training["validation_interval"]) == 0:
                 row.update(
                     _validate(
@@ -640,6 +789,7 @@ def run_training(
                     epoch=epoch,
                     next_batch=next_batch,
                     sampler=sampler,
+                    optimizer_updates=optimizer_updates,
                 )
                 checkpoint = output / "checkpoints" / f"step-{global_step:08d}.pt"
                 _atomic_save(payload, checkpoint)
@@ -666,6 +816,9 @@ def run_training(
                     )
 
     progress.close()
+    if rollout_manager is not None:
+        rollout_manager.poll()
+        rollout_manager.write_status()
 
     final_payload = _checkpoint_payload(
         program,
@@ -678,6 +831,7 @@ def run_training(
         epoch=epoch,
         next_batch=next_batch,
         sampler=sampler,
+        optimizer_updates=optimizer_updates,
     )
     final_checkpoint = output / "checkpoints" / "final.pt"
     _atomic_save(final_payload, final_checkpoint)
@@ -696,6 +850,7 @@ def run_training(
         "method": config["method"],
         "global_step": global_step,
         "epoch": epoch,
+        "optimizer_updates": optimizer_updates,
         "checkpoint": str(final_checkpoint.resolve()),
         "trainable_parameters": len(names),
         "metrics": str(metrics_path.resolve()),

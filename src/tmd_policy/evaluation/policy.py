@@ -116,13 +116,23 @@ class InferencePolicy(nn.Module):
             return self.student.postprocessor(normalized)
         condition = self.student.encode_condition(processed)
         if self.tmd_head is None:
-            normalized = self.student.sample(
-                condition,
-                noise,
-                self.outer_steps,
-                student_time_shift_gamma=self.student_time_shift_gamma,
-                step_callback=step_callback,
-            )
+            if self.method == "dmd2_flow":
+                normalized = self.student.sample_denoise_renoise(
+                    condition,
+                    noise,
+                    self.outer_steps,
+                    student_time_shift_gamma=self.student_time_shift_gamma,
+                    generator=generator,
+                    step_callback=step_callback,
+                )
+            else:
+                normalized = self.student.sample(
+                    condition,
+                    noise,
+                    self.outer_steps,
+                    student_time_shift_gamma=self.student_time_shift_gamma,
+                    step_callback=step_callback,
+                )
         else:
             inner = torch.stack(
                 [
@@ -312,7 +322,10 @@ def load_inference_policy(
         raise ValueError(f"unsupported inference checkpoint method: {method}")
     if method == "dmd2_flow":
         sampling_architecture = checkpoint_config["dmd2"]
-        outer_steps = int(sampling_architecture["discrete_outer_steps"])
+        checkpoint_outer_steps = int(sampling_architecture["discrete_outer_steps"])
+        outer_steps = int(policy_config.get("outer_steps", checkpoint_outer_steps))
+        if outer_steps < 1:
+            raise ValueError("DMD2 evaluation outer_steps must be positive")
         inner_steps = 1
         student_time_shift_gamma = float(sampling_architecture["student_time_shift_gamma"])
     elif method in {"tmd_stage1", "occupancy_tmd"}:
@@ -350,7 +363,18 @@ def load_inference_policy(
             "outer_steps": outer_steps,
             "inner_steps": inner_steps,
             "student_time_shift_gamma": student_time_shift_gamma,
-            "source": "checkpoint architecture" if method != "flow_sft" else "flow-SFT evaluation",
+            "source": (
+                "DMD2 evaluation ablation override"
+                if method == "dmd2_flow" and "outer_steps" in policy_config
+                else "checkpoint architecture"
+                if method != "flow_sft"
+                else "flow-SFT evaluation"
+            ),
+            "sampler": (
+                "DMD2 denoise-renoise"
+                if method == "dmd2_flow"
+                else "deterministic shifted-grid integration"
+            ),
         },
     }
 

@@ -1,4 +1,4 @@
-# Implementation report (2026-08-05, shifted-grid/DMD2-v correction)
+# Implementation report (updated 2026-08-13, DMD2 backward-simulation fidelity)
 
 ## Delivered scope
 
@@ -20,10 +20,17 @@ attention.
 
 ## Mathematical and systems changes
 
-- DMD2 uses a real-data outer DMD2-v transition, a frozen PI0.5 real model, an
-  exactly initialized trainable PI0.5 suffix, five joint guidance updates, noised
-  fake-score features, and no SFT. Its stopped direction is
+- DMD2 now starts from Gaussian noise and uses inference-matched denoise--renoise
+  backward simulation rather than noised expert actions. It uses a frozen PI0.5
+  real model, an exactly initialized trainable PI0.5 suffix, five joint guidance
+  updates, noised fake-score features, and no SFT. Its stopped direction is
   `(mu_fake-mu_real)/(mean_valid(abs(x-mu_real))+epsilon)`.
+- TTUR warmup/decay is expressed in actual per-optimizer updates. A balanced
+  student-state replay bootstraps before training and refreshes asynchronously
+  every 500 generator updates; fixed probes and detailed DMD/GAN/gradient traces
+  are persisted to JSONL.
+- DMD2 evaluation uses the same Gaussian-start denoise--renoise sampler. A
+  separate resumable LIBERO-Plus environment/evaluator covers all 10,030 tasks.
 - TMD Stage 2 uses its distinct appendix direction
   `(g_fake-g_teacher)/(sum_valid(abs(g_fake-g_teacher))+epsilon)`, real-data
   outer transitions, and a differentiable inner rollout. It also has no SFT.

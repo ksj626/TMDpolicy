@@ -44,12 +44,14 @@ training:
   validation_interval: 500
   validation_batches: 8
   checkpoint_interval: 1000
+  inference_checkpoint_interval: 10
+  diagnostics_interval: 10
 dmd2:
   student_fine_tuning: head_only
   fake_score_variant: pi05_clone
   fake_updates_per_generator: 5
   guidance_classifier_weight: 1.0
-  student_training_mode: real_data_outer_transition
+  student_training_mode: backward_simulation_denoise_renoise
   discrete_outer_steps: 4
   student_time_shift_gamma: 5.0
   generator_learning_rate: 1.0e-5
@@ -61,6 +63,15 @@ dmd2:
   teacher_device: cuda:1
   teacher_dtype: bfloat16
   fake_score_device: cuda:1
+  student_rollout_replay:
+    enabled: true
+    initial_blocking: true
+    refresh_generator_updates: 500
+    capacity_replans: 8000
+    device: cuda:2
+    fps: 10
+    base_reset_seed: 100000
+    max_episode_steps: 600
   vsd_time: {minimum_time: 0.001, maximum_time: 0.999, time_shift_gamma: 5.0}
   gan_time: {minimum_time: 0.001, maximum_time: 0.999, time_shift_gamma: 5.0}
   fake_score_time: {minimum_time: 0.001, maximum_time: 0.999, time_shift_gamma: 5.0}
@@ -76,8 +87,8 @@ dmd2:
     trainable_pi05_suffix_and_optimizer_gib: 8-14
     discriminator_and_optimizer_gib: 1-2
     activations_gib: 8-18
-    recommendation: two 24+ GiB GPUs; pi05_clone requires substantially more
+    recommendation: two 24+ GiB training GPUs plus one 7+ GiB asynchronous rollout GPU
 output:
   directory: artifacts/training/dmd2_flow
 preflight:
-  minimum_total_memory_gib: {cuda:0: 23.5, cuda:1: 23.5}
+  minimum_total_memory_gib: {cuda:0: 23.5, cuda:1: 23.5, cuda:2: 7.0}

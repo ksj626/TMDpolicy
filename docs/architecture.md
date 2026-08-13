@@ -33,10 +33,12 @@ dtype, and dimension.
 
 ## Objectives
 
-For each valid coordinate, corruption is `x_t=(1-t)x+t epsilon`. DMD2-v samples
-`t` from the nonzero checkpoint-shifted student grid and predicts
-`x_hat=x_t-t*v_student(x_t,t)`. Deterministic evaluation traverses the same grid
-in descending order. DMD2 uses
+For each valid coordinate, corruption is `x_t=(1-t)x+t epsilon`. DMD2 backward
+simulation starts at Gaussian noise, predicts
+`x_hat=x_t-t*v_student(x_t,t)`, and independently re-noises the prediction at
+the next checkpoint-shifted time. Prefix steps are stopped and only a randomly
+selected denoising step is differentiated. Evaluation traverses the entire same
+denoise--renoise chain. DMD2 uses
 `stopgrad((mu_fake-mu_real)/(mean_valid(abs(x-mu_real))+epsilon))`. TMD-v instead uses
 
 ```text
@@ -64,11 +66,21 @@ uses teacher features, so its disjoint fake-score and classifier optimizers keep
 explicit update ratios. The engine rejects parameters owned by multiple
 optimizers.
 
+Scheduler time is optimizer-local: for a phase appearing `k` times in the
+global phase schedule, total and warmup updates are `max_steps*k` and
+`warmup_steps*k`. Checkpoint counters persist the actual update count of every
+optimizer.
+
 ## Rollouts and resume
 
 Rollout v2 stores only observed replan-start states/cameras, full policy plans,
 and actual executed prefixes. It never synthesizes future states. Tensor payload
 and JSON index replacement are atomic. Old schemas are rejected.
+
+DMD2 owns a bounded per-task replay over those records. Its first collection is
+blocking and covers all 40 tasks. Later snapshot collectors are separate
+processes, launched every 500 actual generator updates; optimization polls and
+atomically ingests completed rounds without waiting.
 
 Ordinary training uses deterministic permutations. Occupancy training supplies
 a deterministic source-paired/task-stratified batch sampler. Checkpoints contain

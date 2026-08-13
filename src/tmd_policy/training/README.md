@@ -21,6 +21,13 @@ hub revision in the resolved config supplies all frozen weights. These small
 files are valid for evaluation but intentionally invalid for exact training
 resume, which still requires `tmdpolicy.training/v1`.
 
+Multi-rate phase schedulers use actual optimizer counts. DMD2 therefore has a
+500,000-update guidance schedule and 100,000-update generator schedule for a
+100,000-global-step run, with correspondingly scaled warmup lengths. The same
+counters, current learning rates, scheduler steps, phase/group gradient
+diagnostics, backward-simulation trace, score/DMD/GAN diagnostics, and fixed
+probe validation values are persisted in `metrics.jsonl`.
+
 `TrainingProgram` defines phase/loss/optimizer hooks;
 `DeterministicBatchSampler` owns epoch permutations; `seed_everything` owns
 global seeds; `run_training` executes and checkpoints. `TrainingBundle` plus

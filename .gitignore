@@ -2,7 +2,7 @@
 /.pytest_cache/
 /artifacts/
 /outputs/
+/.deps/
 __pycache__/
 *.egg-info/
 *.py[cod]
-

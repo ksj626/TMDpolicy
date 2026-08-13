@@ -189,51 +189,72 @@ def test_dmd2_runtime_gradient_contract_keeps_teacher_and_backbone_frozen() -> N
 
 
 class _DMDStudent(nn.Module):
+    chunk_size = 2
+    internal_action_dim = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.anchor = nn.Parameter(torch.tensor(0.0))
-        self.policy = SimpleNamespace(prepare_action=lambda batch: batch["action"])
+        self.policy = SimpleNamespace(
+            prepare_action=lambda batch: (_ for _ in ()).throw(
+                AssertionError("backward simulation must not read expert actions")
+            )
+        )
         self.times: list[torch.Tensor] = []
 
     def preprocess_observation(self, batch):
         return batch
 
     def encode_condition(self, batch):
-        return SimpleNamespace(batch_size=batch["action"].shape[0])
+        return SimpleNamespace(batch_size=batch["observation.state"].shape[0])
 
     def velocity(self, condition, value, time):
         self.times.append(time.detach().clone())
         return torch.full_like(value, 2.0) + self.anchor * 0.0
 
+    clean_prediction = staticmethod(LeRobotSmolVLAStudent.clean_prediction)
 
-def test_fixed_noise_dmd2_v_transition_and_evaluation_use_one_shifted_grid(monkeypatch) -> None:
+
+def test_dmd2_backward_simulation_and_inference_share_denoise_renoise_grid(monkeypatch) -> None:
     student = _DMDStudent()
     program = DMD2FlowProgram.__new__(DMD2FlowProgram)
     nn.Module.__init__(program)
     program.student = student
     program.dmd_config = {"discrete_outer_steps": 4, "student_time_shift_gamma": 5.0}
-    monkeypatch.setattr(torch, "randn_like", lambda value: torch.ones_like(value))
+    monkeypatch.setattr(
+        torch,
+        "randn",
+        lambda shape, *, device=None, dtype=None, generator=None: torch.ones(
+            shape, device=device, dtype=dtype
+        ),
+    )
     monkeypatch.setattr(
         torch,
         "randint",
-        lambda low, high, size, device=None: torch.full(size, 2, device=device, dtype=torch.long),
+        lambda low, high, size, device=None, generator=None: torch.full(
+            size, 2, device=device, dtype=torch.long
+        ),
     )
     clean = torch.full((1, 2, 1), 3.0)
-    predicted = program._sample_student({"action": clean}, requires_grad=True)
-    grid = shifted_time_grid(4, 5.0, device=clean.device)
-    time = grid[2]
-    x_t = (1.0 - time) * clean + time * torch.ones_like(clean)
-    assert torch.allclose(predicted, x_t - time * torch.full_like(clean, 2.0))
-    assert torch.allclose(student.times[0], time.expand(1))
+    predicted = program._sample_student(
+        {"observation.state": torch.zeros(1, 8)}, requires_grad=True
+    )
+    grid = shifted_time_grid(4, 5.0, device=clean.device, descending=True)
+    value = torch.ones_like(clean)
+    for index in range(2):
+        clean_prediction = value - grid[index] * 2.0
+        value = (1.0 - grid[index + 1]) * clean_prediction + grid[index + 1]
+    assert torch.allclose(predicted, value - grid[2] * 2.0)
+    assert torch.allclose(torch.stack([value[0] for value in student.times]), grid[:3])
+    assert program._last_backward_metrics["backward/selected_step_index"] == 2.0
 
     student.times.clear()
-    LeRobotSmolVLAStudent.sample(
+    LeRobotSmolVLAStudent.sample_denoise_renoise(
         student,
         SimpleNamespace(batch_size=1),
         torch.ones_like(clean),
         4,
         student_time_shift_gamma=5.0,
+        renoise_noises=torch.ones(3, *clean.shape),
     )
-    evaluation_grid = shifted_time_grid(4, 5.0, device=clean.device, descending=True)
-    assert torch.allclose(torch.stack([value[0] for value in student.times]), evaluation_grid[:-1])
-    assert torch.any(torch.isclose(evaluation_grid, time))
+    assert torch.allclose(torch.stack([value[0] for value in student.times]), grid[:-1])

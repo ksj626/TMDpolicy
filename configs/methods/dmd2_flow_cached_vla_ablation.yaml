@@ -6,13 +6,13 @@ models:
   teacher: {id: lerobot/pi05_libero_finetuned, revision: 8e174154ef5f6c60a8da12ae99c303d8963138c1, processor_revision: 8e174154ef5f6c60a8da12ae99c303d8963138c1}
 dataset: {id: lerobot/libero, revision: a1aaacb7f6cd6ee5fb43120f673cebb0cfea7dd4, cache: .cache/lerobot, manifest: artifacts/data/libero_expert/episode_manifest.json, validation_fraction: 0.1, test_fraction: 0.1, split_seed: 17, download_videos: true, video_backend: pyav}
 horizons: {prediction: 50, execution: 10}
-training: {seed: 7, device: cuda:0, batch_size: 4, num_workers: 0, mixed_precision: bf16, gradient_accumulation: 8, gradient_clip_norm: 1.0, learning_rate: 1.0e-5, weight_decay: 1.0e-4, betas: [0.9, 0.95], epsilon: 1.0e-8, warmup_steps: 1000, minimum_lr_scale: 0.05, max_steps: 100000, validation_interval: 500, validation_batches: 8, checkpoint_interval: 1000}
+training: {seed: 7, device: cuda:0, batch_size: 4, num_workers: 0, mixed_precision: bf16, gradient_accumulation: 8, gradient_clip_norm: 1.0, learning_rate: 1.0e-5, weight_decay: 1.0e-4, betas: [0.9, 0.95], epsilon: 1.0e-8, warmup_steps: 1000, minimum_lr_scale: 0.05, max_steps: 100000, validation_interval: 500, validation_batches: 8, checkpoint_interval: 1000, inference_checkpoint_interval: 10, diagnostics_interval: 10}
 dmd2:
   student_fine_tuning: head_only
   fake_score_variant: pi05_clone
   fake_updates_per_generator: 5
   discriminator_updates_per_generator: 1
-  student_training_mode: real_data_outer_transition
+  student_training_mode: backward_simulation_denoise_renoise
   discrete_outer_steps: 4
   student_time_shift_gamma: 5.0
   generator_learning_rate: 1.0e-5
@@ -24,9 +24,10 @@ dmd2:
   teacher_device: cuda:1
   teacher_dtype: bfloat16
   fake_score_device: cuda:1
+  student_rollout_replay: {enabled: true, initial_blocking: true, refresh_generator_updates: 500, capacity_replans: 8000, device: cuda:2, fps: 10, base_reset_seed: 100000, max_episode_steps: 600}
   vsd_time: {minimum_time: 0.001, maximum_time: 0.999, time_shift_gamma: 5.0}
   gan_time: {minimum_time: 0.001, maximum_time: 0.999, time_shift_gamma: 5.0}
   fake_score_time: {minimum_time: 0.001, maximum_time: 0.999, time_shift_gamma: 5.0}
   discriminator: {variant: cached_vla_features, feature_source: cached_vla_features, num_tasks: 40, model_dim: 256, layers: 3, heads: 8}
-preflight: {minimum_total_memory_gib: {cuda:0: 23.5, cuda:1: 23.5}}
+preflight: {minimum_total_memory_gib: {cuda:0: 23.5, cuda:1: 23.5, cuda:2: 7.0}}
 output: {directory: artifacts/training/dmd2_flow_cached_vla_ablation}

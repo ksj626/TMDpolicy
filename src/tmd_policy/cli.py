@@ -58,6 +58,15 @@ def _train(args: argparse.Namespace) -> int:
 
     expected = _TRAIN_METHODS[args.train_method]
     config = load_config(args.config, expected_method=expected)
+    initial_rollout_replay = getattr(args, "initial_rollout_replay", None)
+    if initial_rollout_replay is not None:
+        initial_rollout_replay = str(Path(initial_rollout_replay).expanduser().resolve())
+        initial_path = Path(initial_rollout_replay)
+        if not initial_path.is_dir() or not (initial_path / "collection_report.json").is_file():
+            raise FileNotFoundError(
+                "--initial-rollout-replay must be a completed rollout round containing "
+                f"collection_report.json: {initial_path}"
+            )
     from tmd_policy.training.preflight import preflight
 
     preflight(config)
@@ -70,6 +79,7 @@ def _train(args: argparse.Namespace) -> int:
         output_dir=_output(args, config),
         resume=args.resume,
         train_batch_sampler=bundle.train_batch_sampler,
+        initial_rollout_replay=initial_rollout_replay,
     )
     print(json.dumps(report, indent=2, sort_keys=True))
     return 0
@@ -96,12 +106,16 @@ def _evaluate(args: argparse.Namespace) -> int:
         config["policy"]["checkpoint_sha256"] = args.checkpoint_sha256
     if args.device is not None:
         config["policy"]["device"] = args.device
-    if (args.outer_steps is not None or args.inner_steps is not None) and config["policy"][
-        "method"
-    ] in {"dmd2_flow", "tmd_stage1", "tmd_stage2", "occupancy_tmd"}:
+    if args.inner_steps is not None and config["policy"]["method"] in {
+        "dmd2_flow", "tmd_stage1", "tmd_stage2", "occupancy_tmd"
+    }:
         raise ValueError(
-            "distilled-policy evaluation step counts and shifted-grid gamma come from the checkpoint"
+            "this distilled policy's inner step count comes from the checkpoint"
         )
+    if args.outer_steps is not None and config["policy"]["method"] in {
+        "tmd_stage1", "tmd_stage2", "occupancy_tmd"
+    }:
+        raise ValueError("TMD outer step counts come from the checkpoint")
     if args.outer_steps is not None:
         config["policy"]["outer_steps"] = args.outer_steps
     if args.inner_steps is not None:
@@ -147,6 +161,63 @@ def _evaluate(args: argparse.Namespace) -> int:
     return 0
 
 
+def _evaluate_libero_plus(args: argparse.Namespace) -> int:
+    from tmd_policy.evaluation.libero_plus import evaluate_libero_plus
+
+    config = load_config(args.config, expected_method="evaluate_libero_plus")
+    if args.checkpoint is not None:
+        config["policy"]["checkpoint"] = args.checkpoint
+    if args.checkpoint_sha256 is not None:
+        config["policy"]["checkpoint_sha256"] = args.checkpoint_sha256
+    if args.device is not None:
+        config["policy"]["device"] = args.device
+    if args.outer_steps is not None:
+        if config["policy"]["method"] not in {"dmd2_flow", "flow_sft"}:
+            raise ValueError("only DMD2/Flow-SFT support a LIBERO-Plus outer-step override")
+        if args.outer_steps < 1:
+            raise ValueError("--outer-steps must be positive")
+        config["policy"]["outer_steps"] = int(args.outer_steps)
+    evaluation = config["evaluation"]
+    if args.suite:
+        evaluation["suites"] = list(args.suite)
+    if args.task_ids is not None:
+        if args.sample_per_category is not None:
+            raise ValueError("--task-ids and --sample-per-category are mutually exclusive")
+        ids = [int(value) for value in args.task_ids]
+        if not ids or len(ids) != len(set(ids)) or min(ids) < 0:
+            raise ValueError("--task-ids must be unique nonnegative integers")
+        evaluation["task_ids"] = ids
+        evaluation["sample_per_category"] = None
+    if args.sample_per_category is not None:
+        if args.sample_per_category < 1:
+            raise ValueError("--sample-per-category must be positive")
+        if args.sample_seed < 0:
+            raise ValueError("--sample-seed must be nonnegative")
+        evaluation["task_ids"] = None
+        evaluation["sample_per_category"] = int(args.sample_per_category)
+        evaluation["sample_seed"] = int(args.sample_seed)
+        config["classification"] = (
+            f"{config['classification']}; deterministic category-balanced sampled evaluation"
+        )
+    elif args.sample_seed != 0:
+        raise ValueError("--sample-seed requires --sample-per-category")
+    if args.reset_seeds is not None:
+        seeds = [int(value) for value in args.reset_seeds]
+        if not seeds or len(seeds) != len(set(seeds)) or min(seeds) < 0:
+            raise ValueError("--reset-seeds must be unique nonnegative integers")
+        evaluation["reset_seeds"] = seeds
+    if args.max_episode_steps is not None:
+        if args.max_episode_steps < 1:
+            raise ValueError("--max-episode-steps must be positive")
+        evaluation["suite_max_episode_steps"] = {
+            suite: int(args.max_episode_steps)
+            for suite in evaluation["suite_max_episode_steps"]
+        }
+    report = evaluate_libero_plus(config, _output(args, config), resume=bool(args.resume))
+    print(json.dumps(report["summary"], indent=2, sort_keys=True))
+    return 0
+
+
 def _compare(args: argparse.Namespace) -> int:
     from tmd_policy.evaluation.compare import compare
 
@@ -181,6 +252,14 @@ def build_parser() -> argparse.ArgumentParser:
         sub.add_argument("--config", default=f"configs/methods/{expected}.yaml")
         sub.add_argument("--output")
         sub.add_argument("--resume")
+        if command == "dmd2-flow":
+            sub.add_argument(
+                "--initial-rollout-replay",
+                help=(
+                    "completed balanced student-rollout round used to bootstrap replay; "
+                    "skips the blocking pre-training rollout"
+                ),
+            )
         sub.set_defaults(handler=_train)
 
     rollout = commands.add_parser("rollout", help="real LIBERO student rollouts")
@@ -231,6 +310,41 @@ def build_parser() -> argparse.ArgumentParser:
         help="optional shortened horizon for a smoke test; use 600 for reportable evaluation",
     )
     libero.set_defaults(handler=_evaluate)
+    libero_plus = evaluate_commands.add_parser(
+        "libero-plus", help="resumable evaluation over the 10,030-task robustness benchmark"
+    )
+    libero_plus.add_argument(
+        "--config", default="configs/evaluation/libero_plus_dmd2.yaml"
+    )
+    libero_plus.add_argument("--output")
+    libero_plus.add_argument("--checkpoint")
+    libero_plus.add_argument("--checkpoint-sha256")
+    libero_plus.add_argument("--device")
+    libero_plus.add_argument("--outer-steps", type=int)
+    libero_plus.add_argument(
+        "--suite",
+        action="append",
+        choices=("libero_spatial", "libero_object", "libero_goal", "libero_10"),
+        help="restrict to a suite; repeat for multiple suites",
+    )
+    libero_plus.add_argument("--task-ids", type=int, nargs="+")
+    libero_plus.add_argument(
+        "--sample-per-category",
+        type=int,
+        help="deterministically sample this many tasks from each of the seven categories",
+    )
+    libero_plus.add_argument(
+        "--sample-seed",
+        type=int,
+        default=0,
+        help="nonnegative seed for --sample-per-category (default: 0)",
+    )
+    libero_plus.add_argument("--reset-seeds", type=int, nargs="+")
+    libero_plus.add_argument("--max-episode-steps", type=int)
+    libero_plus.add_argument(
+        "--resume", action="store_true", help="continue a matching output directory"
+    )
+    libero_plus.set_defaults(handler=_evaluate_libero_plus)
     comparison = evaluate_commands.add_parser("compare")
     comparison.add_argument("--config", default="configs/experiments/motivation.yaml")
     comparison.add_argument("--output", required=True)

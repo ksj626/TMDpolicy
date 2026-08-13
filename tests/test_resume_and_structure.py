@@ -7,7 +7,7 @@ import torch
 from torch import Tensor, nn
 from torch.utils.data import Dataset
 
-from tmd_policy.training.engine import TrainingProgram, run_training
+from tmd_policy.training.engine import TrainingProgram, _scheduler, run_training
 
 
 class _Dataset(Dataset):
@@ -119,9 +119,33 @@ def test_lightweight_intermediate_inference_checkpoints_are_periodic(tmp_path: P
     assert Path(report["inference_checkpoint"]).name == "final.pt"
 
 
+def test_ttur_scheduler_is_expressed_in_actual_optimizer_updates() -> None:
+    parameter = nn.Parameter(torch.tensor(1.0))
+    optimizer = torch.optim.AdamW([parameter], lr=1.0)
+    scheduler = _scheduler(
+        optimizer,
+        {
+            "warmup_steps": 2,
+            "max_steps": 10,
+            "minimum_lr_scale": 0.05,
+        },
+        updates_per_global_step=5,
+    )
+    factor = scheduler.lr_lambdas[0]
+    assert factor(0) == 0.1
+    assert factor(9) == 1.0
+    assert factor(10) == 1.0
+    assert factor(50) == 0.05
+
+
 def test_removed_paths_and_training_scripts_are_concrete() -> None:
     root = Path(__file__).resolve().parents[1]
-    assert not list(root.rglob("*opd*"))
+    ignored_roots = {".deps", ".cache", ".git", "artifacts"}
+    assert not [
+        path
+        for path in root.rglob("*opd*")
+        if not (set(path.relative_to(root).parts) & ignored_roots)
+    ]
     assert not (root / "src/tmd_policy/research_cli.py").exists()
     assert not (root / "src/tmd_policy/common/density/cnf.py").exists()
     scripts = list((root / "scripts/train").glob("*.sh"))

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from contextlib import contextmanager
 from typing import Any
 
@@ -42,6 +43,50 @@ def _masked_mean(values: Tensor, valid_coordinates: Tensor) -> Tensor:
     return (values * mask).flatten(1).sum(dim=1) / denominator
 
 
+def _cosine(left: Tensor, right: Tensor) -> Tensor:
+    return F.cosine_similarity(left.detach().float().flatten(1), right.detach().float().flatten(1))
+
+
+def _time_binned_metrics(
+    prefix: str,
+    time: Tensor,
+    values: Tensor,
+    *,
+    bins: int = 5,
+) -> dict[str, float]:
+    if time.ndim != 1 or values.shape != time.shape:
+        raise ValueError("time-binned diagnostics require [B] times and values")
+    indices = torch.clamp((time.detach().float() * bins).long(), max=bins - 1)
+    result: dict[str, float] = {}
+    for index in range(bins):
+        selected = indices == index
+        result[f"{prefix}/bin_{index}_fraction"] = float(selected.float().mean())
+        if torch.any(selected):
+            result[f"{prefix}/bin_{index}_value"] = float(values.detach().float()[selected].mean())
+    return result
+
+
+def _distribution_metrics(prefix: str, values: Tensor) -> dict[str, float]:
+    flat = values.detach().float().flatten()
+    quantiles = torch.quantile(flat, torch.tensor([0.1, 0.5, 0.9], device=flat.device))
+    return {
+        f"{prefix}/mean": float(flat.mean()),
+        f"{prefix}/std": float(flat.std(unbiased=False)),
+        f"{prefix}/p10": float(quantiles[0]),
+        f"{prefix}/p50": float(quantiles[1]),
+        f"{prefix}/p90": float(quantiles[2]),
+    }
+
+
+def _binary_auc(real_logits: Tensor, fake_logits: Tensor) -> float:
+    real = real_logits.detach().float().flatten()
+    fake = fake_logits.detach().float().flatten()
+    if real.numel() == 0 or fake.numel() == 0:
+        return float("nan")
+    comparisons = real[:, None] - fake[None, :]
+    return float(((comparisons > 0).float() + 0.5 * (comparisons == 0).float()).mean())
+
+
 class _CapturedFirstOrderGradient(torch.autograd.Function):
     """Return an exact scalar value while replaying a captured input gradient."""
 
@@ -64,7 +109,7 @@ def _stable_first_order_surrogate(
     value: Tensor,
     *,
     scales: tuple[float, ...] = (1.0, 2.0**-8, 2.0**-16, 2.0**-24),
-) -> tuple[Tensor, float]:
+) -> tuple[Tensor, float, Tensor]:
     """Capture a finite first-order gradient without replaying an unstable graph.
 
     PI0.5's checkpoint-native BF16 suffix can produce a finite discriminator
@@ -103,7 +148,7 @@ def _stable_first_order_surrogate(
         )
         if not torch.isfinite(surrogate.detach()).all():
             raise RuntimeError("captured generator GAN surrogate changed a finite loss to NaN/Inf")
-        return surrogate, scale
+        return surrogate, scale, gradient
     if not saw_connected:
         raise RuntimeError("generator GAN gradient is disconnected")
     if saw_finite:
@@ -126,7 +171,7 @@ def _frozen_parameters(module: nn.Module):
 
 
 class DMD2FlowProgram(TrainingProgram):
-    """Direct DMD2-v outer-transition objective with VSD and feature GAN."""
+    """DMD2 backward simulation with VSD, feature GAN, and no data regression."""
 
     def __init__(
         self,
@@ -151,7 +196,7 @@ class DMD2FlowProgram(TrainingProgram):
         expected_training_mode = (
             "tmd_stage1_outer_transition"
             if preserve_student_trainability
-            else "real_data_outer_transition"
+            else "backward_simulation_denoise_renoise"
         )
         if config.get("student_training_mode") != expected_training_mode:
             raise ValueError(
@@ -220,6 +265,14 @@ class DMD2FlowProgram(TrainingProgram):
         if not preserve_student_trainability:
             self.student.configure_trainable(str(config["student_fine_tuning"]))
         self._fake_score_device = next(self.fake_score.parameters()).device
+        self._step_context: dict[str, Any] = {
+            "global_step": 0,
+            "phase": "initialization",
+            "phase_occurrence": 0,
+            "diagnostics_enabled": True,
+        }
+        self._student_replay: Any | None = None
+        self._last_backward_metrics: dict[str, float] = {}
         self._validate_freezing_contract()
 
     def _validate_freezing_contract(self) -> None:
@@ -262,6 +315,109 @@ class DMD2FlowProgram(TrainingProgram):
             self._require_module_gradient(self.discriminator, "DMD2 discriminator")
         if phase == "generator":
             self._require_module_gradient(self.student, "SmolVLA student")
+
+    @staticmethod
+    def _gradient_group_metrics(
+        prefix: str,
+        parameters: list[Tensor],
+    ) -> dict[str, float]:
+        gradients = [parameter.grad.detach().float() for parameter in parameters if parameter.grad is not None]
+        if not gradients:
+            return {f"gradient/{prefix}/norm": 0.0, f"gradient/{prefix}/nonfinite_fraction": 0.0}
+        squared = torch.stack([gradient.square().sum() for gradient in gradients]).sum()
+        nonfinite = torch.stack([(~torch.isfinite(gradient)).sum() for gradient in gradients]).sum()
+        elements = sum(gradient.numel() for gradient in gradients)
+        return {
+            f"gradient/{prefix}/norm": float(squared.sqrt()),
+            f"gradient/{prefix}/nonfinite_fraction": float(nonfinite.float() / max(1, elements)),
+        }
+
+    def gradient_diagnostics(self, phase: str) -> dict[str, float]:
+        if not bool(self._step_context.get("diagnostics_enabled", False)):
+            return {}
+        metrics: dict[str, float] = {}
+        if phase in {"guidance", "fake"}:
+            metrics.update(
+                self._gradient_group_metrics(
+                    "fake_pi05_suffix",
+                    [parameter for parameter in self.fake_score.parameters() if parameter.requires_grad],
+                )
+            )
+        if phase in {"guidance", "discriminator"}:
+            metrics.update(
+                self._gradient_group_metrics(
+                    "discriminator_heads",
+                    [parameter for parameter in self.discriminator.parameters() if parameter.requires_grad],
+                )
+            )
+            heads = getattr(self.discriminator, "heads", {})
+            for layer, head in heads.items():
+                metrics.update(
+                    self._gradient_group_metrics(
+                        f"discriminator_layer_{layer}", list(head.parameters())
+                    )
+                )
+        if phase == "generator":
+            named = dict(self.student.named_parameters())
+            groups = {
+                "student_state_proj": ("state_proj",),
+                "student_action_in_proj": ("action_in_proj",),
+                "student_time_mlp": ("action_time_mlp_in", "action_time_mlp_out"),
+                "student_action_out_proj": ("action_out_proj",),
+            }
+            for label, fragments in groups.items():
+                parameters = [
+                    parameter
+                    for name, parameter in named.items()
+                    if parameter.requires_grad and any(fragment in name for fragment in fragments)
+                ]
+                metrics.update(self._gradient_group_metrics(label, parameters))
+        return metrics
+
+    def optimizer_step_diagnostics(
+        self,
+        phase: str,
+        optimizer: torch.optim.Optimizer,
+    ) -> dict[str, float]:
+        """Compute the exact AdamW fake-parameter update ratio without cloning it."""
+
+        if phase not in {"guidance", "fake"} or not bool(
+            self._step_context.get("diagnostics_enabled", False)
+        ):
+            return {}
+        fake_ids = {id(parameter) for parameter in self.fake_score.parameters() if parameter.requires_grad}
+        delta_squares: list[Tensor] = []
+        before_squares: list[Tensor] = []
+        for group in optimizer.param_groups:
+            beta1, beta2 = group["betas"]
+            learning_rate = float(group["lr"])
+            weight_decay = float(group["weight_decay"])
+            decay = 1.0 - learning_rate * weight_decay
+            for parameter in group["params"]:
+                if id(parameter) not in fake_ids or parameter not in optimizer.state:
+                    continue
+                state = optimizer.state[parameter]
+                if "exp_avg" not in state or "exp_avg_sq" not in state:
+                    continue
+                step = int(torch.as_tensor(state["step"]).item())
+                variance = state.get("max_exp_avg_sq", state["exp_avg_sq"])
+                denominator = variance.float().sqrt() / math.sqrt(1.0 - beta2**step)
+                denominator = denominator + float(group["eps"])
+                adam_update = (
+                    learning_rate
+                    / (1.0 - beta1**step)
+                    * state["exp_avg"].float()
+                    / denominator
+                )
+                before = (parameter.detach().float() + adam_update) / decay
+                delta = parameter.detach().float() - before
+                delta_squares.append(delta.square().sum())
+                before_squares.append(before.square().sum())
+        if not delta_squares:
+            return {"fake_score/parameter_update_ratio": 0.0}
+        delta_norm = torch.stack(delta_squares).sum().sqrt()
+        parameter_norm = torch.stack(before_squares).sum().sqrt().clamp_min(1.0e-30)
+        return {"fake_score/parameter_update_ratio": float(delta_norm / parameter_norm)}
 
     def to(self, *args: Any, **kwargs: Any) -> "DMD2FlowProgram":
         # This is a deliberately model-parallel program. Calling nn.Module.to
@@ -307,6 +463,31 @@ class DMD2FlowProgram(TrainingProgram):
     def student_device(self) -> torch.device:
         return next(self.student.parameters()).device
 
+    def set_step_context(self, **values: Any) -> None:
+        self._step_context = dict(values)
+
+    def set_student_replay(self, replay: Any | None) -> None:
+        self._student_replay = replay
+
+    def prepare_phase_batch(self, batch: dict[str, Any], phase: str) -> dict[str, Any]:
+        """Use replay observations for generator objectives, never GAN real updates."""
+
+        if phase != "generator" or self._student_replay is None:
+            return batch
+        replay_batch = self._student_replay.sample_like(batch)
+        return batch if replay_batch is None else replay_batch
+
+    @staticmethod
+    def _tensor_metrics(prefix: str, value: Tensor) -> dict[str, float]:
+        detached = value.detach().float()
+        return {
+            f"{prefix}/mean": float(detached.mean()),
+            f"{prefix}/std": float(detached.std(unbiased=False)),
+            f"{prefix}/norm": float(
+                torch.linalg.vector_norm(detached.flatten(1), dim=1).mean()
+            ),
+        }
+
     def _raw_state_task(self, batch: dict[str, Any]) -> tuple[Tensor, Tensor]:
         state = torch.as_tensor(batch["observation.state"], device=self.student_device, dtype=torch.float32)
         task = torch.as_tensor(batch["task_index"], device=self.student_device).long().flatten()
@@ -330,29 +511,101 @@ class DMD2FlowProgram(TrainingProgram):
             gamma=float(value["time_shift_gamma"]),
         )
 
-    def _sample_student(self, batch: dict[str, Any], *, requires_grad: bool) -> Tensor:
+    def _sample_student(
+        self,
+        batch: dict[str, Any],
+        *,
+        requires_grad: bool,
+        generator: torch.Generator | None = None,
+    ) -> Tensor:
+        """Simulate the DMD2 inference path up to a random denoising step.
+
+        The batch shares one random step index, as in the released DMD2 code.
+        Prefix steps start from pure Gaussian noise and alternate clean
+        prediction with independent re-noising. Prefix computation is stopped;
+        only the selected clean prediction carries a student gradient.
+        """
+
         processed = self.student.preprocess_observation(batch)
-        condition = self.student.encode_condition(processed)
-        clean = self.student.policy.prepare_action(processed)
-        source = torch.randn_like(clean)
+        if requires_grad:
+            condition = self.student.encode_condition(processed)
+        else:
+            with torch.no_grad():
+                condition = self.student.encode_condition(processed)
+        shape = (
+            condition.batch_size,
+            self.student.chunk_size,
+            self.student.internal_action_dim,
+        )
+        source = torch.randn(
+            shape,
+            device=self.student_device,
+            dtype=torch.float32,
+            generator=generator,
+        )
+        steps = int(self.dmd_config["discrete_outer_steps"])
         grid = shifted_time_grid(
-            int(self.dmd_config["discrete_outer_steps"]),
+            steps,
             float(self.dmd_config["student_time_shift_gamma"]),
             device=self.student_device,
             dtype=torch.float32,
+            descending=True,
         )
-        indices = torch.randint(1, grid.numel(), (condition.batch_size,), device=self.student_device)
-        time = grid[indices]
-        x_t = (1.0 - time[:, None, None]) * clean + time[:, None, None] * source
+        selected = int(
+            torch.randint(
+                0,
+                steps,
+                (1,),
+                device=self.student_device,
+                generator=generator,
+            ).item()
+        )
+        value = source
+        metrics = {
+            "backward/selected_step_index": float(selected),
+            "backward/selected_time": float(grid[selected]),
+            "backward/pure_noise_step_fraction": float(selected == 0),
+            **self._tensor_metrics("backward/source_noise", source),
+        }
+        for index in range(selected):
+            current = grid[index].expand(condition.batch_size)
+            with torch.no_grad():
+                clean_prefix = self._denoised_prediction(
+                    value,
+                    current,
+                    self.student.velocity(condition, value, current),
+                ).detach()
+            target = grid[index + 1]
+            fresh_noise = torch.randn(
+                shape,
+                device=self.student_device,
+                dtype=torch.float32,
+                generator=generator,
+            )
+            next_value = (1.0 - target) * clean_prefix + target * fresh_noise
+            metrics.update(self._tensor_metrics(f"backward/x_t_prefix_{index}", value))
+            metrics[f"backward/transition_{index}_norm"] = float(
+                torch.linalg.vector_norm((next_value - value).flatten(1), dim=1).mean()
+            )
+            value = next_value
+
+        time = grid[selected].expand(condition.batch_size)
 
         def predict() -> Tensor:
-            velocity = self.student.velocity(condition, x_t, time)
-            return self._denoised_prediction(x_t, time, velocity)
+            velocity = self.student.velocity(condition, value, time)
+            return self._denoised_prediction(value, time, velocity)
 
+        metrics.update(self._tensor_metrics(f"backward/x_t_prefix_{selected}", value))
+        for index in range(steps):
+            metrics[f"backward/t_bin_{index}_fraction"] = float(index == selected)
         if requires_grad:
-            return predict()
-        with torch.no_grad():
-            return predict().detach()
+            generated = predict()
+        else:
+            with torch.no_grad():
+                generated = predict().detach()
+        metrics.update(self._tensor_metrics("backward/generated_clean", generated))
+        self._last_backward_metrics = metrics
+        return generated
 
     def _student_condition(self, batch: dict[str, Any]) -> SmolVLAConditionCache:
         return self.student.encode_condition(self.student.preprocess_observation(batch))
@@ -396,7 +649,7 @@ class DMD2FlowProgram(TrainingProgram):
 
     @staticmethod
     def _denoised_prediction(x_t: Tensor, time: Tensor, velocity: Tensor) -> Tensor:
-        return x_t - time[:, None, None] * velocity
+        return x_t.float() - time.float()[:, None, None] * velocity.float()
 
     def _real_actions_teacher(self, batch: dict[str, Any], valid: Tensor) -> Tensor:
         processed = self.student.preprocess_observation(batch)
@@ -430,9 +683,39 @@ class DMD2FlowProgram(TrainingProgram):
             teacher_condition = self._teacher_condition(batch)
         condition = self._fake_condition(batch, teacher_condition)
         prediction = self._fake_velocity(batch, noised, time, condition)
-        per_sample = _masked_mean((prediction - target_velocity).square(), valid)
+        per_sample = _masked_mean((prediction.float() - target_velocity.float()).square(), valid)
         loss = per_sample.mean()
-        return loss, {"velocity_mse": float(loss.detach())}
+        metrics = {
+            "velocity_mse": float(loss.detach()),
+            **_time_binned_metrics("timestep_fake_mse", time, per_sample),
+        }
+        diagnostics = bool(self._step_context.get("diagnostics_enabled", False))
+        if diagnostics and self.fake_variant == "pi05_clone":
+            if teacher_condition is None:
+                teacher_condition = self._teacher_condition(batch)
+            with torch.no_grad():
+                teacher_velocity = self.teacher.velocity(
+                    teacher_condition,
+                    safe_device_transfer(noised.detach().float(), self.teacher.device),
+                    safe_device_transfer(time.detach().float(), self.teacher.device),
+                )
+            teacher_velocity = safe_device_transfer(teacher_velocity, prediction.device)
+            teacher_clean = self._denoised_prediction(noised, time, teacher_velocity)
+            fake_clean = self._denoised_prediction(noised, time, prediction)
+            metrics.update(
+                {
+                    "teacher_fake_velocity_cosine": float(
+                        _cosine(teacher_velocity, prediction).mean()
+                    ),
+                    "teacher_fake_clean_prediction_l1": float(
+                        _masked_mean((teacher_clean - fake_clean).abs(), valid).mean()
+                    ),
+                    "fixed_student_sample_tracking_lag": float(
+                        _masked_mean((teacher_clean - fake_clean).abs(), valid).mean()
+                    ),
+                }
+            )
+        return loss, metrics
 
     def _paper_features(
         self,
@@ -514,8 +797,8 @@ class DMD2FlowProgram(TrainingProgram):
                 for index in self.selected_layers
             ]
             loss = torch.stack(layer_losses).mean()
-            real_values = torch.stack(list(real_logits.values()))
-            fake_values = torch.stack(list(fake_logits.values()))
+            real_values = torch.stack(list(real_logits.values())).mean(dim=0)
+            fake_values = torch.stack(list(fake_logits.values())).mean(dim=0)
         else:
             condition = self._student_condition(batch)
             device = self._discriminator_device
@@ -529,11 +812,38 @@ class DMD2FlowProgram(TrainingProgram):
             real_values = self.discriminator(real_noised, time, condition.condition_features, task, valid)
             fake_values = self.discriminator(fake_noised, time, condition.condition_features, task, valid)
             loss = F.softplus(-real_values).mean() + F.softplus(fake_values).mean()
-        return loss, {
+            real_logits = {}
+            fake_logits = {}
+        real_correct = real_values > 0
+        fake_correct = fake_values < 0
+        accuracy = torch.cat((real_correct, fake_correct)).float().mean()
+        per_example_accuracy = 0.5 * (real_correct.float() + fake_correct.float())
+        metrics = {
+            **_distribution_metrics("real_logits", real_values),
+            **_distribution_metrics("fake_logits", fake_values),
             "real_probability": float(real_values.sigmoid().mean().detach()),
             "fake_probability": float(fake_values.sigmoid().mean().detach()),
+            "accuracy": float(accuracy),
+            "auc": _binary_auc(real_values, fake_values),
             "gan_noise_time": float(time.mean().detach()),
+            **_time_binned_metrics(
+                "timestep_discriminator_accuracy", time, per_example_accuracy
+            ),
         }
+        for index in self.selected_layers:
+            if index not in real_logits:
+                continue
+            layer_loss = F.softplus(-real_logits[index]).mean() + F.softplus(
+                fake_logits[index]
+            ).mean()
+            metrics.update(
+                {
+                    f"layer_{index}/loss": float(layer_loss.detach()),
+                    f"layer_{index}/real_logit": float(real_logits[index].mean().detach()),
+                    f"layer_{index}/fake_logit": float(fake_logits[index].mean().detach()),
+                }
+            )
+        return loss, metrics
 
     def _guidance_loss(self, batch: dict[str, Any]) -> tuple[Tensor, dict[str, float]]:
         if self.feature_source != "fake_score_features":
@@ -560,10 +870,12 @@ class DMD2FlowProgram(TrainingProgram):
         classifier_weight = float(self.dmd_config["guidance_classifier_weight"])
         loss = fake_loss + classifier_weight * discriminator_loss
         return loss, {
+            **getattr(self, "_last_backward_metrics", {}),
             **{f"fake_score/{name}": value for name, value in fake_metrics.items()},
             **{f"classifier/{name}": value for name, value in discriminator_metrics.items()},
             "fake_score_loss": float(fake_loss.detach()),
             "classifier_loss": float(discriminator_loss.detach()),
+            "discriminator_loss": float(discriminator_loss.detach()),
             "classifier_weight": classifier_weight,
         }
 
@@ -614,7 +926,33 @@ class DMD2FlowProgram(TrainingProgram):
         else:
             raise ValueError(f"unknown VSD normalization: {normalization}")
         loss = surrogate_vector_loss(teacher_generated, direction, valid_coordinates)
-        return loss, {name: float(value.mean()) for name, value in values.items()}
+        denominator = values["denominator"].detach().float()
+        denominator_quantiles = torch.quantile(
+            denominator,
+            torch.tensor([0.5, 0.95], device=denominator.device),
+        )
+        metrics = {name: float(value.float().mean()) for name, value in values.items()}
+        metrics.update(
+            {
+                "normalization_denominator_min": float(denominator.min()),
+                "normalization_denominator_p50": float(denominator_quantiles[0]),
+                "normalization_denominator_p95": float(denominator_quantiles[1]),
+                "teacher_prediction_norm": float(
+                    torch.linalg.vector_norm(teacher_prediction.float().flatten(1), dim=1).mean()
+                ),
+                "fake_prediction_norm": float(
+                    torch.linalg.vector_norm(fake_prediction.float().flatten(1), dim=1).mean()
+                ),
+                "teacher_fake_cosine_similarity": float(
+                    _cosine(teacher_prediction, fake_prediction).mean()
+                ),
+                "direction_norm": float(
+                    torch.linalg.vector_norm(direction.float().flatten(1), dim=1).mean()
+                ),
+                "direction_max": float(direction.detach().float().abs().max()),
+            }
+        )
+        return loss, metrics
 
     def _generator_gan_loss(
         self,
@@ -660,8 +998,9 @@ class DMD2FlowProgram(TrainingProgram):
                     safe_device_transfer(valid_student, device),
                 )
                 loss = F.softplus(-logits).mean()
-        loss, backward_scale = _stable_first_order_surrogate(loss, generated)
+        loss, backward_scale, action_gradient = _stable_first_order_surrogate(loss, generated)
         self._last_gan_backward_scale = backward_scale
+        self._last_gan_action_gradient = action_gradient.detach().float()
         if any(parameter.grad is not None for parameter in self.teacher.policy.parameters()):
             raise RuntimeError("frozen PI0.5 teacher unexpectedly received gradients")
         return loss
@@ -683,11 +1022,64 @@ class DMD2FlowProgram(TrainingProgram):
             valid,
             teacher_condition=teacher_condition,
         )
+        dmd_gradient = torch.autograd.grad(
+            vsd,
+            generated,
+            retain_graph=True,
+            allow_unused=False,
+        )[0].detach().float()
+        gan_gradient = getattr(self, "_last_gan_action_gradient", None)
+        if gan_gradient is None:
+            # Keep the helper independently testable when a custom GAN loss is
+            # injected. The production path captures this gradient with
+            # _stable_first_order_surrogate so the large PI0.5 graph is not
+            # replayed a second time.
+            gan_gradient = torch.autograd.grad(
+                gan,
+                generated,
+                retain_graph=True,
+                allow_unused=False,
+            )[0].detach().float()
+        gradient_cosine = F.cosine_similarity(
+            dmd_gradient.flatten(1),
+            gan_gradient.flatten(1),
+        ).mean()
         total = vsd + float(self.dmd_config["gan_weight"]) * gan
+        canonical = self.bridge.student_to_canonical(generated).detach().float()
+        generated_metrics = self._tensor_metrics("generated/action", canonical)
+        for index in range(canonical.shape[-1]):
+            generated_metrics[f"generated/action_dim_{index}_mean"] = float(
+                canonical[..., index].mean()
+            )
+            generated_metrics[f"generated/action_dim_{index}_std"] = float(
+                canonical[..., index].std(unbiased=False)
+            )
+        adjacent_valid = valid[:, 1:] & valid[:, :-1]
+        smoothness = torch.linalg.vector_norm(canonical[:, 1:] - canonical[:, :-1], dim=-1)
+        generated_metrics["generated/chunk_smoothness"] = float(
+            (smoothness * adjacent_valid.float()).sum()
+            / adjacent_valid.float().sum().clamp_min(1.0)
+        )
+        generated_metrics["generated/valid_fraction"] = float(valid.float().mean())
+        generated_metrics["generated/replay_state_fraction"] = float(
+            bool(batch.get("_student_replay_batch", False))
+        )
         return total, {
+            **getattr(self, "_last_backward_metrics", {}),
             **metrics,
+            **generated_metrics,
             "distribution_matching": float(vsd.detach()),
+            "distribution_matching_loss": float(vsd.detach()),
             "gan": float(gan.detach()),
+            "generator_gan_loss": float(gan.detach()),
+            "generator_total_loss": float(total.detach()),
+            "vsd_gradient_norm": float(
+                torch.linalg.vector_norm(dmd_gradient.flatten(1), dim=1).mean()
+            ),
+            "generated_action_gan_input_gradient_norm": float(
+                torch.linalg.vector_norm(gan_gradient.flatten(1), dim=1).mean()
+            ),
+            "dmd_gan_gradient_cosine_similarity": float(gradient_cosine),
             "gan_backward_scale": float(getattr(self, "_last_gan_backward_scale", 1.0)),
         }
 
@@ -703,12 +1095,67 @@ class DMD2FlowProgram(TrainingProgram):
         raise ValueError(f"unknown DMD2 phase: {phase}")
 
     def validation_loss(self, batch: dict[str, Any]) -> tuple[Tensor, dict[str, float]]:
-        return self._fake_loss(batch)
+        devices = sorted(
+            {
+                device.index
+                for device in (self.student_device, self.teacher.device, self._fake_score_device)
+                if device.type == "cuda" and device.index is not None
+            }
+        )
+        previous_context = self._step_context
+        self._step_context = {**previous_context, "diagnostics_enabled": True, "phase": "validation"}
+        try:
+            # Validation loader order, observation batches, and all random
+            # draws are fixed across calls. fork_rng prevents this probe from
+            # perturbing the subsequent training stream.
+            with torch.random.fork_rng(devices=devices):
+                torch.manual_seed(0xD2D2)
+                for device_index in devices:
+                    with torch.cuda.device(device_index):
+                        torch.cuda.manual_seed(0xD2D2)
+                generator = torch.Generator(device=self.student_device).manual_seed(0xD2D2)
+                generated = self._sample_student(
+                    batch,
+                    requires_grad=False,
+                    generator=generator,
+                )
+                teacher_condition = self._teacher_condition(batch)
+                fake_loss, fake_metrics = self._fake_loss(
+                    batch,
+                    generated,
+                    teacher_condition=teacher_condition,
+                )
+                valid = self._valid(batch, self.student_device)
+                dmd_loss, dmd_metrics = self._distribution_matching_loss(
+                    batch,
+                    generated,
+                    valid,
+                    teacher_condition=teacher_condition,
+                )
+        finally:
+            self._step_context = previous_context
+        return fake_loss, {
+            **{f"fixed_probe/fake_score/{name}": value for name, value in fake_metrics.items()},
+            **{f"fixed_probe/dmd/{name}": value for name, value in dmd_metrics.items()},
+            **{f"fixed_probe/{name}": value for name, value in self._last_backward_metrics.items()},
+            "fixed_probe/fake_score_loss": float(fake_loss.detach()),
+            "fixed_probe/generator_loss": float(dmd_loss.detach()),
+            "fixed_probe/generator_distribution_matching_loss": float(dmd_loss.detach()),
+            "fixed_probe/teacher_prediction_norm": float(
+                dmd_metrics["teacher_prediction_norm"]
+            ),
+            "fixed_probe/teacher_fake_clean_l1": float(
+                fake_metrics.get(
+                    "teacher_fake_clean_prediction_l1", dmd_metrics["difference_l1"]
+                )
+            ),
+        }
 
     def make_optimizers(self, training: dict[str, Any]) -> dict[str, torch.optim.Optimizer]:
         common = {
             "betas": tuple(training.get("betas", [0.9, 0.95])),
             "weight_decay": float(training["weight_decay"]),
+            "eps": float(training.get("epsilon", 1.0e-8)),
         }
         fake_parameters = [parameter for parameter in self.fake_score.parameters() if parameter.requires_grad]
         discriminator_parameters = [parameter for parameter in self.discriminator.parameters() if parameter.requires_grad]
@@ -771,9 +1218,10 @@ class DMD2FlowProgram(TrainingProgram):
             "discriminator": discriminator,
             "teacher_device": str(self.teacher.device),
             "sampler_identity": (
-                "DMD2-v real-data shifted outer transition during training; "
-                "checkpoint-grid deterministic Euler integration during evaluation"
+                "DMD2 backward simulation during training and DMD2 denoise-renoise "
+                "sampling during evaluation; both start from independent Gaussian noise"
             ),
+            "student_state_replay": self.dmd_config.get("student_rollout_replay"),
             "guidance_objective": (
                 "fake_score_loss + guidance_classifier_weight * discriminator_loss"
                 if self.feature_source == "fake_score_features"

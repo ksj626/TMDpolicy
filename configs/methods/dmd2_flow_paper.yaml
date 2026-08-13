@@ -34,12 +34,13 @@ training:
   validation_batches: 8
   checkpoint_interval: 1000
   inference_checkpoint_interval: 10
+  diagnostics_interval: 10
 dmd2:
   student_fine_tuning: head_only
   fake_score_variant: pi05_clone
   fake_updates_per_generator: 5
   guidance_classifier_weight: 1.0
-  student_training_mode: real_data_outer_transition
+  student_training_mode: backward_simulation_denoise_renoise
   discrete_outer_steps: 4
   student_time_shift_gamma: 5.0
   generator_learning_rate: 1.0e-5
@@ -51,6 +52,15 @@ dmd2:
   teacher_device: cuda:1
   teacher_dtype: bfloat16
   fake_score_device: cuda:1
+  student_rollout_replay:
+    enabled: true
+    initial_blocking: true
+    refresh_generator_updates: 500
+    capacity_replans: 8000
+    device: cuda:2
+    fps: 10
+    base_reset_seed: 100000
+    max_episode_steps: 600
   vsd_time: {minimum_time: 0.001, maximum_time: 0.999, time_shift_gamma: 5.0}
   gan_time: {minimum_time: 0.001, maximum_time: 0.999, time_shift_gamma: 5.0}
   fake_score_time: {minimum_time: 0.001, maximum_time: 0.999, time_shift_gamma: 5.0}
@@ -61,8 +71,8 @@ dmd2:
     hidden_dim: 512
     time_embedding_dim: 32
   resource_estimate:
-    classification: PI0.5 prefix plus independently trainable PI0.5 suffix; no fallback
-    expected_vram: "cuda:0 >=24 GiB student; cuda:1 >=24 GiB teacher/fake suffix/features"
+    classification: PI0.5 prefix plus independently trainable PI0.5 suffix and asynchronous rollout; no fallback
+    expected_vram: "cuda:0 >=24 GiB student; cuda:1 >=24 GiB teacher/fake suffix/features; cuda:2 >=7 GiB rollout inference"
 preflight:
-  minimum_total_memory_gib: {cuda:0: 23.5, cuda:1: 23.5}
+  minimum_total_memory_gib: {cuda:0: 23.5, cuda:1: 23.5, cuda:2: 7.0}
 output: {directory: artifacts/training/dmd2_flow_paper}

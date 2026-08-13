@@ -332,12 +332,28 @@ class LeRobotSmolVLAStudent(nn.Module):
             raise ValueError(f"SmolVLA x_t must be [B,50,32], got {tuple(x_t.shape)}")
         if t.ndim == 0:
             t = t.expand(condition.batch_size)
-        return self.flow.denoise_step(
-            prefix_pad_masks=condition.prefix_pad_masks,
-            past_key_values=condition.past_key_values,
-            x_t=x_t,
-            timestep=t.to(torch.float32),
-        )
+        # The checkpoint deliberately mixes BF16 expert blocks with FP32
+        # action/time projections. Keep flow coordinates at the public FP32
+        # boundary and let the LeRobot module perform its internal casts. This
+        # also prevents an enclosing trainer autocast from feeding BF16 into a
+        # checkpoint-native FP32 projection.
+        with torch.autocast(device_type=x_t.device.type, enabled=False):
+            return self.flow.denoise_step(
+                prefix_pad_masks=condition.prefix_pad_masks,
+                past_key_values=condition.past_key_values,
+                x_t=x_t.float(),
+                timestep=t.to(torch.float32),
+            ).float()
+
+    @staticmethod
+    def clean_prediction(x_t: Tensor, time: Tensor, velocity: Tensor) -> Tensor:
+        """Rectified-flow clean prediction ``x_hat=x_t-t*v(x_t,t)``."""
+
+        if time.ndim == 0:
+            time = time.expand(x_t.shape[0])
+        if time.shape != (x_t.shape[0],) or velocity.shape != x_t.shape:
+            raise ValueError("clean prediction expects x/velocity [B,H,D] and time [B]")
+        return x_t.float() - time.float()[:, None, None] * velocity.float()
 
     def velocity_with_features(
         self, condition: SmolVLAConditionCache, x_t: Tensor, t: Tensor
@@ -393,6 +409,71 @@ class LeRobotSmolVLAStudent(nn.Module):
             if step_callback is not None:
                 step_callback()
         return value
+
+    def sample_denoise_renoise(
+        self,
+        condition: SmolVLAConditionCache,
+        noise: Tensor,
+        num_steps: int,
+        *,
+        student_time_shift_gamma: float,
+        time_grid: Tensor | None = None,
+        generator: torch.Generator | None = None,
+        renoise_noises: Tensor | None = None,
+        step_callback: Callable[[], None] | None = None,
+    ) -> Tensor:
+        """DMD2 multi-step sampler with inference-matched backward simulation.
+
+        Starting from pure Gaussian noise, each step predicts a clean sample.
+        Except after the final prediction, that clean sample is independently
+        re-noised at the next scheduled time. This is the denoise--renoise
+        sampler in DMD2 Sections 4.4--4.5, and is intentionally distinct from
+        the deterministic rectified-flow Euler sampler in :meth:`sample`.
+        """
+
+        if num_steps < 1:
+            raise ValueError("num_steps must be positive")
+        if noise.dtype != torch.float32:
+            noise = noise.float()
+        if time_grid is None:
+            time_grid = shifted_time_grid(
+                num_steps,
+                student_time_shift_gamma,
+                device=noise.device,
+                dtype=torch.float32,
+                descending=True,
+            )
+        if time_grid.shape != (num_steps + 1,) or not torch.all(
+            time_grid[:-1] > time_grid[1:]
+        ):
+            raise ValueError("time_grid must contain num_steps+1 strictly descending values")
+        if renoise_noises is not None and renoise_noises.shape != (
+            max(0, num_steps - 1),
+            *noise.shape,
+        ):
+            raise ValueError("renoise_noises must be [num_steps-1,B,50,32]")
+
+        value = noise
+        clean = noise
+        for index, (current, target) in enumerate(
+            zip(time_grid[:-1], time_grid[1:], strict=True)
+        ):
+            time = current.expand(condition.batch_size)
+            clean = self.clean_prediction(value, time, self.velocity(condition, value, time))
+            if step_callback is not None:
+                step_callback()
+            if index + 1 < num_steps:
+                if renoise_noises is None:
+                    fresh_noise = torch.randn(
+                        value.shape,
+                        device=value.device,
+                        dtype=torch.float32,
+                        generator=generator,
+                    )
+                else:
+                    fresh_noise = renoise_noises[index].float()
+                value = (1.0 - target.float()) * clean + target.float() * fresh_noise
+        return clean
 
     @torch.no_grad()
     def predict_canonical_action_chunk(

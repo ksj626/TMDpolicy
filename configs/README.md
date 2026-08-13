@@ -31,8 +31,9 @@ has no CFG. `normalization_constant_scale: 1.0` yields `c=350` for `[50,7]`.
 `teacher_features` for TMD Stage 2. Selected layers and separate-head aggregation
 are stored in provenance. Cached condition identity includes encoder/processor
 revision, layer, dtype, dimension, components, and detach policy.
-DMD2 also records `student_training_mode: real_data_outer_transition` and a
-separate `guidance_classifier_weight`; Stage 2 records
+DMD2 records `student_training_mode: backward_simulation_denoise_renoise`, a
+separate `guidance_classifier_weight`, and its periodic task-balanced student
+replay contract; Stage 2 records
 `student_training_mode: tmd_stage1_outer_transition` and an explicit
 `discriminator_updates_per_generator`.
 
@@ -48,6 +49,8 @@ Evaluation configs distinguish `pi05`, SmolVLA `official`, and SmolVLA
 `override`. Official SmolVLA forbids `num_steps`; override requires an ablation
 classification. Collection configs must enumerate the four suites and every
 local task 0–9. Occupancy configs must enumerate global task indices 0–39.
+`libero_plus_dmd2.yaml` is a distinct method contract for the four robustness
+suites (2,402 + 2,518 + 2,591 + 2,519 = 10,030 tasks).
 
 `preflight.minimum_total_memory_gib` is a per-device hard floor. A failed
 preflight reports the requested component device and detected memory and never

@@ -54,11 +54,12 @@ def test_first_order_surrogate_recovers_gradient_with_safe_backward_scale() -> N
 
     value = torch.ones(3, requires_grad=True)
     unstable_loss = FiniteOnlyWhenScaled.apply(value)
-    surrogate, scale = _stable_first_order_surrogate(
+    surrogate, scale, gradient = _stable_first_order_surrogate(
         unstable_loss, value, scales=(1.0, 2.0**-8)
     )
     surrogate.backward()
     assert scale == 2.0**-8
+    assert torch.equal(gradient, torch.full((3,), 4.0))
     assert torch.equal(value.grad, torch.full((3,), 4.0))
 
 
@@ -74,9 +75,10 @@ def test_first_order_surrogate_does_not_form_overflowing_gradient_dot_product() 
 
     value = torch.full((3,), 1.0e30, requires_grad=True)
     loss = FiniteLossHugeGradient.apply(value)
-    surrogate, scale = _stable_first_order_surrogate(loss, value)
+    surrogate, scale, gradient = _stable_first_order_surrogate(loss, value)
     assert scale == 1.0
     assert torch.equal(surrogate.detach(), torch.tensor(1.25))
+    assert torch.equal(gradient, torch.full((3,), 1.0e20))
     surrogate.backward()
     assert torch.equal(value.grad, torch.full((3,), 1.0e20))
 
@@ -184,6 +186,7 @@ def test_faithful_dmd_generator_never_calls_flow_sft() -> None:
             raise AssertionError("faithful DMD2 must not call Flow-SFT")
 
     program.student = Student()
+    program.bridge = types.SimpleNamespace(student_to_canonical=lambda value: value[..., :7])
     program.dmd_config = {"gan_weight": 0.5}
     program._sample_student = types.MethodType(
         lambda self, batch, requires_grad: self.student.anchor * torch.ones(1, 50, 32), program
@@ -362,12 +365,12 @@ def test_default_baseline_configs_are_pi05_feature_based_and_have_no_data_loss()
     ] == "dmd2_teacher_residual_mean_abs"
     assert load_config(root / "configs/methods/dmd2_flow_paper.yaml")["dmd2"][
         "student_training_mode"
-    ] == "real_data_outer_transition"
+    ] == "backward_simulation_denoise_renoise"
     optimized_training = load_config(root / "configs/methods/dmd2_flow_paper.yaml")["training"]
     assert optimized_training["batch_size"] == 8
     assert optimized_training["gradient_accumulation"] == 4
     assert optimized_training["batch_size"] * optimized_training["gradient_accumulation"] == 32
-    assert optimized_training["inference_checkpoint_interval"] == 50
+    assert optimized_training["inference_checkpoint_interval"] == 10
     assert load_config(root / "configs/methods/tmd_stage2_paper.yaml")["stage2"][
         "vsd_normalization"
     ] == "tmd_fake_teacher_difference_l1"
