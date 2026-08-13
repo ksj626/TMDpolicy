@@ -30,7 +30,7 @@ training:
   warmup_steps: 1000
   minimum_lr_scale: 0.05
   max_steps: 100000
-  validation_interval: 500
+  validation_interval: 50
   validation_batches: 8
   checkpoint_interval: 1000
   inference_checkpoint_interval: 10
@@ -55,14 +55,16 @@ dmd2:
   student_rollout_replay:
     enabled: true
     initial_blocking: true
-    refresh_generator_updates: 500
-    capacity_replans: 8000
+    refresh_generator_updates: 50
+    capacity_replans: 2400
     device: cuda:2
+    devices: [cuda:2, cuda:3, cuda:4, cuda:5]
     fps: 10
     base_reset_seed: 100000
     max_episode_steps: 600
+    batch_size: 1
   vsd_time: {minimum_time: 0.001, maximum_time: 0.999, time_shift_gamma: 5.0}
-  gan_time: {minimum_time: 0.001, maximum_time: 0.999, time_shift_gamma: 5.0}
+  gan_time: {minimum_time: 0.001, maximum_time: 0.999, time_shift_gamma: 1.0}
   fake_score_time: {minimum_time: 0.001, maximum_time: 0.999, time_shift_gamma: 5.0}
   discriminator:
     variant: pi05_intermediate_features

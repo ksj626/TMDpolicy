@@ -1,8 +1,9 @@
-"""Resumable one-environment-at-a-time evaluation on all 10,030 LIBERO-Plus tasks."""
+"""Resumable serial or multi-GPU-sharded LIBERO-Plus evaluation."""
 
 from __future__ import annotations
 
 import contextlib
+import copy
 import hashlib
 import inspect
 import io
@@ -10,6 +11,8 @@ import json
 import os
 import random
 import subprocess
+import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -20,7 +23,7 @@ from tqdm.auto import tqdm
 
 from tmd_policy.config import save_resolved_config
 
-from .libero import run_episode, wilson_interval
+from .libero import run_episode_batch, wilson_interval
 from .policy import load_inference_policy
 
 
@@ -46,6 +49,14 @@ CATEGORY_NAMES = (
     "Robot Initial States",
     "Sensor Noise",
 )
+
+
+def resolve_video_setting(
+    *, sample_per_category: int | None, save_videos: bool | None
+) -> bool:
+    """Default videos on for category samples while keeping full runs opt-in."""
+
+    return bool(sample_per_category is not None) if save_videos is None else save_videos
 
 
 def _atomic_json(value: Any, target: Path) -> None:
@@ -78,6 +89,12 @@ def _comparable_config(config: dict[str, Any]) -> dict[str, Any]:
     evaluation = dict(result.get("evaluation", {}))
     evaluation.setdefault("sample_per_category", None)
     evaluation.setdefault("sample_seed", 0)
+    evaluation.pop("batch_size", None)
+    evaluation.pop("devices", None)
+    evaluation.pop("parallel_worker", None)
+    evaluation.pop("task_map", None)
+    evaluation.setdefault("save_videos", None)
+    evaluation.setdefault("video_camera", "image")
     result["evaluation"] = evaluation
     return result
 
@@ -201,6 +218,41 @@ def select_category_sample(
     return {suite: sorted(set(ids)) for suite, ids in selected.items()}
 
 
+def _select_tasks(
+    evaluation: dict[str, Any],
+    classification: dict[str, list[dict[str, Any]]],
+    suites: list[str],
+) -> dict[str, list[int]]:
+    task_map = evaluation.get("task_map")
+    if task_map is not None:
+        return {
+            suite: [int(value) for value in task_map.get(suite, [])]
+            for suite in suites
+        }
+    requested_task_ids = evaluation.get("task_ids")
+    sample_per_category = evaluation.get("sample_per_category")
+    if sample_per_category is not None:
+        return select_category_sample(
+            classification,
+            suites,
+            per_category=int(sample_per_category),
+            seed=int(evaluation.get("sample_seed", 0)),
+        )
+    selected: dict[str, list[int]] = {}
+    for suite in suites:
+        ids = (
+            list(range(SUITE_COUNTS[suite]))
+            if requested_task_ids is None
+            else [int(value) for value in requested_task_ids]
+        )
+        if any(value < 0 or value >= SUITE_COUNTS[suite] for value in ids):
+            raise ValueError(
+                f"LIBERO-Plus task id exceeds {suite} range [0,{SUITE_COUNTS[suite] - 1}]"
+            )
+        selected[suite] = ids
+    return selected
+
+
 def _single_task_env(
     catalog: Any,
     *,
@@ -284,7 +336,7 @@ def summarize_libero_plus(rows: list[dict[str, Any]], *, full_benchmark: bool) -
     }
 
 
-def evaluate_libero_plus(
+def _evaluate_libero_plus_serial(
     config: dict[str, Any], output_dir: str | Path, *, resume: bool = False
 ) -> dict[str, Any]:
     """Evaluate a policy with per-episode persistence and exact resume."""
@@ -296,6 +348,15 @@ def evaluate_libero_plus(
     requested_task_ids = evaluation.get("task_ids")
     sample_per_category = evaluation.get("sample_per_category")
     sample_seed = int(evaluation.get("sample_seed", 0))
+    batch_size = int(evaluation.get("batch_size", 1))
+    if batch_size < 1:
+        raise ValueError("LIBERO-Plus batch_size must be positive")
+    save_videos = resolve_video_setting(
+        sample_per_category=(
+            int(sample_per_category) if sample_per_category is not None else None
+        ),
+        save_videos=evaluation.get("save_videos"),
+    )
     if requested_task_ids is not None and sample_per_category is not None:
         raise ValueError("LIBERO-Plus task_ids and sample_per_category are mutually exclusive")
     reset_seeds = [int(value) for value in evaluation["reset_seeds"]]
@@ -304,6 +365,7 @@ def evaluate_libero_plus(
         and set(suites) == set(SUITE_COUNTS)
         and requested_task_ids is None
         and sample_per_category is None
+        and evaluation.get("task_map") is None
         and len(reset_seeds) == 1
     )
 
@@ -319,26 +381,7 @@ def evaluate_libero_plus(
     from lerobot.envs.configs import LiberoPlusEnv
 
     env_processor, _ = LiberoPlusEnv().get_env_processors()
-    if sample_per_category is not None:
-        selected = select_category_sample(
-            classification,
-            suites,
-            per_category=int(sample_per_category),
-            seed=sample_seed,
-        )
-    else:
-        selected = {}
-        for suite in suites:
-            ids = (
-                list(range(SUITE_COUNTS[suite]))
-                if requested_task_ids is None
-                else [int(value) for value in requested_task_ids]
-            )
-            if any(value >= SUITE_COUNTS[suite] for value in ids):
-                raise ValueError(
-                    f"LIBERO-Plus task id exceeds {suite} range [0,{SUITE_COUNTS[suite] - 1}]"
-                )
-            selected[suite] = ids
+    selected = _select_tasks(evaluation, classification, suites)
     requested = {
         (suite, task_id, seed)
         for suite, ids in selected.items()
@@ -361,13 +404,18 @@ def evaluate_libero_plus(
         "expected_total_tasks": TOTAL_TASKS,
         "full_benchmark": full_benchmark,
         "selection": {
-            "mode": "category_sample" if sample_per_category is not None else (
-                "task_ids" if requested_task_ids is not None else "full"
-            ),
+            "mode": "worker_shard" if evaluation.get("task_map") is not None else (
+                "category_sample" if sample_per_category is not None else (
+                "task_ids" if requested_task_ids is not None else (
+                    "full_benchmark" if full_benchmark else "full_suite"
+                )
+            )),
             "sample_per_category": sample_per_category,
             "sample_seed": sample_seed if sample_per_category is not None else None,
             "tasks": selected,
         },
+        "batch_size": batch_size,
+        "save_videos": save_videos,
     }
     manifest_path = output / "manifest.json"
     if manifest_path.exists():
@@ -391,42 +439,73 @@ def evaluate_libero_plus(
     with episodes_path.open("a", encoding="utf-8") as handle:
         for suite in suites:
             catalog = catalogs[suite]
-            for task_id in selected[suite]:
-                metadata = classification[suite][task_id]
-                task = catalog.tasks[task_id]
-                for reset_seed in reset_seeds:
-                    key = (suite, task_id, reset_seed)
-                    if key in completed:
-                        continue
-                    progress.set_postfix_str(
-                        f"{suite}:{task_id}/{SUITE_COUNTS[suite] - 1} seed={reset_seed}",
-                        refresh=True,
-                    )
-                    env = _single_task_env(
-                        catalog,
-                        suite=suite,
-                        task_id=task_id,
-                        fps=int(evaluation["fps"]),
-                        episode_length=int(evaluation["suite_max_episode_steps"][suite]),
-                        control_mode=str(evaluation.get("control_mode", "relative")),
-                        hard_reset=bool(evaluation.get("hard_reset", True)),
-                    )
-                    try:
-                        metrics, _ = run_episode(
-                            env,
-                            env_processor,
-                            policy,
-                            instruction=str(task.language),
-                            reset_seed=reset_seed,
-                            task_index=SUITE_OFFSETS[suite] + task_id,
-                            execution_horizon=int(config["horizons"]["execution"]),
-                            max_steps=int(evaluation["suite_max_episode_steps"][suite]),
-                            synchronize_cuda=bool(evaluation.get("synchronize_cuda", True)),
-                            replan_metadata=None,
-                            progress_description=f"LIBERO+ {suite}:{task_id}",
+            pending = [
+                (task_id, reset_seed)
+                for task_id in selected[suite]
+                for reset_seed in reset_seeds
+                if (suite, task_id, reset_seed) not in completed
+            ]
+            for chunk_start in range(0, len(pending), batch_size):
+                chunk = pending[chunk_start : chunk_start + batch_size]
+                progress.set_postfix_str(
+                    f"{suite} batch={len(chunk)} tasks={chunk[0][0]}..{chunk[-1][0]}",
+                    refresh=True,
+                )
+                envs: list[Any] = []
+                specs: list[dict[str, Any]] = []
+                try:
+                    for task_id, reset_seed in chunk:
+                        task = catalog.tasks[task_id]
+                        metadata = classification[suite][task_id]
+                        env = _single_task_env(
+                            catalog,
+                            suite=suite,
+                            task_id=task_id,
+                            fps=int(evaluation["fps"]),
+                            episode_length=int(evaluation["suite_max_episode_steps"][suite]),
+                            control_mode=str(evaluation.get("control_mode", "relative")),
+                            hard_reset=bool(evaluation.get("hard_reset", True)),
                         )
-                    finally:
+                        envs.append(env)
+                        video_path = (
+                            output
+                            / "videos"
+                            / suite
+                            / f"task-{task_id:04d}_variant-{int(metadata['id']):04d}_seed-{reset_seed}.mp4"
+                            if save_videos
+                            else None
+                        )
+                        specs.append(
+                            {
+                                "env": env,
+                                "instruction": str(task.language),
+                                "reset_seed": reset_seed,
+                                "task_index": SUITE_OFFSETS[suite] + task_id,
+                                "replan_metadata": None,
+                                "video_path": video_path,
+                            }
+                        )
+                    results = run_episode_batch(
+                        specs,
+                        env_processor,
+                        policy,
+                        execution_horizon=int(config["horizons"]["execution"]),
+                        max_steps=int(evaluation["suite_max_episode_steps"][suite]),
+                        synchronize_cuda=bool(evaluation.get("synchronize_cuda", True)),
+                        progress_description=f"LIBERO+ {suite} batch {chunk_start // batch_size + 1}",
+                        video_fps=int(evaluation["fps"]),
+                        video_camera=str(evaluation.get("video_camera", "image")),
+                    )
+                finally:
+                    for env in envs:
                         env.close()
+                for (task_id, reset_seed), (metrics, payload) in zip(
+                    chunk, results, strict=True
+                ):
+                    metadata = classification[suite][task_id]
+                    task = catalog.tasks[task_id]
+                    key = (suite, task_id, reset_seed)
+                    video_path = payload.get("video_path")
                     row = {
                         "suite": suite,
                         "task_id": task_id,
@@ -437,6 +516,9 @@ def evaluate_libero_plus(
                         "category": str(metadata["category"]),
                         "difficulty_level": int(metadata["difficulty_level"]),
                         "reset_seed": reset_seed,
+                        "video": (
+                            str(Path(video_path).relative_to(output)) if video_path else None
+                        ),
                         **metrics,
                     }
                     handle.write(json.dumps(row, sort_keys=True) + "\n")
@@ -462,11 +544,258 @@ def evaluate_libero_plus(
     return report
 
 
+def _evaluate_libero_plus_multi_gpu(
+    config: dict[str, Any], output_dir: str | Path, *, resume: bool
+) -> dict[str, Any]:
+    """Shard tasks across policy replicas; each worker keeps the serial loop."""
+
+    output = Path(output_dir)
+    _prepare_output(output, config, resume=resume)
+    evaluation = config["evaluation"]
+    devices = [str(value) for value in evaluation["devices"]]
+    suites = [str(value) for value in evaluation["suites"]]
+    _, classification, classification_path = _load_catalogs(suites)
+    selected = _select_tasks(evaluation, classification, suites)
+    task_pairs = [
+        (suite, task_id)
+        for suite in suites
+        for task_id in selected[suite]
+    ]
+    if not task_pairs:
+        raise ValueError("LIBERO-Plus multi-GPU selection contains no tasks")
+    worker_count = min(len(devices), len(task_pairs))
+    shards: list[list[tuple[str, int]]] = [[] for _ in range(worker_count)]
+    for index, pair in enumerate(task_pairs):
+        shards[index % worker_count].append(pair)
+
+    workers_root = output / "parallel_workers"
+    workers_root.mkdir(exist_ok=True)
+    processes: list[tuple[int, str, Path, subprocess.Popen[str], Any]] = []
+    for worker_index, (device, shard) in enumerate(
+        zip(devices[:worker_count], shards, strict=True)
+    ):
+        worker_name = f"worker-{worker_index:02d}"
+        worker_output = workers_root / worker_name
+        worker_config = copy.deepcopy(config)
+        worker_config["classification"] = (
+            f"{config['classification']}; serial multi-GPU shard {worker_index}/{worker_count}"
+        )
+        worker_config["policy"]["device"] = device
+        worker_evaluation = worker_config["evaluation"]
+        worker_evaluation["devices"] = []
+        worker_evaluation["parallel_worker"] = True
+        worker_evaluation["batch_size"] = 1
+        worker_evaluation["task_ids"] = None
+        worker_evaluation["sample_per_category"] = None
+        worker_evaluation["save_videos"] = resolve_video_setting(
+            sample_per_category=(
+                int(evaluation["sample_per_category"])
+                if evaluation.get("sample_per_category") is not None
+                else None
+            ),
+            save_videos=evaluation.get("save_videos"),
+        )
+        task_map = {
+            suite: [task_id for selected_suite, task_id in shard if selected_suite == suite]
+            for suite in suites
+        }
+        worker_evaluation["suites"] = [suite for suite in suites if task_map[suite]]
+        worker_evaluation["task_map"] = task_map
+        worker_config["output"]["directory"] = str(worker_output)
+        config_path = workers_root / f"{worker_name}.yaml"
+        save_resolved_config(worker_config, config_path)
+        log_path = workers_root / f"{worker_name}.log"
+        log_handle = log_path.open("a", encoding="utf-8")
+        command = [
+            sys.executable,
+            "-m",
+            "tmd_policy.cli",
+            "evaluate",
+            "libero-plus",
+            "--config",
+            str(config_path),
+            "--output",
+            str(worker_output),
+        ]
+        if worker_output.exists():
+            command.append("--resume")
+        environment = dict(os.environ)
+        environment.setdefault("MUJOCO_GL", "egl")
+        # EGL and CUDA device enumerations are not necessarily the same (this
+        # container exposes one EGL render device and many CUDA devices). Keep
+        # rendering on the launcher-selected/default EGL device; only the VLA
+        # replica is assigned to `device` above.
+        process = subprocess.Popen(
+            command,
+            cwd=Path(__file__).resolve().parents[3],
+            env=environment,
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        processes.append((worker_index, device, worker_output, process, log_handle))
+
+    reset_seeds = [int(value) for value in evaluation["reset_seeds"]]
+    total_episodes = len(task_pairs) * len(reset_seeds)
+    progress = tqdm(
+        total=total_episodes,
+        desc=f"LIBERO-Plus {worker_count}-GPU shards",
+        unit="episode",
+        dynamic_ncols=True,
+    )
+    try:
+        while any(process.poll() is None for _, _, _, process, _ in processes):
+            completed = 0
+            for _, _, worker_output, _, _ in processes:
+                progress_path = worker_output / "progress.json"
+                if progress_path.exists():
+                    try:
+                        completed += int(
+                            json.loads(progress_path.read_text(encoding="utf-8"))[
+                                "completed_episodes"
+                            ]
+                        )
+                    except (OSError, ValueError, KeyError, json.JSONDecodeError):
+                        pass
+            progress.n = min(completed, total_episodes)
+            progress.set_postfix(alive=sum(p.poll() is None for *_, p, _ in processes))
+            progress.refresh()
+            time.sleep(1.0)
+    finally:
+        progress.close()
+        for *_, handle in processes:
+            handle.close()
+
+    failures = [
+        (index, device, process.returncode)
+        for index, device, _, process, _ in processes
+        if process.returncode != 0
+    ]
+    if failures:
+        details = []
+        for index, device, return_code in failures:
+            log_path = workers_root / f"worker-{index:02d}.log"
+            tail = "\n".join(log_path.read_text(encoding="utf-8").splitlines()[-30:])
+            details.append(f"worker {index} ({device}) exited {return_code}:\n{tail}")
+        raise RuntimeError("LIBERO-Plus parallel evaluation failed\n" + "\n".join(details))
+
+    rows: list[dict[str, Any]] = []
+    worker_manifests: list[dict[str, Any]] = []
+    for worker_index, _, worker_output, _, _ in processes:
+        worker_rows = _load_existing(worker_output / "episodes.jsonl")
+        for row in worker_rows:
+            if row.get("video"):
+                row["video"] = str(
+                    Path("parallel_workers")
+                    / f"worker-{worker_index:02d}"
+                    / str(row["video"])
+                )
+            rows.append(row)
+        worker_manifests.append(
+            json.loads((worker_output / "manifest.json").read_text(encoding="utf-8"))
+        )
+    suite_order = {suite: index for index, suite in enumerate(suites)}
+    rows.sort(key=lambda row: (suite_order[str(row["suite"])], int(row["task_id"]), int(row["reset_seed"])))
+    expected = {
+        (suite, task_id, seed)
+        for suite, ids in selected.items()
+        for task_id in ids
+        for seed in reset_seeds
+    }
+    actual = {
+        (str(row["suite"]), int(row["task_id"]), int(row["reset_seed"]))
+        for row in rows
+    }
+    if actual != expected:
+        raise RuntimeError(
+            f"parallel LIBERO-Plus shards are incomplete: missing={len(expected - actual)}, "
+            f"unexpected={len(actual - expected)}"
+        )
+    episodes_path = output / "episodes.jsonl"
+    episodes_partial = episodes_path.with_suffix(".jsonl.partial")
+    episodes_partial.write_text(
+        "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+    os.replace(episodes_partial, episodes_path)
+    full_benchmark = (
+        set(suites) == set(SUITE_COUNTS)
+        and evaluation.get("task_ids") is None
+        and evaluation.get("sample_per_category") is None
+        and len(reset_seeds) == 1
+    )
+    manifest = {
+        "format": "tmdpolicy.libero-plus-evaluation/v1",
+        "policy": worker_manifests[0]["policy"],
+        "libero_plus_source": _source_identity(classification_path),
+        "suite_counts": SUITE_COUNTS,
+        "expected_total_tasks": TOTAL_TASKS,
+        "full_benchmark": full_benchmark,
+        "selection": {
+            "mode": (
+                "category_sample"
+                if evaluation.get("sample_per_category") is not None
+                else "task_ids"
+                if evaluation.get("task_ids") is not None
+                else "full_benchmark"
+                if full_benchmark
+                else "full_suite"
+            ),
+            "sample_per_category": evaluation.get("sample_per_category"),
+            "sample_seed": (
+                int(evaluation.get("sample_seed", 0))
+                if evaluation.get("sample_per_category") is not None
+                else None
+            ),
+            "tasks": selected,
+        },
+        "parallelism": {
+            "mode": "independent_serial_processes",
+            "devices": devices[:worker_count],
+            "workers": worker_count,
+            "per_worker_batch_size": 1,
+        },
+        "save_videos": resolve_video_setting(
+            sample_per_category=(
+                int(evaluation["sample_per_category"])
+                if evaluation.get("sample_per_category") is not None
+                else None
+            ),
+            save_videos=evaluation.get("save_videos"),
+        ),
+    }
+    _atomic_json(manifest, output / "manifest.json")
+    _atomic_json(
+        {
+            "completed_episodes": len(rows),
+            "requested_episodes": len(expected),
+            "fraction": 1.0,
+        },
+        output / "progress.json",
+    )
+    summary = summarize_libero_plus(rows, full_benchmark=full_benchmark)
+    report = {"policy": manifest["policy"], "summary": summary}
+    _atomic_json(report, output / "evaluation.json")
+    return report
+
+
+def evaluate_libero_plus(
+    config: dict[str, Any], output_dir: str | Path, *, resume: bool = False
+) -> dict[str, Any]:
+    devices = [str(value) for value in config["evaluation"].get("devices", [])]
+    if len(devices) > 1 and not bool(config["evaluation"].get("parallel_worker", False)):
+        return _evaluate_libero_plus_multi_gpu(config, output_dir, resume=resume)
+    if len(devices) == 1:
+        config["policy"]["device"] = devices[0]
+    return _evaluate_libero_plus_serial(config, output_dir, resume=resume)
+
+
 __all__ = [
     "SUITE_COUNTS",
     "TOTAL_TASKS",
     "CATEGORY_NAMES",
     "evaluate_libero_plus",
+    "resolve_video_setting",
     "select_category_sample",
     "summarize_libero_plus",
 ]

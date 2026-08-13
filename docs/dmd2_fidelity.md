@@ -61,13 +61,13 @@ updates, and 5,000 versus 1,000 warmup updates.
 Periodic student-state replay is a repository adaptation for conditional robot
 policies, not a claim about the image-generation DMD2 paper. Before the first
 optimizer step, a lightweight student snapshot runs one rollout in every one of
-the 40 original LIBERO tasks. This initial collection is blocking and streams
-its rollout progress to the terminal.
+the 40 original LIBERO tasks. This initial collection is blocking, shards the
+tasks over the configured rollout GPUs, and streams progress to the terminal.
 
-Every 500 actual generator updates, training writes another immutable student
-snapshot and starts a collector process on the configured rollout device. The
-trainer continues optimizing while that process runs and ingests a round only
-after its atomic rollout store is complete. The bounded replay samples tasks in
+At the configured actual-generator-update interval, training writes another
+immutable student snapshot and starts a coordinator whose serial workers use the
+configured rollout devices. The trainer continues optimizing while they run and
+ingests a round only after its merged atomic rollout store is complete. The bounded replay samples tasks in
 round-robin order. Guidance/fake-score and discriminator-real updates always use
 expert-state minibatches. The generator's DMD and GAN objectives use replay
 observations when the buffer is available.
@@ -179,29 +179,48 @@ The setup defaults to fork commit
 `TMD_LIBERO_PLUS_COMMIT` only when intentionally starting a new benchmark
 provenance. The evaluator records that commit and the classification-file hash.
 
-Run the full four-suite, one-trial-per-variant 10,030-task benchmark:
+Run the full four-suite, one-trial-per-variant 10,030-task benchmark. For
+throughput, assign independent serial task shards to multiple GPUs:
 
 ```bash
 bash scripts/evaluate/evaluate_libero_plus_dmd2.sh \
   --checkpoint artifacts/training/dmd2_flow_paper_run1/inference_checkpoints/final.pt \
   --checkpoint-sha256 auto \
-  --device cuda:0 \
+  --devices cuda:2 cuda:3 cuda:4 cuda:5 \
   --output artifacts/evaluation/libero_plus_dmd2_run1
 ```
 
-The evaluator verifies exact suite counts and the upstream classification file,
-then creates one environment at a time. It appends every completed episode to
-`episodes.jsonl`, atomically refreshes `progress.json`, and reports success by
-suite, perturbation category, and difficulty. Resume without repeating completed
-tasks:
+The coordinator launches one policy replica per device and distributes complete
+tasks round-robin. Every worker uses the original batch-1 reset, plan, step, and
+termination loop, so there is no cross-task synchronization or waiting for a
+batch's slowest episode. Worker results are checked for exact task coverage and
+merged into `episodes.jsonl`. Resume without repeating completed tasks:
 
 ```bash
 bash scripts/evaluate/evaluate_libero_plus_dmd2.sh \
   --checkpoint artifacts/training/dmd2_flow_paper_run1/inference_checkpoints/final.pt \
   --checkpoint-sha256 auto \
-  --device cuda:0 \
+  --devices cuda:2 cuda:3 cuda:4 cuda:5 \
   --output artifacts/evaluation/libero_plus_dmd2_run1 \
   --resume
+```
+
+Fully evaluate one selected suite, or a selected subset of the four suites:
+
+```bash
+# One complete suite.
+bash scripts/evaluate/evaluate_libero_plus_dmd2.sh \
+  --checkpoint artifacts/training/dmd2_flow_paper_run1/inference_checkpoints/final.pt \
+  --checkpoint-sha256 auto \
+  --suite libero_spatial \
+  --output artifacts/evaluation/libero_plus_spatial
+
+# Two complete suites. Repeating --suite also works.
+bash scripts/evaluate/evaluate_libero_plus_dmd2.sh \
+  --checkpoint artifacts/training/dmd2_flow_paper_run1/inference_checkpoints/final.pt \
+  --checkpoint-sha256 auto \
+  --suite libero_object libero_goal \
+  --output artifacts/evaluation/libero_plus_object_goal
 ```
 
 A lightweight environment smoke test (not a reportable benchmark) is:
@@ -231,8 +250,34 @@ bash scripts/evaluate/evaluate_libero_plus_dmd2.sh \
 ```
 
 The exact suite-local task IDs are recorded under `selection.tasks` in
-`manifest.json`. Use the same seed and `--resume` to continue an interrupted
-sample without changing its task set.
+`manifest.json`. Category-sampled runs save agent-view videos by default under
+`videos/<suite>/`; use `--no-save-videos` to disable them. Conversely, use
+`--save-videos` to opt into videos for a full run. Use the same seed and
+`--resume` to continue an interrupted sample without changing its task set.
+
+The configured evaluation batch size is `1`. `--devices` is the acceleration
+control; omit it (or pass one device with `--device`) for a single serial worker.
+Each extra worker needs enough VRAM for one policy replica. Model startup is paid
+once per worker, so multi-GPU sharding helps sustained sampled/full evaluations,
+not tiny one-step smoke tests. This container exposes one EGL render device, so
+rendering remains there while policy replicas use the requested CUDA devices.
+
+## Batched DMD2 student rollout refresh
+
+Initial and asynchronous DMD2 student-state collection use the same process-level
+task sharding. Configure the worker GPUs in the training YAML:
+
+```yaml
+dmd2:
+  student_rollout_replay:
+    devices: [cuda:2, cuda:3, cuda:4, cuda:5]
+    batch_size: 1
+```
+
+The coordinator assigns the 40 tasks across the listed devices, validates every
+worker store, and merges them into the same atomic round consumed by training.
+This does not change task balance, reset seeds, rollout horizons, RNG rules,
+replay schema, asynchronous refresh schedule, or expert-state GAN minibatches.
 
 Primary references are the [DMD2 paper](https://arxiv.org/abs/2405.14867),
 [official DMD2 implementation](https://github.com/tianweiy/DMD2),

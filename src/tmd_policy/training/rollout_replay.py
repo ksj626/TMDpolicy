@@ -171,6 +171,10 @@ class AsyncStudentRolloutManager:
 
     def _rollout_config(self, checkpoint: Path, output: Path) -> dict[str, Any]:
         round_index = self._round
+        devices = [
+            str(value)
+            for value in self.settings.get("devices", [self.settings["device"]])
+        ]
         return {
             "method": "collect_student",
             "classification": "DMD2 asynchronous balanced on-policy state refresh",
@@ -182,7 +186,7 @@ class AsyncStudentRolloutManager:
                 "method": "dmd2_flow",
                 "checkpoint": str(checkpoint.resolve()),
                 "checkpoint_sha256": "auto",
-                "device": str(self.settings["device"]),
+                "device": devices[0],
             },
             "collection": {
                 "fps": int(self.settings.get("fps", 10)),
@@ -192,6 +196,8 @@ class AsyncStudentRolloutManager:
                 ],
                 "validation_reset_seeds": [],
                 "max_episode_steps": int(self.settings.get("max_episode_steps", 600)),
+                "batch_size": 1,
+                "devices": devices,
                 "collection_round": round_index,
             },
             "output": {"directory": str(output)},

@@ -278,8 +278,8 @@ def validate_config(config: dict[str, Any], *, expected_method: str | None = Non
                 replay,
                 {
                     "enabled", "initial_blocking", "refresh_generator_updates",
-                    "capacity_replans", "device", "fps", "base_reset_seed",
-                    "max_episode_steps",
+                    "capacity_replans", "device", "devices", "fps", "base_reset_seed",
+                    "max_episode_steps", "batch_size",
                 },
                 "dmd2.student_rollout_replay",
             )
@@ -287,12 +287,15 @@ def validate_config(config: dict[str, Any], *, expected_method: str | None = Non
                 raise ConfigError("configured DMD2 student replay must be enabled")
             if not bool(replay.get("initial_blocking", False)):
                 raise ConfigError("DMD2 student replay must collect a balanced initial rollout")
-            if int(replay.get("refresh_generator_updates", 0)) != 500:
-                raise ConfigError("DMD2 student replay refresh must be every 500 generator updates")
             if int(replay.get("capacity_replans", 0)) < 40:
                 raise ConfigError("DMD2 student replay capacity must be at least 40 replans")
             if int(replay.get("max_episode_steps", 0)) < 1:
                 raise ConfigError("DMD2 student replay max_episode_steps must be positive")
+            if int(replay.get("batch_size", 1)) < 1:
+                raise ConfigError("DMD2 student replay batch_size must be positive")
+            devices = [str(value) for value in replay.get("devices", [replay["device"]])]
+            if not devices or len(devices) != len(set(devices)):
+                raise ConfigError("DMD2 student replay devices must be unique and nonempty")
         if objective.get("fake_score_variant") != "pi05_clone" and "ablation" not in str(
             config.get("classification", "")
         ).lower():
@@ -361,7 +364,27 @@ def validate_config(config: dict[str, Any], *, expected_method: str | None = Non
                 raise ConfigError(f"invalid {section_name}.{name} time range/shift")
 
     if method == "collect_student":
-        _all_libero_tasks(_require(config["collection"], "benchmark", "collection"), "collection.benchmark")
+        collection = config["collection"]
+        benchmark = _require(collection, "benchmark", "collection")
+        if bool(collection.get("parallel_worker", False)):
+            seen: set[tuple[str, int]] = set()
+            for suite_spec in benchmark:
+                suite = str(suite_spec.get("suite"))
+                task_ids = [int(value) for value in suite_spec.get("task_ids", [])]
+                if suite not in {"libero_spatial", "libero_object", "libero_goal", "libero_10"}:
+                    raise ConfigError(f"unknown collection worker suite: {suite}")
+                if not task_ids or len(task_ids) != len(set(task_ids)) or not set(task_ids) <= set(range(10)):
+                    raise ConfigError("collection worker task_ids must be unique values in [0,9]")
+                if any((suite, task_id) in seen for task_id in task_ids):
+                    raise ConfigError("collection worker repeats a suite/task pair")
+                seen.update((suite, task_id) for task_id in task_ids)
+        else:
+            _all_libero_tasks(benchmark, "collection.benchmark")
+        if int(collection.get("batch_size", 1)) < 1:
+            raise ConfigError("collection.batch_size must be positive")
+        devices = [str(value) for value in collection.get("devices", [])]
+        if len(devices) != len(set(devices)):
+            raise ConfigError("collection.devices must be unique")
         _reject_unknown(
             config["policy"],
             {"method", "device", "checkpoint", "checkpoint_sha256"},
@@ -440,6 +463,8 @@ def validate_config(config: dict[str, Any], *, expected_method: str | None = Non
                 "fps", "suites", "task_ids", "reset_seeds", "suite_max_episode_steps",
                 "expected_total_tasks", "synchronize_cuda", "control_mode", "hard_reset",
                 "sample_per_category", "sample_seed",
+                "batch_size", "save_videos", "video_camera", "devices",
+                "task_map", "parallel_worker",
             },
             "evaluation",
         )
@@ -471,6 +496,18 @@ def validate_config(config: dict[str, Any], *, expected_method: str | None = Non
             raise ConfigError("LIBERO-Plus sample_per_category must be positive")
         if int(evaluation.get("sample_seed", 0)) < 0:
             raise ConfigError("LIBERO-Plus sample_seed must be nonnegative")
+        if int(evaluation.get("batch_size", 1)) < 1:
+            raise ConfigError("LIBERO-Plus batch_size must be positive")
+        devices = [str(value) for value in evaluation.get("devices", [])]
+        if len(devices) != len(set(devices)):
+            raise ConfigError("LIBERO-Plus devices must be unique")
+        if evaluation.get("save_videos") not in {None, True, False}:
+            raise ConfigError("LIBERO-Plus save_videos must be null or boolean")
+        task_map = evaluation.get("task_map")
+        if task_map is not None and not isinstance(task_map, dict):
+            raise ConfigError("LIBERO-Plus task_map must be a suite-to-task-list mapping")
+        if not str(evaluation.get("video_camera", "image")).strip():
+            raise ConfigError("LIBERO-Plus video_camera must be nonempty")
         reset_seeds = [int(value) for value in _require(evaluation, "reset_seeds", "evaluation")]
         if not reset_seeds or len(reset_seeds) != len(set(reset_seeds)) or min(reset_seeds) < 0:
             raise ConfigError("LIBERO-Plus reset_seeds must be unique nonnegative integers")

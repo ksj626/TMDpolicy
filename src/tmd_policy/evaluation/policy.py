@@ -3,8 +3,7 @@
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Callable
-from pathlib import Path
+from collections.abc import Callable, Sequence
 from typing import Any
 
 import torch
@@ -18,6 +17,78 @@ from tmd_policy.training.builders import build_student, build_teacher, file_sha2
 
 def _substate(state: dict[str, Tensor], prefix: str) -> dict[str, Tensor]:
     return {key.removeprefix(prefix): value for key, value in state.items() if key.startswith(prefix)}
+
+
+def _seeded_noise(
+    seeds: int | Sequence[int],
+    *,
+    batch_size: int,
+    device: torch.device,
+    shape: tuple[int, ...],
+    offset: int = 0,
+) -> Tensor:
+    normalized = [int(seeds)] if isinstance(seeds, int) else [int(seed) for seed in seeds]
+    if len(normalized) == 1 and batch_size > 1:
+        # Preserve the historical one-generator stream for callers that pass a
+        # scalar seed with a batch. Episode batching passes one seed per item.
+        generator = torch.Generator(device=device).manual_seed(normalized[0] + offset)
+        return torch.randn(
+            batch_size,
+            *shape,
+            device=device,
+            dtype=torch.float32,
+            generator=generator,
+        )
+    if len(normalized) != batch_size:
+        raise ValueError(f"received {len(normalized)} noise seeds for batch size {batch_size}")
+    return torch.stack(
+        [
+            torch.randn(
+                *shape,
+                device=device,
+                dtype=torch.float32,
+                generator=torch.Generator(device=device).manual_seed(seed + offset),
+            )
+            for seed in normalized
+        ]
+    )
+
+
+def _dmd2_seeded_noises(
+    seeds: int | Sequence[int],
+    *,
+    batch_size: int,
+    device: torch.device,
+    outer_steps: int,
+) -> tuple[Tensor, torch.Generator | None, Tensor | None]:
+    if isinstance(seeds, int):
+        generator = torch.Generator(device=device).manual_seed(seeds)
+        noise = torch.randn(
+            batch_size, 50, 32, device=device, dtype=torch.float32, generator=generator
+        )
+        return noise, generator, None
+    normalized = [int(seed) for seed in seeds]
+    if len(normalized) != batch_size:
+        raise ValueError(f"received {len(normalized)} noise seeds for batch size {batch_size}")
+    initial: list[Tensor] = []
+    renoise_per_episode: list[Tensor] = []
+    for seed in normalized:
+        generator = torch.Generator(device=device).manual_seed(seed)
+        initial.append(
+            torch.randn(50, 32, device=device, dtype=torch.float32, generator=generator)
+        )
+        renoise_per_episode.append(
+            torch.stack(
+                [
+                    torch.randn(50, 32, device=device, dtype=torch.float32, generator=generator)
+                    for _ in range(max(0, outer_steps - 1))
+                ]
+            )
+            if outer_steps > 1
+            else torch.empty(0, 50, 32, device=device, dtype=torch.float32)
+        )
+    renoise = torch.stack(renoise_per_episode, dim=1)
+    return torch.stack(initial), None, renoise
 
 
 def _load_student_checkpoint_state(
@@ -88,20 +159,27 @@ class InferencePolicy(nn.Module):
         self,
         canonical_batch: dict[str, Any],
         *,
-        noise_seed: int,
+        noise_seed: int | Sequence[int],
         step_callback: Callable[[], None] | None = None,
     ) -> Tensor:
         processed = self.student.preprocess_observation(canonical_batch)
-        generator = torch.Generator(device=self.student.device).manual_seed(noise_seed)
         batch_size = int(torch.as_tensor(processed["observation.state"]).shape[0])
-        noise = torch.randn(
-            batch_size,
-            50,
-            32,
-            device=self.student.device,
-            dtype=torch.float32,
-            generator=generator,
-        )
+        if self.method == "dmd2_flow" and self.tmd_head is None:
+            noise, generator, renoise_noises = _dmd2_seeded_noises(
+                noise_seed,
+                batch_size=batch_size,
+                device=self.student.device,
+                outer_steps=self.outer_steps,
+            )
+        else:
+            noise = _seeded_noise(
+                noise_seed,
+                batch_size=batch_size,
+                device=self.student.device,
+                shape=(50, 32),
+            )
+            generator = None
+            renoise_noises = None
         if self.tmd_head is None and self.sampler_mode == "official":
             handle = None
             if step_callback is not None:
@@ -123,6 +201,7 @@ class InferencePolicy(nn.Module):
                     self.outer_steps,
                     student_time_shift_gamma=self.student_time_shift_gamma,
                     generator=generator,
+                    renoise_noises=renoise_noises,
                     step_callback=step_callback,
                 )
             else:
@@ -134,19 +213,16 @@ class InferencePolicy(nn.Module):
                     step_callback=step_callback,
                 )
         else:
-            inner = torch.stack(
-                [
-                    torch.randn(
-                        noise.shape,
-                        device=noise.device,
-                        dtype=noise.dtype,
-                        generator=torch.Generator(device=noise.device).manual_seed(
-                            noise_seed + 1_000_003 * (index + 1)
-                        ),
-                    )
-                    for index in range(self.outer_steps)
-                ]
-            )
+            inner = torch.stack([
+                _seeded_noise(
+                    noise_seed,
+                    batch_size=batch_size,
+                    device=noise.device,
+                    shape=(50, 32),
+                    offset=1_000_003 * (index + 1),
+                )
+                for index in range(self.outer_steps)
+            ])
             normalized = sample_stage1_generator(
                 self.student,
                 self.tmd_head,
@@ -188,19 +264,16 @@ class PI05InferencePolicy(nn.Module):
         self,
         canonical_batch: dict[str, Any],
         *,
-        noise_seed: int,
+        noise_seed: int | Sequence[int],
         step_callback: Callable[[], None] | None = None,
     ) -> Tensor:
         processed = self.teacher.preprocess_observation(canonical_batch)
         condition = self.teacher.encode_condition(processed)
-        generator = torch.Generator(device=self.device).manual_seed(noise_seed)
-        noise = torch.randn(
-            condition.batch_size,
-            50,
-            32,
+        noise = _seeded_noise(
+            noise_seed,
+            batch_size=condition.batch_size,
             device=self.device,
-            dtype=torch.float32,
-            generator=generator,
+            shape=(50, 32),
         )
         normalized = self.teacher.sample(
             condition,

@@ -170,7 +170,15 @@ def _evaluate_libero_plus(args: argparse.Namespace) -> int:
     if args.checkpoint_sha256 is not None:
         config["policy"]["checkpoint_sha256"] = args.checkpoint_sha256
     if args.device is not None:
+        if args.devices is not None:
+            raise ValueError("--device and --devices are mutually exclusive")
         config["policy"]["device"] = args.device
+    if args.devices is not None:
+        devices = [str(value) for value in args.devices]
+        if not devices or len(devices) != len(set(devices)):
+            raise ValueError("--devices must contain unique device names")
+        config["evaluation"]["devices"] = devices
+        config["policy"]["device"] = devices[0]
     if args.outer_steps is not None:
         if config["policy"]["method"] not in {"dmd2_flow", "flow_sft"}:
             raise ValueError("only DMD2/Flow-SFT support a LIBERO-Plus outer-step override")
@@ -180,6 +188,12 @@ def _evaluate_libero_plus(args: argparse.Namespace) -> int:
     evaluation = config["evaluation"]
     if args.suite:
         evaluation["suites"] = list(args.suite)
+    if args.batch_size is not None:
+        if args.batch_size < 1:
+            raise ValueError("--batch-size must be positive")
+        evaluation["batch_size"] = int(args.batch_size)
+    if args.save_videos is not None:
+        evaluation["save_videos"] = bool(args.save_videos)
     if args.task_ids is not None:
         if args.sample_per_category is not None:
             raise ValueError("--task-ids and --sample-per-category are mutually exclusive")
@@ -320,12 +334,18 @@ def build_parser() -> argparse.ArgumentParser:
     libero_plus.add_argument("--checkpoint")
     libero_plus.add_argument("--checkpoint-sha256")
     libero_plus.add_argument("--device")
+    libero_plus.add_argument(
+        "--devices",
+        nargs="+",
+        help="run independent serial task shards concurrently, one process per GPU",
+    )
     libero_plus.add_argument("--outer-steps", type=int)
     libero_plus.add_argument(
         "--suite",
-        action="append",
+        action="extend",
+        nargs="+",
         choices=("libero_spatial", "libero_object", "libero_goal", "libero_10"),
-        help="restrict to a suite; repeat for multiple suites",
+        help="fully evaluate one or more selected suites; accepts one flag or repeated flags",
     )
     libero_plus.add_argument("--task-ids", type=int, nargs="+")
     libero_plus.add_argument(
@@ -338,6 +358,17 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=0,
         help="nonnegative seed for --sample-per-category (default: 0)",
+    )
+    libero_plus.add_argument(
+        "--batch-size",
+        type=int,
+        help="episodes per policy call (default: 1; prefer --devices for acceleration)",
+    )
+    libero_plus.add_argument(
+        "--save-videos",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="save agent-view MP4s; defaults on for category-sampled runs",
     )
     libero_plus.add_argument("--reset-seeds", type=int, nargs="+")
     libero_plus.add_argument("--max-episode-steps", type=int)

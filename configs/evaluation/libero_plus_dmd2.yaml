@@ -17,6 +17,9 @@ evaluation:
   task_ids: null
   sample_per_category: null
   sample_seed: 0
+  batch_size: 1
+  save_videos: null
+  video_camera: image
   reset_seeds: [0]
   suite_max_episode_steps:
     libero_spatial: 280

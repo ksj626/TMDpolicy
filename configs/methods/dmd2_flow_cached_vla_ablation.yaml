@@ -24,7 +24,7 @@ dmd2:
   teacher_device: cuda:1
   teacher_dtype: bfloat16
   fake_score_device: cuda:1
-  student_rollout_replay: {enabled: true, initial_blocking: true, refresh_generator_updates: 500, capacity_replans: 8000, device: cuda:2, fps: 10, base_reset_seed: 100000, max_episode_steps: 600}
+  student_rollout_replay: {enabled: true, initial_blocking: true, refresh_generator_updates: 500, capacity_replans: 8000, device: cuda:2, devices: [cuda:2, cuda:3, cuda:4, cuda:5], fps: 10, base_reset_seed: 100000, max_episode_steps: 600, batch_size: 1}
   vsd_time: {minimum_time: 0.001, maximum_time: 0.999, time_shift_gamma: 5.0}
   gan_time: {minimum_time: 0.001, maximum_time: 0.999, time_shift_gamma: 5.0}
   fake_score_time: {minimum_time: 0.001, maximum_time: 0.999, time_shift_gamma: 5.0}

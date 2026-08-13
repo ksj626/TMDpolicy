@@ -7,9 +7,11 @@ import torch
 from tmd_policy.evaluation.libero_plus import (
     CATEGORY_NAMES,
     TOTAL_TASKS,
+    resolve_video_setting,
     select_category_sample,
     summarize_libero_plus,
 )
+from tmd_policy.evaluation.policy import _dmd2_seeded_noises, _seeded_noise
 from tmd_policy.training.rollout_replay import AsyncStudentRolloutManager, BalancedStudentReplay
 
 
@@ -79,6 +81,7 @@ def test_libero_plus_config_and_cli_are_wired() -> None:
         expected_method="evaluate_libero_plus",
     )
     assert config["evaluation"]["expected_total_tasks"] == 10_030
+    assert config["evaluation"]["batch_size"] == 1
     args = build_parser().parse_args(
         [
             "evaluate",
@@ -110,6 +113,28 @@ def test_libero_plus_config_and_cli_are_wired() -> None:
     )
     assert sampled.sample_per_category == 10
     assert sampled.sample_seed == 19
+
+    accelerated = build_parser().parse_args(
+        [
+            "evaluate",
+            "libero-plus",
+            "--suite",
+            "libero_spatial",
+            "libero_goal",
+            "--suite",
+            "libero_10",
+            "--batch-size",
+            "6",
+            "--devices",
+            "cuda:2",
+            "cuda:3",
+            "--no-save-videos",
+        ]
+    )
+    assert accelerated.suite == ["libero_spatial", "libero_goal", "libero_10"]
+    assert accelerated.batch_size == 6
+    assert accelerated.devices == ["cuda:2", "cuda:3"]
+    assert accelerated.save_videos is False
 
     bootstrap = build_parser().parse_args(
         [
@@ -149,6 +174,65 @@ def test_libero_plus_category_sample_has_exact_balanced_counts() -> None:
     )
 
 
+def test_libero_plus_category_samples_save_videos_by_default() -> None:
+    assert resolve_video_setting(sample_per_category=10, save_videos=None)
+    assert not resolve_video_setting(sample_per_category=None, save_videos=None)
+    assert not resolve_video_setting(sample_per_category=10, save_videos=False)
+    assert resolve_video_setting(sample_per_category=None, save_videos=True)
+
+
+def test_batched_noise_preserves_each_episode_rng_stream() -> None:
+    device = torch.device("cpu")
+    seeds = [13, 29, 41]
+    batched = _seeded_noise(
+        seeds,
+        batch_size=len(seeds),
+        device=device,
+        shape=(5, 7),
+    )
+    for index, seed in enumerate(seeds):
+        serial = _seeded_noise(seed, batch_size=1, device=device, shape=(5, 7))[0]
+        torch.testing.assert_close(batched[index], serial, rtol=0, atol=0)
+
+
+def test_batched_dmd2_noise_preserves_initial_and_renoise_streams() -> None:
+    device = torch.device("cpu")
+    seeds = [101, 303]
+    steps = 4
+    initial, generator, renoise = _dmd2_seeded_noises(
+        seeds,
+        batch_size=len(seeds),
+        device=device,
+        outer_steps=steps,
+    )
+    assert generator is None
+    assert renoise is not None
+    assert renoise.shape == (steps - 1, len(seeds), 50, 32)
+    for episode_index, seed in enumerate(seeds):
+        serial_initial, serial_generator, serial_renoise = _dmd2_seeded_noises(
+            seed,
+            batch_size=1,
+            device=device,
+            outer_steps=steps,
+        )
+        assert serial_generator is not None
+        assert serial_renoise is None
+        torch.testing.assert_close(
+            initial[episode_index], serial_initial[0], rtol=0, atol=0
+        )
+        for step_index in range(steps - 1):
+            expected = torch.randn(
+                1,
+                50,
+                32,
+                device=device,
+                generator=serial_generator,
+            )[0]
+            torch.testing.assert_close(
+                renoise[step_index, episode_index], expected, rtol=0, atol=0
+            )
+
+
 def test_external_rollout_round_bootstraps_without_collection(tmp_path, monkeypatch) -> None:
     source = tmp_path / "source" / "round-000000"
     source.mkdir(parents=True)
@@ -179,3 +263,36 @@ def test_external_rollout_round_bootstraps_without_collection(tmp_path, monkeypa
     assert not manager.should_refresh(499)
     assert manager.should_refresh(500)
     assert manager.metrics()["replay/bootstrap_source"] == str(source.resolve())
+
+
+def test_rollout_manager_propagates_serial_multi_gpu_workers(tmp_path) -> None:
+    manager = AsyncStudentRolloutManager(
+        config={
+            "training": {"seed": 7},
+            "backend": {},
+            "models": {},
+            "dataset": {},
+            "horizons": {"execution": 10},
+            "dmd2": {
+                "student_rollout_replay": {
+                    "capacity_replans": 80,
+                    "device": "cuda:2",
+                    "devices": ["cuda:2", "cuda:3"],
+                }
+            },
+        },
+        output=tmp_path / "run",
+    )
+    runtime = manager._rollout_config(tmp_path / "student.pt", tmp_path / "round")
+    assert runtime["collection"]["batch_size"] == 1
+    assert runtime["collection"]["devices"] == ["cuda:2", "cuda:3"]
+
+
+def test_paper_rollout_uses_independent_serial_gpu_shards() -> None:
+    from tmd_policy.config import load_config
+
+    root = Path(__file__).resolve().parents[1]
+    config = load_config(root / "configs/methods/dmd2_flow_paper.yaml")
+    replay = config["dmd2"]["student_rollout_replay"]
+    assert replay["batch_size"] == 1
+    assert replay["devices"] == ["cuda:2", "cuda:3", "cuda:4", "cuda:5"]
