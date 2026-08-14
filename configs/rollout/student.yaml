@@ -32,7 +32,7 @@ policy:
   checkpoint_sha256: auto
   device: cuda:0
 collection:
-  fps: 10
+  fps: 20
   devices: [cuda:0]
   batch_size: 1
   benchmark:
@@ -47,7 +47,7 @@ collection:
   validation_task_ids: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
   save_validation_videos: true
   video_camera: image
-  suite_max_episode_steps: {libero_spatial: 220, libero_object: 280, libero_goal: 300, libero_10: 520}
+  suite_max_episode_steps: {libero_spatial: 280, libero_object: 280, libero_goal: 300, libero_10: 520}
   collection_round: 0
 output:
   directory: artifacts/rollouts/all40_student
