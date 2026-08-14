@@ -59,10 +59,11 @@ dmd2:
     capacity_replans: 2400
     device: cuda:2
     devices: [cuda:2, cuda:3, cuda:4, cuda:5]
-    fps: 10
+    fps: 20
     base_reset_seed: 100000
-    max_episode_steps: 600
+    suite_max_episode_steps: {libero_spatial: 280, libero_object: 280, libero_goal: 300, libero_10: 520}
     batch_size: 1
+    validation_videos: {enabled: true, task_ids: [0], simulator_seed: 200000, init_state_index: 49, camera: image}
   vsd_time: {minimum_time: 0.001, maximum_time: 0.999, time_shift_gamma: 5.0}
   gan_time: {minimum_time: 0.001, maximum_time: 0.8, time_shift_gamma: 1.0}
   fake_score_time: {minimum_time: 0.001, maximum_time: 0.999, time_shift_gamma: 5.0}
@@ -76,5 +77,5 @@ dmd2:
     classification: PI0.5 prefix plus independently trainable PI0.5 suffix and asynchronous rollout; no fallback
     expected_vram: "cuda:0 >=24 GiB student; cuda:1 >=24 GiB teacher/fake suffix/features; cuda:2 >=7 GiB rollout inference"
 preflight:
-  minimum_total_memory_gib: {cuda:0: 23.5, cuda:1: 23.5, cuda:2: 7.0}
+  minimum_total_memory_gib: {cuda:0: 23.5, cuda:1: 23.5, cuda:2: 23.5}
 output: {directory: artifacts/training/dmd2_flow_paper}

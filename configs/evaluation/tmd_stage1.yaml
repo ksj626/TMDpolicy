@@ -8,14 +8,14 @@ dataset: {id: lerobot/libero, revision: a1aaacb7f6cd6ee5fb43120f673cebb0cfea7dd4
 horizons: {prediction: 50, execution: 10}
 policy: {method: tmd_stage1, device: cuda:0, checkpoint: artifacts/training/tmd_stage1/checkpoints/final.pt, checkpoint_sha256: auto}
 evaluation:
-  fps: 10
+  fps: 20
   benchmark:
     - {suite: libero_spatial, task_ids: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]}
     - {suite: libero_object, task_ids: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]}
     - {suite: libero_goal, task_ids: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]}
     - {suite: libero_10, task_ids: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]}
   reset_seeds: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
-  max_episode_steps: 600
+  suite_max_episode_steps: {libero_spatial: 220, libero_object: 280, libero_goal: 300, libero_10: 520}
   save_rollouts: false
   synchronize_cuda: true
 output: {directory: artifacts/evaluation/tmd_stage1}

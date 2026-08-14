@@ -28,6 +28,11 @@ counters, current learning rates, scheduler steps, phase/group gradient
 diagnostics, backward-simulation trace, score/DMD/GAN diagnostics, and fixed
 probe validation values are persisted in `metrics.jsonl`.
 
+DMD2 simulator validation is attached to each replay refresh without entering
+the replay buffer. Four fixed probe episodes (one per suite) are saved under the
+round's `validation_videos/` directory. Periodic refresh workers remain
+asynchronous with optimization.
+
 `TrainingProgram` defines phase/loss/optimizer hooks;
 `DeterministicBatchSampler` owns epoch permutations; `seed_everything` owns
 global seeds; `run_training` executes and checkpoints. `TrainingBundle` plus

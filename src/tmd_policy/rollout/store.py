@@ -44,6 +44,7 @@ class ReplanRecord:
     model_revision: str
     processor_revision: str
     dataset_revision: str
+    init_state_index: int | None = None
 
     def __post_init__(self) -> None:
         if self.suite not in {"libero_spatial", "libero_object", "libero_goal", "libero_10"}:
@@ -60,6 +61,8 @@ class ReplanRecord:
             )
         if not self.canonical_task_uid or not self.instruction:
             raise ValueError("canonical task UID and instruction must be nonempty")
+        if self.init_state_index is not None and self.init_state_index < 0:
+            raise ValueError("LIBERO init-state index must be nonnegative")
         if self.state.shape != (8,) or not torch.isfinite(self.state).all():
             raise ValueError("replan-start state must be finite [8]")
         if self.planned_actions.shape != (50, 7) or not torch.isfinite(self.planned_actions).all():
@@ -108,6 +111,7 @@ class RolloutEpisode:
             first.canonical_task_uid,
             first.instruction,
             first.reset_seed,
+            first.init_state_index,
             first.policy_checkpoint,
             first.policy_checkpoint_sha256,
             first.policy_version,
@@ -124,6 +128,7 @@ class RolloutEpisode:
                 value.canonical_task_uid,
                 value.instruction,
                 value.reset_seed,
+                value.init_state_index,
                 value.policy_checkpoint,
                 value.policy_checkpoint_sha256,
                 value.policy_version,
@@ -186,6 +191,7 @@ class RolloutStore:
             "canonical_task_uid": record.canonical_task_uid,
             "instruction": record.instruction,
             "reset_seed": record.reset_seed,
+            "init_state_index": record.init_state_index,
             "policy_checkpoint": record.policy_checkpoint,
             "policy_checkpoint_sha256": record.policy_checkpoint_sha256,
             "policy_version": record.policy_version,
@@ -226,6 +232,7 @@ class RolloutStore:
             "canonical_task_uid": first.canonical_task_uid,
             "instruction": first.instruction,
             "reset_seed": first.reset_seed,
+            "init_state_index": first.init_state_index,
             "success": last.success,
             "terminated": last.terminated,
             "truncated": last.truncated,

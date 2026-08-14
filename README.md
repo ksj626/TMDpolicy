@@ -202,7 +202,6 @@ bash scripts/evaluate/evaluate_dmd2.sh \
   --suite libero_spatial \
   --task-ids 0 5 \
   --reset-seeds 0 \
-  --max-episode-steps 600 \
   --output artifacts/evaluation/dmd2_step50_spatial_0_5
 ```
 

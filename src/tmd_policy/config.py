@@ -14,6 +14,11 @@ from typing import Any
 
 import yaml
 
+from tmd_policy.libero_protocol import (
+    LIBERO_SUITE_MAX_EPISODE_STEPS,
+    validate_suite_max_episode_steps,
+)
+
 LEROBOT_VERSION = "0.6.1"
 IMMUTABLE_REVISION = re.compile(r"^[0-9a-f]{40}$")
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -59,6 +64,27 @@ def _all_libero_tasks(benchmark: Any, context: str) -> None:
         actual[suite] = {int(task) for task in value.get("task_ids", [])}
     if actual != expected:
         raise ConfigError(f"{context} must cover each of the four suites and all 40 tasks exactly")
+
+
+def _libero_task_subset(benchmark: Any, context: str) -> None:
+    if not isinstance(benchmark, list) or not benchmark:
+        raise ConfigError(f"{context} must be a nonempty suite/task list")
+    seen: set[str] = set()
+    for value in benchmark:
+        suite = str(value.get("suite"))
+        task_ids = [int(task) for task in value.get("task_ids", [])]
+        if suite not in LIBERO_SUITE_MAX_EPISODE_STEPS or suite in seen:
+            raise ConfigError(f"{context} contains an unknown or repeated suite: {suite}")
+        if not task_ids or len(task_ids) != len(set(task_ids)) or not set(task_ids) <= set(range(10)):
+            raise ConfigError(f"{context} task_ids must be unique values in [0,9]")
+        seen.add(suite)
+
+
+def _suite_steps(value: Any, context: str) -> dict[str, int]:
+    try:
+        return validate_suite_max_episode_steps(value, context=context)
+    except (TypeError, ValueError) as error:
+        raise ConfigError(str(error)) from error
 
 
 def validate_config(config: dict[str, Any], *, expected_method: str | None = None) -> None:
@@ -279,7 +305,7 @@ def validate_config(config: dict[str, Any], *, expected_method: str | None = Non
                 {
                     "enabled", "initial_blocking", "refresh_generator_updates",
                     "capacity_replans", "device", "devices", "fps", "base_reset_seed",
-                    "max_episode_steps", "batch_size",
+                    "suite_max_episode_steps", "batch_size", "validation_videos",
                 },
                 "dmd2.student_rollout_replay",
             )
@@ -289,13 +315,37 @@ def validate_config(config: dict[str, Any], *, expected_method: str | None = Non
                 raise ConfigError("DMD2 student replay must collect a balanced initial rollout")
             if int(replay.get("capacity_replans", 0)) < 40:
                 raise ConfigError("DMD2 student replay capacity must be at least 40 replans")
-            if int(replay.get("max_episode_steps", 0)) < 1:
-                raise ConfigError("DMD2 student replay max_episode_steps must be positive")
+            _suite_steps(
+                _require(replay, "suite_max_episode_steps", "dmd2.student_rollout_replay"),
+                "dmd2.student_rollout_replay.suite_max_episode_steps",
+            )
             if int(replay.get("batch_size", 1)) < 1:
                 raise ConfigError("DMD2 student replay batch_size must be positive")
             devices = [str(value) for value in replay.get("devices", [replay["device"]])]
             if not devices or len(devices) != len(set(devices)):
                 raise ConfigError("DMD2 student replay devices must be unique and nonempty")
+            validation_videos = _require(
+                replay, "validation_videos", "dmd2.student_rollout_replay"
+            )
+            _reject_unknown(
+                validation_videos,
+                {"enabled", "task_ids", "simulator_seed", "init_state_index", "camera"},
+                "dmd2.student_rollout_replay.validation_videos",
+            )
+            video_tasks = [int(value) for value in validation_videos.get("task_ids", [])]
+            if bool(validation_videos.get("enabled", False)) and (
+                not video_tasks
+                or len(video_tasks) != len(set(video_tasks))
+                or not set(video_tasks) <= set(range(10))
+            ):
+                raise ConfigError("DMD2 validation-video task_ids must be unique values in [0,9]")
+            if min(
+                int(validation_videos.get("simulator_seed", -1)),
+                int(validation_videos.get("init_state_index", -1)),
+            ) < 0:
+                raise ConfigError("DMD2 validation-video seed/init-state index must be nonnegative")
+            if not str(validation_videos.get("camera", "")).strip():
+                raise ConfigError("DMD2 validation-video camera must be nonempty")
         if objective.get("fake_score_variant") != "pi05_clone" and "ablation" not in str(
             config.get("classification", "")
         ).lower():
@@ -365,6 +415,17 @@ def validate_config(config: dict[str, Any], *, expected_method: str | None = Non
 
     if method == "collect_student":
         collection = config["collection"]
+        _reject_unknown(
+            collection,
+            {
+                "fps", "devices", "batch_size", "benchmark", "train_reset_seeds",
+                "validation_reset_seeds", "train_init_state_indices",
+                "validation_init_state_indices", "validation_task_ids",
+                "suite_max_episode_steps", "collection_round", "parallel_worker",
+                "save_validation_videos", "video_camera",
+            },
+            "collection",
+        )
         benchmark = _require(collection, "benchmark", "collection")
         if bool(collection.get("parallel_worker", False)):
             seen: set[tuple[str, int]] = set()
@@ -385,6 +446,32 @@ def validate_config(config: dict[str, Any], *, expected_method: str | None = Non
         devices = [str(value) for value in collection.get("devices", [])]
         if len(devices) != len(set(devices)):
             raise ConfigError("collection.devices must be unique")
+        _suite_steps(
+            _require(collection, "suite_max_episode_steps", "collection"),
+            "collection.suite_max_episode_steps",
+        )
+        for split in ("train", "validation"):
+            seeds = [int(value) for value in _require(
+                collection, f"{split}_reset_seeds", "collection"
+            )]
+            indices = [int(value) for value in _require(
+                collection, f"{split}_init_state_indices", "collection"
+            )]
+            if len(seeds) != len(indices) or min(seeds + indices, default=0) < 0:
+                raise ConfigError(
+                    f"collection {split} simulator seeds and init-state indices must be "
+                    "nonnegative and paired one-to-one"
+                )
+        validation_tasks = [int(value) for value in collection.get("validation_task_ids", [])]
+        if validation_tasks and (
+            len(validation_tasks) != len(set(validation_tasks))
+            or not set(validation_tasks) <= set(range(10))
+        ):
+            raise ConfigError("collection.validation_task_ids must be unique values in [0,9]")
+        if bool(collection.get("save_validation_videos", False)) and not validation_tasks:
+            raise ConfigError("validation videos require collection.validation_task_ids")
+        if not str(collection.get("video_camera", "image")).strip():
+            raise ConfigError("collection.video_camera must be nonempty")
         _reject_unknown(
             config["policy"],
             {"method", "device", "checkpoint", "checkpoint_sha256"},
@@ -455,6 +542,29 @@ def validate_config(config: dict[str, Any], *, expected_method: str | None = Non
             if mode == "override" and "ablation" not in str(policy.get("classification", "")).lower():
                 raise ConfigError("SmolVLA override mode must be classified as an ablation")
 
+    if method == "evaluate_libero":
+        evaluation = _require(config, "evaluation", "config")
+        _reject_unknown(
+            evaluation,
+            {
+                "fps", "benchmark", "reset_seeds", "suite_max_episode_steps",
+                "save_rollouts", "synchronize_cuda",
+            },
+            "evaluation",
+        )
+        _libero_task_subset(
+            _require(evaluation, "benchmark", "evaluation"), "evaluation.benchmark"
+        )
+        reset_seeds = [int(value) for value in _require(evaluation, "reset_seeds", "evaluation")]
+        if not reset_seeds or len(reset_seeds) != len(set(reset_seeds)) or min(reset_seeds) < 0:
+            raise ConfigError("LIBERO reset_seeds must be unique nonnegative integers")
+        _suite_steps(
+            _require(evaluation, "suite_max_episode_steps", "evaluation"),
+            "evaluation.suite_max_episode_steps",
+        )
+        if int(evaluation.get("fps", 0)) < 1:
+            raise ConfigError("LIBERO evaluation.fps must be positive")
+
     if method == "evaluate_libero_plus":
         evaluation = _require(config, "evaluation", "config")
         _reject_unknown(
@@ -511,11 +621,10 @@ def validate_config(config: dict[str, Any], *, expected_method: str | None = Non
         reset_seeds = [int(value) for value in _require(evaluation, "reset_seeds", "evaluation")]
         if not reset_seeds or len(reset_seeds) != len(set(reset_seeds)) or min(reset_seeds) < 0:
             raise ConfigError("LIBERO-Plus reset_seeds must be unique nonnegative integers")
-        episode_steps = _require(evaluation, "suite_max_episode_steps", "evaluation")
-        if set(episode_steps) != set(expected_suites) or min(
-            int(value) for value in episode_steps.values()
-        ) < 1:
-            raise ConfigError("LIBERO-Plus suite_max_episode_steps must cover all four suites")
+        _suite_steps(
+            _require(evaluation, "suite_max_episode_steps", "evaluation"),
+            "evaluation.suite_max_episode_steps",
+        )
         if int(evaluation.get("fps", 0)) < 1:
             raise ConfigError("LIBERO-Plus evaluation.fps must be positive")
         if evaluation.get("control_mode", "relative") not in {"relative", "absolute"}:

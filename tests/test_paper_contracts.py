@@ -254,6 +254,7 @@ def _replan(*, environment_step: int, executed: int, truncated: bool) -> ReplanR
         canonical_task_uid="libero:00:test",
         instruction="test",
         reset_seed=3,
+        init_state_index=7,
         policy_checkpoint="checkpoint.pt",
         policy_checkpoint_sha256="a" * 64,
         policy_version="9",
@@ -316,6 +317,7 @@ def test_rollout_v2_round_trip_preserves_full_plans_observations_and_partial_pre
     values = store.load_replans(store.records()[0])
     assert report["replans"] == 2 and report["steps"] == 13
     assert values[1]["planned_actions"].shape == (50, 7)
+    assert values[1]["init_state_index"] == 7
     assert torch.equal(values[1]["planned_actions"], _replan(environment_step=10, executed=3, truncated=True).planned_actions)
     assert torch.equal(values[1]["state"], torch.zeros(8))
     assert values[1]["executed_actions"].shape == (3, 7)

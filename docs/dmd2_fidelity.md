@@ -63,6 +63,10 @@ policies, not a claim about the image-generation DMD2 paper. Before the first
 optimizer step, a lightweight student snapshot runs one rollout in every one of
 the 40 original LIBERO tasks. This initial collection is blocking, shards the
 tasks over the configured rollout GPUs, and streams progress to the terminal.
+Round `r` uses simulator seed `100000 + r` and fixed-init-state index `r % 50`
+for every task, preventing each fresh worker environment from silently returning
+to init state zero. These values are independent and persisted in the round
+configuration and rollout records.
 
 At the configured actual-generator-update interval, training writes another
 immutable student snapshot and starts a coordinator whose serial workers use the
@@ -80,6 +84,12 @@ Collector state is under
 logs, snapshots, completed rollout stores, and `status.json`. A failed periodic
 refresh is reported but does not destroy the last valid replay; a failed initial
 balanced collection aborts training.
+
+Every round also evaluates the snapshot on a fixed held-out probe: task 0 from
+each suite, simulator seed 200000, and init-state index 49. These four episodes
+are excluded from replay and saved under
+`student_rollout_replay/round-NNNNNN/validation_videos/`. Periodic rounds remain
+asynchronous, so video validation does not block optimization.
 
 ## Precision and gradient contract
 
@@ -160,7 +170,6 @@ bash scripts/evaluate/evaluate_dmd2.sh \
   --suite libero_spatial \
   --task-ids 0 5 \
   --reset-seeds 0 \
-  --max-episode-steps 600 \
   --output artifacts/evaluation/dmd2_step500_spatial_sample
 ```
 
@@ -279,8 +288,10 @@ dmd2:
 
 The coordinator assigns the 40 tasks across the listed devices, validates every
 worker store, and merges them into the same atomic round consumed by training.
-This does not change task balance, reset seeds, rollout horizons, RNG rules,
-replay schema, asynchronous refresh schedule, or expert-state GAN minibatches.
+The shared protocol uses per-suite `220/280/300/520` horizons. Simulator seeds,
+fixed-init-state indices, and held-out validation-video probes are explicit in
+each resolved round config; task balance, asynchronous refresh scheduling, and
+expert-state GAN minibatches remain unchanged.
 
 Primary references are the [DMD2 paper](https://arxiv.org/abs/2405.14867),
 [official DMD2 implementation](https://github.com/tianweiy/DMD2),

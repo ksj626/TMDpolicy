@@ -3,7 +3,7 @@
 Schema `tmdpolicy.libero-replans/v2` stores one payload per episode and one
 record per actual policy replan. Every record includes suite/local/global task
 identity, canonical UID/instruction, reset seed, behavior checkpoint and SHA,
-policy version/round, environment step, exact state, lossless camera tensors and
+fixed-init-state index, policy version/round, environment step, exact state, lossless camera tensors and
 shape/dtype/layout metadata, full canonical `[50,7]` plan, executed prefix and
 actions, terminal/truncation/success state, and immutable revisions.
 

@@ -20,6 +20,7 @@ from tqdm.auto import tqdm
 from tmd_policy.config import project_path, save_resolved_config
 from tmd_policy.backends.lerobot.compatibility import verify_installed_lerobot
 from tmd_policy.data.libero import load_episode_manifest
+from tmd_policy.libero_protocol import init_state_index_for_trial, set_fixed_init_state_index
 from tmd_policy.rollout import ReplanRecord, RolloutEpisode, RolloutStore
 
 from .policy import InferencePolicy, PI05InferencePolicy, load_inference_policy
@@ -103,6 +104,7 @@ def run_episode(
     *,
     instruction: str,
     reset_seed: int,
+    init_state_index: int | None = None,
     task_index: int,
     execution_horizon: int,
     max_steps: int,
@@ -113,6 +115,10 @@ def run_episode(
     from lerobot.envs.utils import NEW_ROLLOUT_OPTION
 
     policy.reset()
+    resolved_init_state = set_fixed_init_state_index(
+        env,
+        reset_seed if init_state_index is None else init_state_index,
+    )
     raw, info = env.reset(seed=[reset_seed], options={NEW_ROLLOUT_OPTION: True})
     observation = _canonical_observation(raw, env_processor)
     actions: list[torch.Tensor] = []
@@ -198,6 +204,7 @@ def run_episode(
                     canonical_task_uid=str(replan_metadata["canonical_task_uid"]),
                     instruction=instruction,
                     reset_seed=reset_seed,
+                    init_state_index=resolved_init_state,
                     policy_checkpoint=str(replan_metadata["policy_checkpoint"]),
                     policy_checkpoint_sha256=str(replan_metadata["policy_checkpoint_sha256"]),
                     policy_version=str(replan_metadata["policy_version"]),
@@ -228,7 +235,10 @@ def run_episode(
         if len(actions) > 1
         else torch.zeros(1)
     )
-    payload = {"replans": tuple(replan_records)}
+    payload = {
+        "replans": tuple(replan_records),
+        "init_state_index": resolved_init_state,
+    }
     metrics = {
         "success": successful,
         "terminated": terminated_value,
@@ -283,6 +293,7 @@ def _video_frame(raw: dict[str, Any], camera: str) -> np.ndarray:
         frame = frame[0]
     if frame.ndim != 3 or frame.shape[-1] != 3:
         raise RuntimeError(f"LIBERO video frame must be HWC RGB, got {frame.shape}")
+    frame = np.ascontiguousarray(frame[::-1, ::-1])
     return frame.astype(np.uint8, copy=False)
 
 
@@ -304,7 +315,7 @@ def run_episode_batch(
     max_steps: int,
     synchronize_cuda: bool,
     progress_description: str | None = None,
-    video_fps: int = 10,
+    video_fps: int,
     video_camera: str = "image",
 ) -> list[tuple[dict[str, Any], dict[str, Any]]]:
     """Run independent episodes with only policy inference batched together."""
@@ -327,6 +338,10 @@ def run_episode_batch(
     try:
         for spec in episode_specs:
             env = spec["env"]
+            resolved_init_state = set_fixed_init_state_index(
+                env,
+                int(spec.get("init_state_index", spec["reset_seed"])),
+            )
             raw, info = env.reset(
                 seed=[int(spec["reset_seed"])], options={NEW_ROLLOUT_OPTION: True}
             )
@@ -349,6 +364,7 @@ def run_episode_batch(
                     "replans": 0,
                     "video_path": str(video_path) if video_path is not None else None,
                     "video_writer": writer,
+                    "init_state_index": resolved_init_state,
                 }
             )
 
@@ -455,6 +471,7 @@ def run_episode_batch(
                             canonical_task_uid=str(metadata["canonical_task_uid"]),
                             instruction=str(state["spec"]["instruction"]),
                             reset_seed=int(state["spec"]["reset_seed"]),
+                            init_state_index=int(state["init_state_index"]),
                             policy_checkpoint=str(metadata["policy_checkpoint"]),
                             policy_checkpoint_sha256=str(metadata["policy_checkpoint_sha256"]),
                             policy_version=str(metadata["policy_version"]),
@@ -526,6 +543,7 @@ def run_episode_batch(
                 {
                     "replans": tuple(state["replan_records"]),
                     "video_path": state["video_path"],
+                    "init_state_index": int(state["init_state_index"]),
                 },
             )
         )
@@ -633,7 +651,7 @@ def evaluate_libero(config: dict[str, Any], output_dir: str | Path) -> dict[str,
             fps=int(evaluation.get("fps", 10)),
             observation_height=256,
             observation_width=256,
-            episode_length=int(evaluation["max_episode_steps"]),
+            episode_length=int(evaluation["suite_max_episode_steps"][suite]),
         )
         env_processor, _ = env_config.get_env_processors()
         environments = env_config.create_envs(n_envs=1, use_async_envs=False)
@@ -645,15 +663,17 @@ def evaluate_libero(config: dict[str, Any], output_dir: str | Path) -> dict[str,
                     manifest, suite, task_id, instruction
                 )
                 for reset_seed in evaluation["reset_seeds"]:
+                    init_state_index = init_state_index_for_trial(int(reset_seed))
                     metrics, payload = run_episode(
                         env,
                         env_processor,
                         policy,
                         instruction=instruction,
                         reset_seed=int(reset_seed),
+                        init_state_index=init_state_index,
                         task_index=dataset_task_index,
                         execution_horizon=int(config["horizons"]["execution"]),
-                        max_steps=int(evaluation["max_episode_steps"]),
+                        max_steps=int(evaluation["suite_max_episode_steps"][suite]),
                         synchronize_cuda=bool(evaluation.get("synchronize_cuda", True)),
                         progress_description=f"{suite}:{task_id} seed={int(reset_seed)}",
                         replan_metadata={
@@ -676,6 +696,7 @@ def evaluate_libero(config: dict[str, Any], output_dir: str | Path) -> dict[str,
                         "canonical_task_uid": task_uid,
                         "instruction": instruction,
                         "reset_seed": int(reset_seed),
+                        "init_state_index": int(payload["init_state_index"]),
                         **metrics,
                     }
                     episodes.append(row)
@@ -749,15 +770,18 @@ def _collect_student_rollouts_serial(config: dict[str, Any], output_dir: str | P
                 expected_source_hashes=config["backend"].get("expected_source_hashes")
             ),
             "models": config["models"],
+            "seed_protocol": {
+                "simulator_seed_field": "reset_seed",
+                "init_state_index_field": "init_state_index",
+            },
         }
     )
     save_resolved_config(config, output / "resolved_config.yaml")
+    validation_task_ids = {int(value) for value in collection["validation_task_ids"]}
     total_episodes = sum(
-        len(suite_spec["task_ids"])
-        * (
-            len(collection["train_reset_seeds"])
-            + len(collection["validation_reset_seeds"])
-        )
+        len(suite_spec["task_ids"]) * len(collection["train_reset_seeds"])
+        + len(validation_task_ids.intersection(int(value) for value in suite_spec["task_ids"]))
+        * len(collection["validation_reset_seeds"])
         for suite_spec in collection["benchmark"]
     )
     episode_progress = tqdm(
@@ -779,7 +803,7 @@ def _collect_student_rollouts_serial(config: dict[str, Any], output_dir: str | P
             fps=int(collection.get("fps", 10)),
             observation_height=256,
             observation_width=256,
-            episode_length=int(collection["max_episode_steps"]),
+            episode_length=int(collection["suite_max_episode_steps"][suite]),
         )
         env_processor, _ = env_config.get_env_processors()
         environments = env_config.create_envs(n_envs=1, use_async_envs=False)
@@ -792,13 +816,28 @@ def _collect_student_rollouts_serial(config: dict[str, Any], output_dir: str | P
                     manifest, suite, int(task_id), instruction
                 )
                 task_metadata[task_id] = (instruction, dataset_task_index, task_uid)
-            for split, seeds in (
-                ("train", collection["train_reset_seeds"]),
-                ("validation", collection["validation_reset_seeds"]),
+            for split, seeds, init_state_indices in (
+                (
+                    "train",
+                    collection["train_reset_seeds"],
+                    collection["train_init_state_indices"],
+                ),
+                (
+                    "validation",
+                    collection["validation_reset_seeds"],
+                    collection["validation_init_state_indices"],
+                ),
             ):
-                for reset_seed in seeds:
-                    for chunk_start in range(0, len(task_ids), batch_size):
-                        chunk = task_ids[chunk_start : chunk_start + batch_size]
+                split_task_ids = (
+                    task_ids
+                    if split == "train"
+                    else [task_id for task_id in task_ids if task_id in validation_task_ids]
+                )
+                for reset_seed, init_state_index in zip(
+                    seeds, init_state_indices, strict=True
+                ):
+                    for chunk_start in range(0, len(split_task_ids), batch_size):
+                        chunk = split_task_ids[chunk_start : chunk_start + batch_size]
                         specs: list[dict[str, Any]] = []
                         for task_id in chunk:
                             instruction, dataset_task_index, task_uid = task_metadata[task_id]
@@ -807,6 +846,7 @@ def _collect_student_rollouts_serial(config: dict[str, Any], output_dir: str | P
                                     "env": environments[suite][task_id],
                                     "instruction": instruction,
                                     "reset_seed": int(reset_seed),
+                                    "init_state_index": int(init_state_index),
                                     "task_index": dataset_task_index,
                                     "replan_metadata": {
                                         "suite": suite,
@@ -824,7 +864,18 @@ def _collect_student_rollouts_serial(config: dict[str, Any], output_dir: str | P
                                         "processor_revision": identity["processor_revision"],
                                         "dataset_revision": config["dataset"]["revision"],
                                     },
-                                    "video_path": None,
+                                    "video_path": (
+                                        output
+                                        / "validation_videos"
+                                        / suite
+                                        / (
+                                            f"task-{task_id:02d}_seed-{int(reset_seed)}_"
+                                            f"init-{int(init_state_index):02d}.mp4"
+                                        )
+                                        if split == "validation"
+                                        and bool(collection["save_validation_videos"])
+                                        else None
+                                    ),
                                 }
                             )
                         results = run_episode_batch(
@@ -832,13 +883,14 @@ def _collect_student_rollouts_serial(config: dict[str, Any], output_dir: str | P
                             env_processor,
                             policy,
                             execution_horizon=int(config["horizons"]["execution"]),
-                            max_steps=int(collection["max_episode_steps"]),
+                            max_steps=int(collection["suite_max_episode_steps"][suite]),
                             synchronize_cuda=True,
                             progress_description=(
                                 f"{suite} {split} seed={int(reset_seed)} "
                                 f"batch={chunk_start // batch_size + 1}"
                             ),
                             video_fps=int(collection.get("fps", 10)),
+                            video_camera=str(collection.get("video_camera", "image")),
                         )
                         for task_id, (_, payload) in zip(chunk, results, strict=True):
                             store.append(
@@ -859,6 +911,10 @@ def _collect_student_rollouts_serial(config: dict[str, Any], output_dir: str | P
                     env.close()
     episode_progress.close()
     report = store.validate()
+    report["validation_videos"] = [
+        str(path.relative_to(output))
+        for path in sorted((output / "validation_videos").rglob("*.mp4"))
+    ] if (output / "validation_videos").exists() else []
     (output / "collection_report.json").write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return report
 
@@ -940,10 +996,12 @@ def _collect_student_rollouts_multi_gpu(
         )
         processes.append((worker_index, device, worker_output, process, log_handle))
 
-    episodes_per_task = len(collection["train_reset_seeds"]) + len(
-        collection["validation_reset_seeds"]
+    validation_task_ids = {int(value) for value in collection["validation_task_ids"]}
+    validation_pairs = sum(task_id in validation_task_ids for _, task_id in task_pairs)
+    total_episodes = (
+        len(task_pairs) * len(collection["train_reset_seeds"])
+        + validation_pairs * len(collection["validation_reset_seeds"])
     )
-    total_episodes = len(task_pairs) * episodes_per_task
     progress = tqdm(
         total=total_episodes,
         desc=f"student rollout {worker_count}-GPU shards",
@@ -1026,7 +1084,18 @@ def _collect_student_rollouts_multi_gpu(
         worker_name = f"worker-{worker_index:02d}"
         shutil.copy2(workers_root / f"{worker_name}.yaml", logs / f"{worker_name}.yaml")
         shutil.copy2(workers_root / f"{worker_name}.log", logs / f"{worker_name}.log")
+        worker_videos = workers_root / worker_name / "validation_videos"
+        if worker_videos.exists():
+            shutil.copytree(
+                worker_videos,
+                output / "validation_videos",
+                dirs_exist_ok=True,
+            )
     report = store.validate()
+    report["validation_videos"] = [
+        str(path.relative_to(output))
+        for path in sorted((output / "validation_videos").rglob("*.mp4"))
+    ] if (output / "validation_videos").exists() else []
     (output / "collection_report.json").write_text(
         json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )

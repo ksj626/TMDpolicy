@@ -12,7 +12,7 @@ policy:
   checkpoint: artifacts/training/dmd2_flow_paper/inference_checkpoints/final.pt
   checkpoint_sha256: auto
 evaluation:
-  fps: 10
+  fps: 20
   suites: [libero_spatial, libero_object, libero_goal, libero_10]
   task_ids: null
   sample_per_category: null
@@ -22,7 +22,7 @@ evaluation:
   video_camera: image
   reset_seeds: [0]
   suite_max_episode_steps:
-    libero_spatial: 280
+    libero_spatial: 220
     libero_object: 280
     libero_goal: 300
     libero_10: 520

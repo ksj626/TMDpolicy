@@ -15,7 +15,9 @@ checkpoint as a one-step clean predictor rather than switching to Euler.
 
 The environment loop uses `policy.device`, replans after the execution horizon,
 and records immutable locator/revisions, step count, coordinate contract, and
-seed rule. Comparisons fail unless every arm has identical
+seed rule. The reportable suite horizons are fixed to Spatial/Object/Goal/Long
+`220/280/300/520`. Simulator RNG seed and fixed-init-state index are explicit;
+evaluation trial `k` uses init state `k % 50`. Comparisons fail unless every arm has identical
 `(suite,task_id,reset_seed)` keys, then report paired overall/suite/task results.
 
 LIBERO-Plus runs in the separate `tmdpolicy-libero-plus` environment because its

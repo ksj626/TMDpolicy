@@ -12,6 +12,11 @@ from tmd_policy.evaluation.libero_plus import (
     summarize_libero_plus,
 )
 from tmd_policy.evaluation.policy import _dmd2_seeded_noises, _seeded_noise
+from tmd_policy.libero_protocol import (
+    LIBERO_SUITE_MAX_EPISODE_STEPS,
+    init_state_index_for_trial,
+    set_fixed_init_state_index,
+)
 from tmd_policy.training.rollout_replay import AsyncStudentRolloutManager, BalancedStudentReplay
 
 
@@ -37,6 +42,29 @@ def test_balanced_student_replay_round_robins_across_task_queues() -> None:
     assert batch["observation.images.image"].shape == (4, 3, 4, 4)
     assert batch["action_is_pad"].shape == (4, 50)
     assert bool(batch["_student_replay_batch"])
+
+
+def test_libero_protocol_uses_suite_horizons_and_explicit_fixed_init_states() -> None:
+    assert LIBERO_SUITE_MAX_EPISODE_STEPS == {
+        "libero_spatial": 220,
+        "libero_object": 280,
+        "libero_goal": 300,
+        "libero_10": 520,
+    }
+    assert init_state_index_for_trial(0) == 0
+    assert init_state_index_for_trial(49) == 49
+    assert init_state_index_for_trial(50) == 0
+
+    class VectorEnv:
+        def __init__(self) -> None:
+            self.values = []
+
+        def set_attr(self, name, value):
+            self.values.append((name, value))
+
+    env = VectorEnv()
+    assert set_fixed_init_state_index(env, 51) == 1
+    assert env.values == [("init_state_id", 1)]
 
 
 def test_libero_plus_summary_covers_10030_contract() -> None:
@@ -286,9 +314,19 @@ def test_rollout_manager_propagates_serial_multi_gpu_workers(tmp_path) -> None:
     runtime = manager._rollout_config(tmp_path / "student.pt", tmp_path / "round")
     assert runtime["collection"]["batch_size"] == 1
     assert runtime["collection"]["devices"] == ["cuda:2", "cuda:3"]
+    assert runtime["collection"]["train_reset_seeds"] == [100_000]
+    assert runtime["collection"]["train_init_state_indices"] == [0]
+    assert runtime["collection"]["suite_max_episode_steps"] == (
+        LIBERO_SUITE_MAX_EPISODE_STEPS
+    )
+
+    manager._round = 51
+    later = manager._rollout_config(tmp_path / "student.pt", tmp_path / "later")
+    assert later["collection"]["train_reset_seeds"] == [100_051]
+    assert later["collection"]["train_init_state_indices"] == [1]
 
 
-def test_paper_rollout_uses_independent_serial_gpu_shards() -> None:
+def test_paper_rollout_uses_independent_serial_gpu_shards(tmp_path: Path) -> None:
     from tmd_policy.config import load_config
 
     root = Path(__file__).resolve().parents[1]
@@ -296,3 +334,32 @@ def test_paper_rollout_uses_independent_serial_gpu_shards() -> None:
     replay = config["dmd2"]["student_rollout_replay"]
     assert replay["batch_size"] == 1
     assert replay["devices"] == ["cuda:2", "cuda:3", "cuda:4", "cuda:5"]
+    assert replay["suite_max_episode_steps"] == LIBERO_SUITE_MAX_EPISODE_STEPS
+    assert replay["validation_videos"] == {
+        "enabled": True,
+        "task_ids": [0],
+        "simulator_seed": 200_000,
+        "init_state_index": 49,
+        "camera": "image",
+    }
+    manager = AsyncStudentRolloutManager(
+        config=config,
+        output=tmp_path / "paper",
+    )
+    runtime = manager._rollout_config(tmp_path / "student.pt", tmp_path / "round")
+    collection = runtime["collection"]
+    assert collection["validation_reset_seeds"] == [200_000]
+    assert collection["validation_init_state_indices"] == [49]
+    assert collection["validation_task_ids"] == [0]
+    assert collection["save_validation_videos"]
+
+
+def test_all_evaluation_configs_use_the_fixed_suite_horizons() -> None:
+    from tmd_policy.config import load_config
+
+    root = Path(__file__).resolve().parents[1]
+    for path in sorted((root / "configs/evaluation").glob("*.yaml")):
+        config = load_config(path)
+        assert config["evaluation"]["suite_max_episode_steps"] == (
+            LIBERO_SUITE_MAX_EPISODE_STEPS
+        )

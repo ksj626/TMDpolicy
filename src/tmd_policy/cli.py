@@ -152,7 +152,10 @@ def _evaluate(args: argparse.Namespace) -> int:
     if args.max_episode_steps is not None:
         if args.max_episode_steps < 1:
             raise ValueError("--max-episode-steps must be positive")
-        evaluation["max_episode_steps"] = int(args.max_episode_steps)
+        evaluation["suite_max_episode_steps"] = {
+            suite: int(args.max_episode_steps)
+            for suite in evaluation["suite_max_episode_steps"]
+        }
         sampled = True
     if sampled:
         config["classification"] = f"{config['classification']}; CLI-scoped sampled evaluation"

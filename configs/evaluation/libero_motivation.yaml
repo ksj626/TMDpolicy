@@ -34,7 +34,7 @@ policy:
   outer_steps: 4
   inner_steps: 2
 evaluation:
-  fps: 10
+  fps: 20
   benchmark:
     - suite: libero_spatial
       task_ids: [0, 2, 5, 8]
@@ -45,7 +45,7 @@ evaluation:
     - suite: libero_10
       task_ids: [0, 2, 5, 8]
   reset_seeds: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
-  max_episode_steps: 600
+  suite_max_episode_steps: {libero_spatial: 220, libero_object: 280, libero_goal: 300, libero_10: 520}
   save_rollouts: true
   synchronize_cuda: true
 output:

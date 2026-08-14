@@ -14,6 +14,10 @@ from typing import Any
 import torch
 
 from tmd_policy.config import save_resolved_config
+from tmd_policy.libero_protocol import (
+    LIBERO_SUITE_MAX_EPISODE_STEPS,
+    init_state_index_for_trial,
+)
 from tmd_policy.rollout import RolloutStore
 
 
@@ -171,6 +175,16 @@ class AsyncStudentRolloutManager:
 
     def _rollout_config(self, checkpoint: Path, output: Path) -> dict[str, Any]:
         round_index = self._round
+        simulator_seed = int(self.settings.get("base_reset_seed", 100_000)) + round_index
+        init_state_index = init_state_index_for_trial(round_index)
+        validation_videos = {
+            "enabled": False,
+            "task_ids": [],
+            "simulator_seed": 200_000,
+            "init_state_index": 49,
+            "camera": "image",
+            **dict(self.settings.get("validation_videos", {})),
+        }
         devices = [
             str(value)
             for value in self.settings.get("devices", [self.settings["device"]])
@@ -192,10 +206,32 @@ class AsyncStudentRolloutManager:
                 "fps": int(self.settings.get("fps", 10)),
                 "benchmark": _ALL40,
                 "train_reset_seeds": [
-                    int(self.settings.get("base_reset_seed", 100_000)) + round_index
+                    simulator_seed
                 ],
-                "validation_reset_seeds": [],
-                "max_episode_steps": int(self.settings.get("max_episode_steps", 600)),
+                "train_init_state_indices": [init_state_index],
+                "validation_reset_seeds": (
+                    [int(validation_videos["simulator_seed"])]
+                    if bool(validation_videos["enabled"])
+                    else []
+                ),
+                "validation_init_state_indices": (
+                    [int(validation_videos["init_state_index"])]
+                    if bool(validation_videos["enabled"])
+                    else []
+                ),
+                "validation_task_ids": (
+                    [int(value) for value in validation_videos["task_ids"]]
+                    if bool(validation_videos["enabled"])
+                    else []
+                ),
+                "save_validation_videos": bool(validation_videos["enabled"]),
+                "video_camera": str(validation_videos["camera"]),
+                "suite_max_episode_steps": dict(
+                    self.settings.get(
+                        "suite_max_episode_steps",
+                        LIBERO_SUITE_MAX_EPISODE_STEPS,
+                    )
+                ),
                 "batch_size": 1,
                 "devices": devices,
                 "collection_round": round_index,

@@ -22,6 +22,7 @@ import yaml
 from tqdm.auto import tqdm
 
 from tmd_policy.config import save_resolved_config
+from tmd_policy.libero_protocol import init_state_index_for_trial
 
 from .libero import run_episode_batch, wilson_interval
 from .policy import load_inference_policy
@@ -480,6 +481,7 @@ def _evaluate_libero_plus_serial(
                                 "env": env,
                                 "instruction": str(task.language),
                                 "reset_seed": reset_seed,
+                                "init_state_index": init_state_index_for_trial(reset_seed),
                                 "task_index": SUITE_OFFSETS[suite] + task_id,
                                 "replan_metadata": None,
                                 "video_path": video_path,
@@ -516,6 +518,7 @@ def _evaluate_libero_plus_serial(
                         "category": str(metadata["category"]),
                         "difficulty_level": int(metadata["difficulty_level"]),
                         "reset_seed": reset_seed,
+                        "init_state_index": int(payload["init_state_index"]),
                         "video": (
                             str(Path(video_path).relative_to(output)) if video_path else None
                         ),

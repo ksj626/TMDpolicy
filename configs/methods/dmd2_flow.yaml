@@ -70,10 +70,11 @@ dmd2:
     capacity_replans: 8000
     device: cuda:2
     devices: [cuda:2, cuda:3, cuda:4, cuda:5]
-    fps: 10
+    fps: 20
     base_reset_seed: 100000
-    max_episode_steps: 600
+    suite_max_episode_steps: {libero_spatial: 220, libero_object: 280, libero_goal: 300, libero_10: 520}
     batch_size: 1
+    validation_videos: {enabled: true, task_ids: [0], simulator_seed: 200000, init_state_index: 49, camera: image}
   vsd_time: {minimum_time: 0.001, maximum_time: 0.999, time_shift_gamma: 5.0}
   gan_time: {minimum_time: 0.001, maximum_time: 0.999, time_shift_gamma: 5.0}
   fake_score_time: {minimum_time: 0.001, maximum_time: 0.999, time_shift_gamma: 5.0}
