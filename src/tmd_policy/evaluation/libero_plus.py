@@ -52,6 +52,12 @@ CATEGORY_NAMES = (
 )
 
 
+def _difficulty_level(value: Any) -> int | None:
+    """Preserve LIBERO-Plus variants whose upstream difficulty is unassigned."""
+
+    return None if value is None else int(value)
+
+
 def resolve_video_setting(
     *, sample_per_category: int | None, save_videos: bool | None
 ) -> bool:
@@ -516,7 +522,9 @@ def _evaluate_libero_plus_serial(
                         "task_name": str(task.name),
                         "instruction": str(task.language),
                         "category": str(metadata["category"]),
-                        "difficulty_level": int(metadata["difficulty_level"]),
+                        "difficulty_level": _difficulty_level(
+                            metadata.get("difficulty_level")
+                        ),
                         "reset_seed": reset_seed,
                         "init_state_index": int(payload["init_state_index"]),
                         "video": (

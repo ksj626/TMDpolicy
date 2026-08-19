@@ -170,6 +170,19 @@ bash scripts/evaluate/evaluate_libero_plus_dmd2.sh \
   --resume
 ```
 
+Evaluate frozen upstream baselines under the same LIBERO-Plus contract:
+
+```bash
+# Select one of: smolvla10, smolvla4, smolvla1, pi05, all
+bash scripts/evaluate/evaluate_libero_plus_baselines.sh smolvla10 \
+  --devices cuda:2 cuda:3 cuda:4 cuda:5
+
+# Resume all four independent default output directories sequentially.
+bash scripts/evaluate/evaluate_libero_plus_baselines.sh all \
+  --devices cuda:2 cuda:3 cuda:4 cuda:5 \
+  --resume
+```
+
 Run a category-balanced 70-episode performance check (10 tasks from each of
 the seven LIBERO-Plus perturbation categories):
 

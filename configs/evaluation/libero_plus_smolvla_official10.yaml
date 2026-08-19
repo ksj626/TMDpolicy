@@ -1,0 +1,25 @@
+method: evaluate_libero_plus
+classification: full 10,030-task LIBERO-Plus official SmolVLA 10-step evaluation
+backend: {lerobot_version: "0.6.1", expected_source_hashes: null, local_files_only: false}
+models:
+  student: {id: lerobot/smolvla_libero, revision: 31d453f7edd78c839a8bbc39744a292686daf0de, processor_revision: 31d453f7edd78c839a8bbc39744a292686daf0de}
+  teacher: {id: lerobot/pi05_libero_finetuned, revision: 8e174154ef5f6c60a8da12ae99c303d8963138c1, processor_revision: 8e174154ef5f6c60a8da12ae99c303d8963138c1}
+dataset: {id: lerobot/libero, revision: a1aaacb7f6cd6ee5fb43120f673cebb0cfea7dd4, cache: .cache/lerobot, manifest: artifacts/data/libero_expert/episode_manifest.json, validation_fraction: 0.1, test_fraction: 0.1, split_seed: 17, download_videos: true, video_backend: pyav}
+horizons: {prediction: 50, execution: 10}
+policy: {method: smolvla, device: cuda:0, sampler_mode: official}
+evaluation:
+  fps: 20
+  suites: [libero_spatial, libero_object, libero_goal, libero_10]
+  task_ids: null
+  sample_per_category: null
+  sample_seed: 0
+  batch_size: 1
+  save_videos: null
+  video_camera: image
+  reset_seeds: [0]
+  suite_max_episode_steps: {libero_spatial: 280, libero_object: 280, libero_goal: 300, libero_10: 520}
+  expected_total_tasks: 10030
+  synchronize_cuda: true
+  control_mode: relative
+  hard_reset: true
+output: {directory: artifacts/evaluation/libero_plus_smolvla_official10}

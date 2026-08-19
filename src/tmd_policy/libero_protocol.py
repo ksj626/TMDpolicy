@@ -12,11 +12,10 @@ LIBERO_SUITES = (
     "libero_10",
 )
 
-# Common OpenVLA-style benchmark horizons. LeRobot 0.6.1 uses 280 for
-# libero_spatial; this project intentionally fixes the cross-method protocol to
-# the values below and records them in every resolved run configuration.
+# Cross-method benchmark horizons, fixed at LeRobot's 280-step spatial protocol
+# and recorded in every resolved run configuration.
 LIBERO_SUITE_MAX_EPISODE_STEPS = {
-    "libero_spatial": 220,
+    "libero_spatial": 280,
     "libero_object": 280,
     "libero_goal": 300,
     "libero_10": 520,

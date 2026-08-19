@@ -7,6 +7,7 @@ import torch
 from tmd_policy.evaluation.libero_plus import (
     CATEGORY_NAMES,
     TOTAL_TASKS,
+    _difficulty_level,
     resolve_video_setting,
     select_category_sample,
     summarize_libero_plus,
@@ -46,7 +47,7 @@ def test_balanced_student_replay_round_robins_across_task_queues() -> None:
 
 def test_libero_protocol_uses_suite_horizons_and_explicit_fixed_init_states() -> None:
     assert LIBERO_SUITE_MAX_EPISODE_STEPS == {
-        "libero_spatial": 220,
+        "libero_spatial": 280,
         "libero_object": 280,
         "libero_goal": 300,
         "libero_10": 520,
@@ -99,6 +100,24 @@ def test_libero_plus_summary_covers_10030_contract() -> None:
     assert set(summary["per_category"]) == {"Camera Viewpoints", "Sensor Noise"}
 
 
+def test_libero_plus_summary_accepts_unassigned_upstream_difficulty() -> None:
+    assert _difficulty_level(None) is None
+    assert _difficulty_level(3) == 3
+    row = {
+        "suite": "libero_goal",
+        "category": "Light Conditions",
+        "difficulty_level": None,
+        "success": False,
+        "model_latency_s": [0.1],
+        "mean_model_latency_s": 0.1,
+        "mean_environment_latency_s": 0.01,
+        "mean_action_l2": 1.0,
+        "mean_action_delta_l2": 0.2,
+    }
+    summary = summarize_libero_plus([row], full_benchmark=False)
+    assert summary["per_difficulty"]["None"]["episodes"] == 1
+
+
 def test_libero_plus_config_and_cli_are_wired() -> None:
     from tmd_policy.cli import build_parser
     from tmd_policy.config import load_config
@@ -128,6 +147,35 @@ def test_libero_plus_config_and_cli_are_wired() -> None:
     )
     assert args.task_ids == [0, 3]
     assert args.resume
+
+    expected_baselines = {
+        "libero_plus_smolvla_official10.yaml": {
+            "method": "smolvla",
+            "sampler_mode": "official",
+        },
+        "libero_plus_smolvla_4step_ablation.yaml": {
+            "method": "smolvla",
+            "sampler_mode": "override",
+            "num_steps": 4,
+        },
+        "libero_plus_smolvla_1step_ablation.yaml": {
+            "method": "smolvla",
+            "sampler_mode": "override",
+            "num_steps": 1,
+        },
+        "libero_plus_pi05_official.yaml": {
+            "method": "pi05",
+            "num_steps": 10,
+        },
+    }
+    for filename, expected_policy in expected_baselines.items():
+        baseline = load_config(
+            root / "configs/evaluation" / filename,
+            expected_method="evaluate_libero_plus",
+        )
+        assert baseline["evaluation"] == config["evaluation"]
+        for key, value in expected_policy.items():
+            assert baseline["policy"][key] == value
 
     sampled = build_parser().parse_args(
         [
