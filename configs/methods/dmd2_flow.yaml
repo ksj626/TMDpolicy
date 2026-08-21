@@ -1,5 +1,5 @@
 method: dmd2_flow
-classification: TMD-paper direct DMD2-v action-policy baseline
+classification: DMD2-v action-policy with full SmolVLA action-expert fine-tuning
 backend:
   lerobot_version: "0.6.1"
   expected_source_hashes: null
@@ -29,10 +29,10 @@ horizons:
 training:
   seed: 7
   device: cuda:0
-  batch_size: 4
-  num_workers: 0
+  batch_size: 8
+  num_workers: 4
   mixed_precision: bf16
-  gradient_accumulation: 8
+  gradient_accumulation: 4
   gradient_clip_norm: 1.0
   learning_rate: 1.0e-5
   weight_decay: 1.0e-4
@@ -41,22 +41,22 @@ training:
   warmup_steps: 1000
   minimum_lr_scale: 0.05
   max_steps: 100000
-  validation_interval: 500
+  validation_interval: 50
   validation_batches: 8
   checkpoint_interval: 1000
   inference_checkpoint_interval: 10
   diagnostics_interval: 10
 dmd2:
-  student_fine_tuning: head_only
+  student_fine_tuning: action_expert
   fake_score_variant: pi05_clone
   fake_updates_per_generator: 5
-  guidance_classifier_weight: 1.0
+  guidance_classifier_weight: 0.01
   student_training_mode: backward_simulation_denoise_renoise
   discrete_outer_steps: 4
   student_time_shift_gamma: 5.0
   generator_learning_rate: 1.0e-5
-  fake_score_learning_rate: 1.0e-4
-  discriminator_learning_rate: 1.0e-4
+  fake_score_learning_rate: 1.0e-5
+  discriminator_learning_rate: 1.0e-5
   gan_weight: 0.003
   vsd_normalization: dmd2_teacher_residual_mean_abs
   vsd_normalization_epsilon: 1.0e-6
@@ -66,8 +66,8 @@ dmd2:
   student_rollout_replay:
     enabled: true
     initial_blocking: true
-    refresh_generator_updates: 500
-    capacity_replans: 8000
+    refresh_generator_updates: 50
+    capacity_replans: 2400
     device: cuda:2
     devices: [cuda:2, cuda:3, cuda:4, cuda:5]
     fps: 20
@@ -76,7 +76,7 @@ dmd2:
     batch_size: 1
     validation_videos: {enabled: true, task_ids: [0], simulator_seed: 200000, init_state_index: 49, camera: image}
   vsd_time: {minimum_time: 0.001, maximum_time: 0.999, time_shift_gamma: 5.0}
-  gan_time: {minimum_time: 0.001, maximum_time: 0.999, time_shift_gamma: 5.0}
+  gan_time: {minimum_time: 0.001, maximum_time: 0.8, time_shift_gamma: 1.0}
   fake_score_time: {minimum_time: 0.001, maximum_time: 0.999, time_shift_gamma: 5.0}
   discriminator:
     variant: pi05_intermediate_features
@@ -85,13 +85,9 @@ dmd2:
     hidden_dim: 512
     time_embedding_dim: 32
   resource_estimate:
-    pi05_frozen_weights_and_cache_gib: 11-14
-    student_trainable_with_optimizer_gib: 8-14
-    trainable_pi05_suffix_and_optimizer_gib: 8-14
-    discriminator_and_optimizer_gib: 1-2
-    activations_gib: 8-18
-    recommendation: two 24+ GiB training GPUs plus one 7+ GiB asynchronous rollout GPU
+    classification: 99.85M-parameter SmolVLA action expert plus PI0.5 teacher/fake suffix and asynchronous rollout; no fallback
+    expected_vram: cuda:0 >=24 GiB action-expert student; cuda:1 >=24 GiB teacher/fake suffix/features; cuda:2 >=7 GiB rollout inference
 output:
-  directory: artifacts/training/dmd2_flow
+  directory: artifacts/training/dmd2_flow_paper
 preflight:
-  minimum_total_memory_gib: {cuda:0: 23.5, cuda:1: 23.5, cuda:2: 7.0}
+  minimum_total_memory_gib: {cuda:0: 23.5, cuda:1: 23.5, cuda:2: 23.5}

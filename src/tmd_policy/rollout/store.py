@@ -1,4 +1,4 @@
-"""Atomic versioned LIBERO replan-record storage for occupancy estimation."""
+"""Atomic versioned LIBERO replan-record storage for DMD2 student replay."""
 
 from __future__ import annotations
 

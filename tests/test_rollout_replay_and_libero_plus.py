@@ -378,7 +378,7 @@ def test_paper_rollout_uses_independent_serial_gpu_shards(tmp_path: Path) -> Non
     from tmd_policy.config import load_config
 
     root = Path(__file__).resolve().parents[1]
-    config = load_config(root / "configs/methods/dmd2_flow_paper.yaml")
+    config = load_config(root / "configs/methods/dmd2_flow.yaml")
     replay = config["dmd2"]["student_rollout_replay"]
     assert replay["batch_size"] == 1
     assert replay["devices"] == ["cuda:2", "cuda:3", "cuda:4", "cuda:5"]

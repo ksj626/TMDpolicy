@@ -86,38 +86,6 @@ def executable_coordinate_mask(valid_timesteps: Tensor, width: int, *, executabl
     return valid_timesteps.bool().unsqueeze(-1) & dimensions[None, None]
 
 
-def stopped_l1_score_direction(
-    fake: Tensor,
-    teacher: Tensor,
-    valid_coordinates: Tensor,
-    *,
-    epsilon: float,
-) -> tuple[Tensor, dict[str, Tensor]]:
-    """TMD-v stopped fake-minus-teacher direction with per-sample valid L1 norm."""
-
-    if fake.shape != teacher.shape or fake.shape != valid_coordinates.shape:
-        raise ValueError("fake, teacher, and valid-coordinate tensors must have identical shapes")
-    if epsilon <= 0:
-        raise ValueError("normalization epsilon must be positive")
-    mask = valid_coordinates.to(fake.dtype)
-    count = mask.flatten(1).sum(dim=1)
-    if torch.any(count == 0):
-        raise ValueError("each sample needs at least one valid executable coordinate")
-    difference = (fake - teacher) * mask
-    numerator = difference.abs().flatten(1).sum(dim=1)
-    denominator = numerator + epsilon
-    direction = difference / denominator[:, None, None]
-    direction = direction.detach()
-    return direction, {
-        "difference_l1": numerator.detach(),
-        "denominator": denominator.detach(),
-        "valid_coordinate_count": count.detach(),
-        "teacher_abs_mean": (teacher.abs() * mask).flatten(1).sum(dim=1).div(count).detach(),
-        "fake_abs_mean": (fake.abs() * mask).flatten(1).sum(dim=1).div(count).detach(),
-        "direction_abs_mean": direction.abs().flatten(1).sum(dim=1).div(count).detach(),
-    }
-
-
 def stopped_dmd2_direction(
     fake: Tensor,
     teacher: Tensor,
@@ -176,7 +144,6 @@ __all__ = [
     "shifted_time_grid",
     "shift_time",
     "stopped_dmd2_direction",
-    "stopped_l1_score_direction",
     "surrogate_vector_loss",
     "validate_time_distribution",
 ]

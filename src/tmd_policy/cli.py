@@ -42,22 +42,11 @@ def _teacher_parity(args: argparse.Namespace) -> int:
     return 0 if report["cache_unchanged"] else 1
 
 
-_TRAIN_METHODS = {
-    "flow-sft": "flow_sft",
-    "tmd-stage1": "tmd_stage1",
-    "dmd2-flow": "dmd2_flow",
-    "tmd-stage2": "tmd_stage2",
-    "occupancy-discriminator": "occupancy_discriminator",
-    "occupancy-tmd": "occupancy_tmd",
-}
-
-
 def _train(args: argparse.Namespace) -> int:
     from tmd_policy.training.builders import build_training_bundle
     from tmd_policy.training.engine import run_training
 
-    expected = _TRAIN_METHODS[args.train_method]
-    config = load_config(args.config, expected_method=expected)
+    config = load_config(args.config, expected_method="dmd2_flow")
     initial_rollout_replay = getattr(args, "initial_rollout_replay", None)
     if initial_rollout_replay is not None:
         initial_rollout_replay = str(Path(initial_rollout_replay).expanduser().resolve())
@@ -106,16 +95,8 @@ def _evaluate(args: argparse.Namespace) -> int:
         config["policy"]["checkpoint_sha256"] = args.checkpoint_sha256
     if args.device is not None:
         config["policy"]["device"] = args.device
-    if args.inner_steps is not None and config["policy"]["method"] in {
-        "dmd2_flow", "tmd_stage1", "tmd_stage2", "occupancy_tmd"
-    }:
-        raise ValueError(
-            "this distilled policy's inner step count comes from the checkpoint"
-        )
-    if args.outer_steps is not None and config["policy"]["method"] in {
-        "tmd_stage1", "tmd_stage2", "occupancy_tmd"
-    }:
-        raise ValueError("TMD outer step counts come from the checkpoint")
+    if args.inner_steps is not None and config["policy"]["method"] == "dmd2_flow":
+        raise ValueError("DMD2 has no inner sampler; use --outer-steps for an NFE ablation")
     if args.outer_steps is not None:
         config["policy"]["outer_steps"] = args.outer_steps
     if args.inner_steps is not None:
@@ -183,8 +164,8 @@ def _evaluate_libero_plus(args: argparse.Namespace) -> int:
         config["evaluation"]["devices"] = devices
         config["policy"]["device"] = devices[0]
     if args.outer_steps is not None:
-        if config["policy"]["method"] not in {"dmd2_flow", "flow_sft"}:
-            raise ValueError("only DMD2/Flow-SFT support a LIBERO-Plus outer-step override")
+        if config["policy"]["method"] != "dmd2_flow":
+            raise ValueError("only DMD2 supports a LIBERO-Plus outer-step override")
         if args.outer_steps < 1:
             raise ValueError("--outer-steps must be positive")
         config["policy"]["outer_steps"] = int(args.outer_steps)
@@ -235,12 +216,28 @@ def _evaluate_libero_plus(args: argparse.Namespace) -> int:
     return 0
 
 
-def _compare(args: argparse.Namespace) -> int:
-    from tmd_policy.evaluation.compare import compare
+def _debug_libero_inputs(args: argparse.Namespace) -> int:
+    from tmd_policy.evaluation.input_audit import audit_libero_episode
 
-    report = compare(args.config, args.output)
+    config = load_config(args.config, expected_method="evaluate_libero")
+    if args.device is not None:
+        config["policy"]["device"] = args.device
+    if args.checkpoint is not None:
+        config["policy"]["checkpoint"] = args.checkpoint
+    if args.checkpoint_sha256 is not None:
+        config["policy"]["checkpoint_sha256"] = args.checkpoint_sha256
+    report = audit_libero_episode(
+        config,
+        args.output,
+        suite=args.suite,
+        task_id=args.task_id,
+        reset_seed=args.reset_seed,
+        max_episode_steps=args.max_episode_steps,
+        execution_horizon=args.execution_horizon,
+        save_images=bool(args.save_images),
+    )
     print(json.dumps(report, indent=2, sort_keys=True))
-    return 0
+    return 0 if report["all_checks_passed"] else 1
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -264,20 +261,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     train = commands.add_parser("train", help="real DataLoader/model training")
     train_commands = train.add_subparsers(dest="train_method", required=True)
-    for command, expected in _TRAIN_METHODS.items():
-        sub = train_commands.add_parser(command)
-        sub.add_argument("--config", default=f"configs/methods/{expected}.yaml")
-        sub.add_argument("--output")
-        sub.add_argument("--resume")
-        if command == "dmd2-flow":
-            sub.add_argument(
-                "--initial-rollout-replay",
-                help=(
-                    "completed balanced student-rollout round used to bootstrap replay; "
-                    "skips the blocking pre-training rollout"
-                ),
-            )
-        sub.set_defaults(handler=_train)
+    dmd2 = train_commands.add_parser("dmd2-flow")
+    dmd2.add_argument("--config", default="configs/methods/dmd2_flow.yaml")
+    dmd2.add_argument("--output")
+    dmd2.add_argument("--resume")
+    dmd2.add_argument(
+        "--initial-rollout-replay",
+        help=(
+            "completed balanced student-rollout round used to bootstrap replay; "
+            "skips the blocking pre-training rollout"
+        ),
+    )
+    dmd2.set_defaults(handler=_train)
 
     rollout = commands.add_parser("rollout", help="real LIBERO student rollouts")
     rollout_commands = rollout.add_subparsers(dest="rollout_command", required=True)
@@ -289,11 +284,11 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate = commands.add_parser("evaluate", help="complete-episode LIBERO evaluation")
     evaluate_commands = evaluate.add_subparsers(dest="evaluate_command", required=True)
     libero = evaluate_commands.add_parser("libero")
-    libero.add_argument("--config", default="configs/evaluation/libero_motivation.yaml")
+    libero.add_argument("--config", default="configs/evaluation/dmd2_flow.yaml")
     libero.add_argument("--output")
     libero.add_argument(
         "--policy-method",
-        choices=("pi05", "smolvla", "flow_sft", "tmd_stage1", "dmd2_flow", "tmd_stage2", "occupancy_tmd"),
+        choices=("pi05", "smolvla", "dmd2_flow"),
     )
     libero.add_argument("--checkpoint")
     libero.add_argument("--checkpoint-sha256")
@@ -379,10 +374,41 @@ def build_parser() -> argparse.ArgumentParser:
         "--resume", action="store_true", help="continue a matching output directory"
     )
     libero_plus.set_defaults(handler=_evaluate_libero_plus)
-    comparison = evaluate_commands.add_parser("compare")
-    comparison.add_argument("--config", default="configs/experiments/motivation.yaml")
-    comparison.add_argument("--output", required=True)
-    comparison.set_defaults(handler=_compare)
+    debug_inputs = evaluate_commands.add_parser(
+        "debug-libero-inputs",
+        help="run one real LIBERO episode and audit every SmolVLA input tensor",
+    )
+    debug_inputs.add_argument(
+        "--config", default="configs/evaluation/smolvla_official10.yaml"
+    )
+    debug_inputs.add_argument("--output", required=True)
+    debug_inputs.add_argument(
+        "--suite",
+        choices=("libero_spatial", "libero_object", "libero_goal", "libero_10"),
+        default="libero_spatial",
+    )
+    debug_inputs.add_argument("--task-id", type=int, default=0)
+    debug_inputs.add_argument("--reset-seed", type=int, default=0)
+    debug_inputs.add_argument("--device")
+    debug_inputs.add_argument("--checkpoint")
+    debug_inputs.add_argument("--checkpoint-sha256")
+    debug_inputs.add_argument(
+        "--max-episode-steps",
+        type=int,
+        help="shorten the real episode for debugging; omitted means the suite horizon",
+    )
+    debug_inputs.add_argument(
+        "--execution-horizon",
+        type=int,
+        help="actions executed per plan; omitted means horizons.execution from the config",
+    )
+    debug_inputs.add_argument(
+        "--save-images",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="save the exact prepared camera tensors as PNG files (default: true)",
+    )
+    debug_inputs.set_defaults(handler=_debug_libero_inputs)
     return parser
 
 

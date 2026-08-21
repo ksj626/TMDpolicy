@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -274,78 +273,6 @@ class LeRobotPI05Teacher:
     @property
     def action_expert_feature_dim(self) -> int:
         return int(self.policy.model.action_out_proj.in_features)
-
-    @property
-    def action_expert_layer_count(self) -> int:
-        return len(self.policy.model.paligemma_with_expert.gemma_expert.model.layers)
-
-    def intermediate_features(
-        self,
-        condition: PI05ConditionCache,
-        noised_action: Tensor,
-        time: Tensor,
-        selected_layers: list[int] | tuple[int, ...],
-        require_input_grad: bool,
-    ) -> OrderedDict[int, Tensor]:
-        """Evaluate frozen PI0.5 suffix layers while preserving action-input autograd.
-
-        Hooks are repository-owned and attached by exact layer identity. The
-        official processor and immutable prefix cache are still used; no
-        installed LeRobot source is patched.
-        """
-
-        time = self._validate_query(condition, noised_action, time)
-        selected = tuple(int(index) for index in selected_layers)
-        if not selected or len(set(selected)) != len(selected):
-            raise ValueError("selected PI0.5 feature layers must be nonempty and unique")
-        layer_count = self.action_expert_layer_count
-        if any(index < 0 or index >= layer_count for index in selected):
-            raise ValueError(f"PI0.5 selected layers must be in [0,{layer_count - 1}]")
-        before = cache_fingerprint(condition.past_key_values)
-        if before != condition.fingerprint:
-            raise RuntimeError("PI0.5 prefix cache was mutated before feature evaluation")
-
-        captured: dict[int, Tensor] = {}
-        handles = []
-
-        def hook(index: int):
-            def capture(_module: Any, _inputs: tuple[Any, ...], output: Any) -> None:
-                value = output
-                if isinstance(value, (tuple, list)):
-                    value = next((item for item in value if isinstance(item, Tensor)), None)
-                if not isinstance(value, Tensor):
-                    raise RuntimeError(f"PI0.5 layer {index} did not return tensor features")
-                captured[index] = value[:, -self.chunk_size :]
-
-            return capture
-
-        layers = self.policy.model.paligemma_with_expert.gemma_expert.model.layers
-        for index in selected:
-            handles.append(layers[index].register_forward_hook(hook(index)))
-        context = torch.enable_grad() if require_input_grad else torch.no_grad()
-        try:
-            with context:
-                self.policy.model.denoise_step(
-                    prefix_pad_masks=condition.prefix_pad_masks,
-                    past_key_values=condition.past_key_values,
-                    x_t=noised_action,
-                    timestep=time,
-                )
-        finally:
-            for handle in handles:
-                handle.remove()
-        after = cache_fingerprint(condition.past_key_values)
-        if after != before:
-            raise RuntimeError("PI0.5 feature evaluation mutated the retained prefix KV cache")
-        if tuple(captured) != selected:
-            raise RuntimeError(f"PI0.5 feature hooks returned layers {tuple(captured)}, expected {selected}")
-        if any(value.shape[:2] != noised_action.shape[:2] for value in captured.values()):
-            raise RuntimeError("PI0.5 intermediate action features changed batch/horizon shape")
-        if require_input_grad and noised_action.requires_grad and not all(
-            value.requires_grad for value in captured.values()
-        ):
-            raise RuntimeError("PI0.5 feature path detached the generated action")
-        return OrderedDict((index, captured[index]) for index in selected)
 
     def score(self, condition: PI05ConditionCache, x_t: Tensor, t: Tensor) -> Tensor:
         """Convert rectified-flow velocity using an explicit minimum score time."""

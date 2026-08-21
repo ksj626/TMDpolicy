@@ -35,7 +35,7 @@ def preflight(config: dict[str, Any]) -> dict[str, Any]:
             raise RuntimeError(
                 f"paper-faithful configuration requires at least {required} GiB on {locator} "
                 f"for the selected algorithm, but {properties.name} has {total_gib:.2f} GiB; "
-                "no lightweight fallback will be selected"
+                "no reduced-model fallback will be selected"
             )
     return report
 

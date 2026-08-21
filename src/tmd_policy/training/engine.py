@@ -577,7 +577,7 @@ def run_training(
                 epoch=epoch,
             )
             if payload is None:
-                raise RuntimeError("student replay requires lightweight inference checkpoints")
+                raise RuntimeError("student replay requires inference-delta checkpoints")
             target = (
                 output
                 / "student_rollout_replay"

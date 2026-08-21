@@ -761,7 +761,7 @@ def _collect_student_rollouts_serial(config: dict[str, Any], output_dir: str | P
     store = RolloutStore(output)
     store.initialize(
         {
-            "purpose": "occupancy_student",
+            "purpose": "dmd2_student_replay",
             "policy": identity,
             "dataset_revision": config["dataset"]["revision"],
             "collection_round": collection["collection_round"],

@@ -1,4 +1,4 @@
-"""Repository-owned SmolVLA flow backend and explicit fine-tuning modes."""
+"""SmolVLA baseline and DMD2 action-expert student backend."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ import torch
 from torch import Tensor, nn
 
 from tmd_policy.methods.flow_objectives import shifted_time_grid
+from tmd_policy.methods.denoise_renoise import denoise_renoise_sample
 
 from .compatibility import (
     validate_smolvla_instance,
@@ -18,7 +19,7 @@ from .compatibility import (
     verify_installed_lerobot,
 )
 
-FineTuningMode = Literal["head_only", "expert_only", "lora", "full"]
+FineTuningMode = Literal["action_expert", "head_only"]
 
 
 def resolve_trainable_state_keys(student: nn.Module) -> tuple[str, ...]:
@@ -50,11 +51,6 @@ class SmolVLAConditionCache:
     processor_revision: str
     dtype: str
     device: str
-    pooled_visual_features: Tensor
-    pooled_language_features: Tensor
-    pooled_state_features: Tensor
-    condition_features: Tensor
-    feature_identity: dict[str, Any]
 
 
 def _unique_parameters(modules: list[nn.Module]) -> set[int]:
@@ -166,99 +162,43 @@ class LeRobotSmolVLAStudent(nn.Module):
             flow.action_time_mlp_out,
         ]
 
+    def _trainable_parameters(self, mode: FineTuningMode) -> set[int]:
+        selected = _unique_parameters(self._head_modules())
+        if mode == "action_expert":
+            selected.update(
+                id(parameter)
+                for name, parameter in self.flow.vlm_with_expert.lm_expert.named_parameters()
+                if "lm_head" not in name
+            )
+        return selected
+
     def configure_trainable(
         self,
         mode: FineTuningMode,
-        *,
-        lora_rank: int = 16,
-        lora_alpha: int = 16,
-        lora_dropout: float = 0.0,
     ) -> tuple[str, ...]:
-        """Select parameters by explicit module identity and validate the result."""
+        """Select DMD2 student parameters without unfreezing the VLM backbone.
 
-        if mode not in {"head_only", "expert_only", "lora", "full"}:
-            raise ValueError(f"unknown SmolVLA fine-tuning mode: {mode}")
+        ``action_expert`` trains every SmolVLA action-expert transformer
+        parameter plus the action/time projections. ``head_only`` remains only
+        to load and evaluate historical DMD2 checkpoints.
+        """
+
+        if mode not in {"action_expert", "head_only"}:
+            raise ValueError("SmolVLA fine-tuning mode must be 'action_expert' or 'head_only'")
         self.policy.requires_grad_(False)
-        if mode == "head_only":
-            selected = _unique_parameters(self._head_modules())
-            for parameter in self.policy.parameters():
-                parameter.requires_grad_(id(parameter) in selected)
-        elif mode == "expert_only":
-            modules = [self.flow.vlm_with_expert.lm_expert, *self._head_modules()]
-            selected = _unique_parameters(modules)
-            for parameter in self.policy.parameters():
-                parameter.requires_grad_(id(parameter) in selected)
-        elif mode == "full":
-            self.policy.requires_grad_(True)
-        else:
-            try:
-                from peft import LoraConfig
-            except ImportError as error:
-                raise RuntimeError("lora mode requires the LeRobot training/PEFT dependencies") from error
-            allowed = [self.flow.vlm_with_expert.lm_expert, *self._head_modules()]
-            allowed_ids = {id(module) for root in allowed for module in root.modules()}
-            targets = [
-                name
-                for name, module in self.policy.named_modules()
-                if id(module) in allowed_ids and isinstance(module, nn.Linear)
-            ]
-            if not targets:
-                raise RuntimeError("no exact Linear modules were found for SmolVLA LoRA")
-            wrapped = self.policy.wrap_with_peft(
-                LoraConfig(
-                    r=lora_rank,
-                    lora_alpha=lora_alpha,
-                    lora_dropout=lora_dropout,
-                    target_modules=targets,
-                    bias="none",
-                )
-            )
-            self.policy = wrapped
+        selected = self._trainable_parameters(mode)
+        for parameter in self.policy.parameters():
+            parameter.requires_grad_(id(parameter) in selected)
 
         names = tuple(name for name, parameter in self.policy.named_parameters() if parameter.requires_grad)
         if not names:
             raise RuntimeError(f"fine-tuning mode {mode} selected no trainable parameters")
+        if mode == "action_expert" and not any("vlm_with_expert.lm_expert" in name for name in names):
+            raise RuntimeError("action_expert mode selected no SmolVLA expert-transformer parameters")
+        if any("vlm_with_expert.vlm" in name for name in names):
+            raise RuntimeError("SmolVLA VLM backbone was unexpectedly made trainable")
         self.trainable_parameter_names = names
         return names
-
-    def configure_tmd_trainable(
-        self, *, last_k_expert_blocks: int, train_backbone_flow_blocks: bool
-    ) -> tuple[str, ...]:
-        """Select the exact Stage-1/Stage-2 TMD parameter set without generic overrides."""
-
-        layers = list(self.flow.vlm_with_expert.lm_expert.layers)
-        if not 1 <= last_k_expert_blocks < len(layers):
-            raise ValueError(f"last_k_expert_blocks must be in [1,{len(layers) - 1}]")
-        self.policy.requires_grad_(False)
-        if train_backbone_flow_blocks:
-            modules = [*layers[-last_k_expert_blocks:], *self._head_modules()]
-            selected = _unique_parameters(modules)
-            for parameter in self.policy.parameters():
-                parameter.requires_grad_(id(parameter) in selected)
-        names = tuple(name for name, parameter in self.policy.named_parameters() if parameter.requires_grad)
-        if train_backbone_flow_blocks and not any("lm_expert.layers" in name for name in names):
-            raise RuntimeError("TMD selected no final expert-block parameters")
-        self.trainable_parameter_names = names
-        return names
-
-    @property
-    def condition_feature_identity(self) -> dict[str, Any]:
-        hidden = int(self.flow.vlm_with_expert.config.text_config.hidden_size)
-        return {
-            "encoder_model_id": self.model_id,
-            "encoder_model_revision": self.model_revision,
-            "processor_revision": self.processor_revision,
-            "feature_layer": "smolvla.embed_prefix.inputs",
-            "dtype": str(next(self.policy.parameters()).dtype),
-            "feature_dimension": 3 * hidden,
-            "components": ["pooled_visual", "pooled_language", "pooled_state"],
-            "detached": True,
-        }
-
-    def flow_matching_loss(self, canonical_batch: dict[str, Any], *, reduction: str = "mean") -> Tensor:
-        processed = self.preprocess_observation(canonical_batch)
-        result = self.policy(processed, reduction=reduction)
-        return result[0] if isinstance(result, tuple) else result
 
     @torch.no_grad()
     def encode_condition(self, processed_batch: dict[str, Any]) -> SmolVLAConditionCache:
@@ -272,29 +212,6 @@ class LeRobotSmolVLAStudent(nn.Module):
         prefix, prefix_pad, prefix_att = self.flow.embed_prefix(
             images, image_masks, language, language_mask, state=state
         )
-        state_positions = prefix_att.bool() & prefix_pad.bool()
-        state_count = state_positions.sum(dim=1)
-        if torch.any(state_count == 0):
-            raise RuntimeError("SmolVLA prefix contains no state-conditioned token")
-        state_weight = state_positions.to(prefix.dtype).unsqueeze(-1)
-        state_features = (prefix * state_weight).sum(dim=1) / state_weight.sum(dim=1).clamp_min(1)
-
-        # LeRobot constructs prefix tokens as cameras, language, state, padding.
-        # The state attention marker provides an exact boundary even when the
-        # language padding mask contains false tokens.
-        state_start = state_positions.float().argmax(dim=1)
-        language_length = int(language.shape[1])
-        positions = torch.arange(prefix.shape[1], device=prefix.device)[None]
-        language_positions = (positions >= (state_start - language_length)[:, None]) & (
-            positions < state_start[:, None]
-        )
-        language_positions &= prefix_pad.bool()
-        language_weight = language_positions.to(prefix.dtype).unsqueeze(-1)
-        language_features = (prefix * language_weight).sum(dim=1) / language_weight.sum(dim=1).clamp_min(1)
-        visual_positions = (positions < (state_start - language_length)[:, None]) & prefix_pad.bool()
-        visual_weight = visual_positions.to(prefix.dtype).unsqueeze(-1)
-        visual_features = (prefix * visual_weight).sum(dim=1) / visual_weight.sum(dim=1).clamp_min(1)
-        condition_features = torch.cat((visual_features, language_features, state_features), dim=-1).detach()
         attention = make_att_2d_masks(prefix_pad, prefix_att)
         positions = torch.cumsum(prefix_pad, dim=1) - 1
         _, past = self.flow.vlm_with_expert.forward(
@@ -313,15 +230,6 @@ class LeRobotSmolVLAStudent(nn.Module):
             processor_revision=self.processor_revision,
             dtype=str(next(self.policy.parameters()).dtype),
             device=str(self.device),
-            pooled_visual_features=visual_features.detach(),
-            pooled_language_features=language_features.detach(),
-            pooled_state_features=state_features.detach(),
-            condition_features=condition_features,
-            feature_identity={
-                **self.condition_feature_identity,
-                "dtype": str(condition_features.dtype),
-                "feature_dimension": int(condition_features.shape[-1]),
-            },
         )
 
     def velocity(self, condition: SmolVLAConditionCache, x_t: Tensor, t: Tensor) -> Tensor:
@@ -353,29 +261,6 @@ class LeRobotSmolVLAStudent(nn.Module):
         if time.shape != (x_t.shape[0],) or velocity.shape != x_t.shape:
             raise ValueError("clean prediction expects x/velocity [B,H,D] and time [B]")
         return x_t.float() - time.float()[:, None, None] * velocity.float()
-
-    def velocity_with_features(
-        self, condition: SmolVLAConditionCache, x_t: Tensor, t: Tensor
-    ) -> tuple[Tensor, Tensor]:
-        """Return raw velocity and final action-expert hidden states.
-
-        The hook is attached by module identity to `action_out_proj`; it neither
-        selects parameters nor reaches into transformer naming conventions.
-        """
-
-        captured: list[Tensor] = []
-
-        def save_input(_module: nn.Module, inputs: tuple[Tensor, ...]) -> None:
-            captured.append(inputs[0])
-
-        handle = self.flow.action_out_proj.register_forward_pre_hook(save_input)
-        try:
-            velocity = self.velocity(condition, x_t, t)
-        finally:
-            handle.remove()
-        if len(captured) != 1 or captured[0].shape[:2] != x_t.shape[:2]:
-            raise RuntimeError("could not capture SmolVLA action-expert features")
-        return velocity, captured[0]
 
     def sample(
         self,
@@ -446,33 +331,14 @@ class LeRobotSmolVLAStudent(nn.Module):
             time_grid[:-1] > time_grid[1:]
         ):
             raise ValueError("time_grid must contain num_steps+1 strictly descending values")
-        if renoise_noises is not None and renoise_noises.shape != (
-            max(0, num_steps - 1),
-            *noise.shape,
-        ):
-            raise ValueError("renoise_noises must be [num_steps-1,B,50,32]")
-
-        value = noise
-        clean = noise
-        for index, (current, target) in enumerate(
-            zip(time_grid[:-1], time_grid[1:], strict=True)
-        ):
-            time = current.expand(condition.batch_size)
-            clean = self.clean_prediction(value, time, self.velocity(condition, value, time))
-            if step_callback is not None:
-                step_callback()
-            if index + 1 < num_steps:
-                if renoise_noises is None:
-                    fresh_noise = torch.randn(
-                        value.shape,
-                        device=value.device,
-                        dtype=torch.float32,
-                        generator=generator,
-                    )
-                else:
-                    fresh_noise = renoise_noises[index].float()
-                value = (1.0 - target.float()) * clean + target.float() * fresh_noise
-        return clean
+        return denoise_renoise_sample(
+            lambda value, time: self.velocity(condition, value, time),
+            noise,
+            time_grid,
+            generator=generator,
+            renoise_noises=renoise_noises,
+            step_callback=step_callback,
+        )
 
     @torch.no_grad()
     def predict_canonical_action_chunk(

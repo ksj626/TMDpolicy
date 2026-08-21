@@ -15,7 +15,6 @@ from tmd_policy.backends.lerobot.pi05_teacher import (
     PI05ConditionCache,
     cache_fingerprint,
 )
-from tmd_policy.backends.lerobot.smolvla_student import LeRobotSmolVLAStudent, SmolVLAConditionCache
 
 
 class PI05CloneFakeScore(nn.Module):
@@ -180,21 +179,4 @@ class PI05CloneFakeScore(nn.Module):
         return self._run(condition, noised_action, time, tuple(selected_layers))[1]
 
 
-class SmolVLACloneFakeScore(nn.Module):
-    """Practical cross-architecture fake-score adaptation."""
-
-    classification = "SmolVLA-clone cross-architecture adaptation; not paper-faithful"
-
-    def __init__(self, clone: LeRobotSmolVLAStudent) -> None:
-        super().__init__()
-        self.clone = clone
-        clone.configure_trainable("expert_only")
-
-    def condition(self, raw_batch: dict[str, Any]) -> SmolVLAConditionCache:
-        return self.clone.encode_condition(self.clone.preprocess_observation(raw_batch))
-
-    def forward(self, condition: SmolVLAConditionCache, x_t: Tensor, time: Tensor) -> Tensor:
-        return self.clone.velocity(condition, x_t, time)
-
-
-__all__ = ["PI05CloneFakeScore", "SmolVLACloneFakeScore"]
+__all__ = ["PI05CloneFakeScore"]

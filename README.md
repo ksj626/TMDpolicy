@@ -1,253 +1,162 @@
 # TMDpolicy
 
-Repository-owned PI0.5-to-SmolVLA action-policy distillation on the immutable
-`lerobot/libero` dataset. Production baselines use LeRobot exactly `0.6.1` and
-never modify installed LeRobot or site-packages.
+TMDpolicy is a focused DMD2 robot-policy distillation codebase. It trains a
+full-action-expert SmolVLA student from a frozen PI0.5 LIBERO teacher with a
+PI0.5-initialized fake-score suffix, an intermediate-feature GAN, five-to-one
+TTUR, denoise--renoise backward simulation, and asynchronously refreshed
+student-state replay.
 
-Pinned assets:
+The supported baselines are immutable PI0.5, official 10-step SmolVLA, and
+explicit 4/1-step SmolVLA ablations. Evaluation supports standard LIBERO and
+the 10,030-task LIBERO-Plus benchmark. Transition Matching, Flow-SFT,
+occupancy-weighted objectives, and cached/lightweight DMD2 variants are not
+part of this repository.
 
-- PI0.5 teacher: `lerobot/pi05_libero_finetuned@8e174154ef5f6c60a8da12ae99c303d8963138c1`
-- SmolVLA student: `lerobot/smolvla_libero@31d453f7edd78c839a8bbc39744a292686daf0de`
-- LIBERO data: `lerobot/libero@a1aaacb7f6cd6ee5fb43120f673cebb0cfea7dd4`
+See [DMD2 fidelity and architecture](docs/dmd2_fidelity.md) for the equations,
+checkpoint contract, replay routing, precision rules, and diagnostic schema.
 
-## Implemented baselines
+## Setup
 
-`dmd2_flow_paper` uses a frozen PI0.5 teacher, a PI0.5-initialized independently
-trainable action-expert suffix, five fake-score updates per generator update,
-VSD, and a noised-action GAN on selected fake-score layers. Its generator loss
-is exactly `L_VSD + lambda_GAN L_GAN`; it has no Flow-SFT or data regression.
-The direct baseline converts the student's rectified-flow velocity to a clean
-prediction and implements DMD2 backward simulation. Training and evaluation
-both start from Gaussian noise; every prefix step predicts clean action and
-independently re-noises it at the next shifted-grid time. Five guidance updates
-jointly train fake-score and classifier parameters for every generator update.
-Their warmup/decay schedules are measured in their actual optimizer-update
-counts, not global generator steps.
-
-TMD uses the repository-owned SmolVLA action-space transformer adaptation:
-
-1. Stage 1 trains TM-MF with independent outer/inner Gaussian sources,
-   a shifted discrete outer grid, continuous shifted MeanFlow `s`, the largest
-   inner-grid predecessor `r<=s`, `r=s` on 75% of
-   rows, exact JVP, and adaptive normalization.
-2. Stage 2 loads Stage 1 immutably, preserves the selected final SmolVLA expert
-   blocks, constructs real-data outer transitions, differentiates through every
-   inner step, and applies TMD v2 DMD2-v VSD plus teacher-feature GAN. It has no
-   SFT/data term.
-
-For the action-space adaptation, `b=v_SmolVLA(x_t,t,c)`, the head predicts a
-zero-initialized residual `Delta`, `h=b+Delta`, and the MeanFlow average velocity
-is `u=z-h`. Therefore a zero residual returns `b` after 1, 2, or 4 inner steps
-and reproduces the corresponding SmolVLA outer Euler transition. Chunk
-attention is bidirectional by default; causal attention is an explicit ablation.
-
-The ordinary DMD/TMD conditional GAN and the short-window occupancy ratio are
-different programs. Occupancy training uses actual replan records
-`(s_t,o_t,a_plan[50],task)` from expert data and real student rollouts. Both
-families corrupt actions as
-
-```text
-a_tau = (1-tau) a + tau epsilon
-tau = gamma u / ((gamma-1)u + 1)
-```
-
-and use logistic discriminator and non-saturating generator losses. The default
-paper feature path uses separate heads on PI0.5 layers `[5,11,17]` and averages
-their losses. `cached_vla_features` is a separately named efficient adaptation.
-
-## Environment
+All commands operate inside this repository. The wrappers use the `tmdpolicy`
+Conda environment and repository-local caches.
 
 ```bash
 cd /home/dmsdmswns/TMDpolicy
 bash scripts/setup/create_environment.sh
-conda activate tmdpolicy
-export MUJOCO_GL=egl
-export HF_HOME="$PWD/.cache/huggingface"
-export HF_LEROBOT_HOME="$PWD/.cache/lerobot"
-```
-
-Accept access to `google/paligemma-3b-pt-224`. Every model, processor, dataset,
-checkpoint, and LeRobot source identity is recorded. Checkpoint SHA-256 fields
-set to `auto` are computed before use and persisted into the resolved run config.
-
-## Data and parity
-
-```bash
 bash scripts/data/build_libero_expert.sh
-bash scripts/data/query_pi05_teacher.sh --output artifacts/pi05_flow_parity
-```
-
-Rollout schema `tmdpolicy.libero-replans/v2` losslessly stores each canonical
-replan-start camera tensor and metadata, state `[8]`, full postprocessed plan
-`[50,7]`, executed prefix/actions, suite-local and global task identities,
-termination outcome, behavior checkpoint/round, and immutable revisions. Old v1
-stores fail closed. All-40-task collection is:
-
-```bash
-bash scripts/data/collect_all_libero_rollouts.sh
-```
-
-## Training
-
-Preflight never changes the requested algorithm; insufficient memory/device
-fails explicitly.
-
-```bash
+bash scripts/data/query_pi05_teacher.sh
 bash scripts/preflight/preflight_dmd2.sh
-bash scripts/train/train_dmd2_flow_paper.sh
-
-bash scripts/preflight/preflight_tmd.sh
-bash scripts/train/train_tmd_stage1.sh
-bash scripts/train/train_tmd_stage2_paper.sh
 ```
 
-The pipeline either accepts an existing Stage-1 checkpoint or trains Stage 1,
-computes its SHA-256, checks its model/dataset provenance, writes a fully
-resolved Stage-2 input config, and refuses existing output directories. After
-training it writes `evaluation_resolved.yaml` with the exact final checkpoint
-path and SHA-256:
-
-```bash
-bash scripts/train/run_tmd_pipeline.sh \
-  artifacts/training/tmd_stage1/checkpoints/final.pt \
-  artifacts/training/tmd_stage2_pipeline
-```
-
-Paper occupancy and cached-VLA occupancy launch with:
-
-```bash
-conda run -n tmdpolicy tmd-policy train occupancy-discriminator \
-  --config configs/methods/occupancy_discriminator_paper.yaml
-conda run -n tmdpolicy tmd-policy train occupancy-discriminator \
-  --config configs/methods/occupancy_discriminator_cached_vla.yaml
-```
-
-Training batches for occupancy are deterministic source-paired/task-stratified
-and resume from an exact epoch/batch cursor. Validation is never oversampled and
-reports source, macro/task, and aggregate metrics. Every trainer displays global
-step and validation progress and atomically refreshes `training_progress.png` in
-its output directory after each completed step.
-
-The paper DMD2 configuration keeps effective batch size 32 as `8 × 4`, reuses
-each immutable PI0.5 condition cache within a loss, and writes a lightweight
-student-delta checkpoint every 10 steps under `inference_checkpoints/`. Before
-optimization it collects one balanced all-40-task student rollout. It refreshes
-that replay asynchronously every 500 actual generator updates on `cuda:2`;
-guidance/discriminator real batches remain expert-state batches, while the
-generator objectives use replay states when available.
-
-## Evaluation
-
-Direct PI0.5 and the ordinary SmolVLA baseline use official 10-step sampling.
-SmolVLA four-step sampling is only available as an explicitly labeled ablation.
-
-```bash
-bash scripts/evaluate/evaluate_pi05.sh
-bash scripts/evaluate/evaluate_smolvla10.sh
-bash scripts/evaluate/evaluate_dmd2.sh
-bash scripts/evaluate/evaluate_tmd.sh
-```
-
-DMD2 evaluation uses the same denoise--renoise sampler as training backward
-simulation. `--outer-steps 1` is a supported one-step DMD2 checkpoint ablation.
-
-LIBERO-Plus replaces the Python `libero` package, so it has a separate cloned
-Conda environment. Full evaluation is streamed one task at a time and resumes
-from `episodes.jsonl`:
+LIBERO-Plus uses a separate environment so its `libero` package does not
+replace standard LIBERO:
 
 ```bash
 bash scripts/setup/create_libero_plus_environment.sh
-bash scripts/evaluate/evaluate_libero_plus_dmd2.sh \
-  --checkpoint artifacts/training/dmd2_flow_paper/inference_checkpoints/final.pt \
-  --checkpoint-sha256 auto \
-  --output artifacts/evaluation/libero_plus_dmd2_full
-
-# Continue an interrupted 10,030-task run
-bash scripts/evaluate/evaluate_libero_plus_dmd2.sh \
-  --checkpoint artifacts/training/dmd2_flow_paper/inference_checkpoints/final.pt \
-  --checkpoint-sha256 auto \
-  --output artifacts/evaluation/libero_plus_dmd2_full \
-  --resume
 ```
 
-Evaluate frozen upstream baselines under the same LIBERO-Plus contract:
+## Train and resume
+
+The sole training config is `configs/methods/dmd2_flow.yaml`. New runs train
+the complete 99.85M-parameter SmolVLA action expert while keeping the VLM and
+observation-prefix encoder frozen. Existing head-only `dmd2_final` inference
+checkpoints remain evaluable, but their full optimizer checkpoints cannot be
+resumed into this larger trainable-parameter contract.
 
 ```bash
-# Select one of: smolvla10, smolvla4, smolvla1, pi05, all
-bash scripts/evaluate/evaluate_libero_plus_baselines.sh smolvla10 \
-  --devices cuda:2 cuda:3 cuda:4 cuda:5
-
-# Resume all four independent default output directories sequentially.
-bash scripts/evaluate/evaluate_libero_plus_baselines.sh all \
-  --devices cuda:2 cuda:3 cuda:4 cuda:5 \
-  --resume
+bash scripts/train/train_dmd2_flow.sh \
+  --output artifacts/training/dmd2_run
 ```
 
-Run a category-balanced 70-episode performance check (10 tasks from each of
-the seven LIBERO-Plus perturbation categories):
+Resume only from a full checkpoint:
 
 ```bash
-bash scripts/evaluate/evaluate_libero_plus_dmd2.sh \
-  --checkpoint artifacts/training/dmd2_flow_paper_run1/inference_checkpoints/step-00000060.pt \
-  --checkpoint-sha256 auto \
-  --device cuda:3 \
-  --sample-per-category 10 \
-  --sample-seed 0 \
-  --output artifacts/evaluation/libero_plus_dmd2_category10
+bash scripts/train/train_dmd2_flow.sh \
+  --output artifacts/training/dmd2_run \
+  --resume artifacts/training/dmd2_run/checkpoints/latest.pt
 ```
 
-Start a new DMD2 run from an existing balanced rollout round, skipping the
-blocking rollout before optimization:
+To bootstrap a new run from a completed balanced replay round and skip the
+blocking initial collection:
 
 ```bash
-bash scripts/train/train_dmd2_flow_paper.sh \
-  --initial-rollout-replay /home/dmsdmswns/TMDpolicy/artifacts/training/dmd2_flow_paper_run1/student_rollout_replay/round-000000 \
-  --output artifacts/training/dmd2_flow_paper_run2
+bash scripts/train/train_dmd2_flow.sh \
+  --initial-rollout-replay artifacts/training/dmd2_final/student_rollout_replay/round-000000 \
+  --output artifacts/training/dmd2_bootstrapped
 ```
 
-Evaluate two spatial tasks from an intermediate DMD2 inference checkpoint:
+Training writes full checkpoints, inference-only student deltas,
+`metrics.jsonl`, an atomically refreshed `training_progress.png`, validation
+videos, and asynchronous replay status/logs.
+
+## Standard LIBERO evaluation
+
+Evaluate a trained DMD2 checkpoint on a short sample:
 
 ```bash
 bash scripts/evaluate/evaluate_dmd2.sh \
-  --checkpoint artifacts/training/dmd2_flow_paper/inference_checkpoints/step-00000050.pt \
+  --checkpoint artifacts/training/dmd2_final/inference_checkpoints/step-00001000.pt \
   --checkpoint-sha256 auto \
   --device cuda:2 \
   --suite libero_spatial \
-  --task-ids 0 5 \
+  --task-ids 0 1 \
   --reset-seeds 0 \
-  --output artifacts/evaluation/dmd2_step50_spatial_0_5
+  --max-episode-steps 20 \
+  --output artifacts/evaluation/dmd2_smoke
 ```
 
-The `inference_checkpoints` files contain only the trained student delta and
-are for evaluation. Use full files under `checkpoints/` with `--resume` when
-continuing training. A shortened episode horizon is a smoke test, not a
-reportable LIBERO success-rate evaluation.
+`--outer-steps 1` is the one-step DMD2 ablation. Repeat `--suite` to select
+multiple suites. Without sampling overrides, the config evaluates all four
+suites with their configured horizons.
 
-Use `configs/evaluation/tmd_stage1.yaml` as the first argument to
-`evaluate_tmd.sh` for Stage 1. Evaluation actions are canonical `[B,50,7]` and
-comparison requires identical `(suite, task_id, reset_seed)` grids. Motivation
-and main comparison configs include PI0.5 official, SmolVLA official-10, and the
-explicit four-step ablation. Evaluation and rollout collection display both
-overall episode progress, per-plan NFE progress, and the environment-step progress
-of the active episode.
+Baselines:
 
-## Memory and fidelity
+```bash
+bash scripts/evaluate/evaluate_pi05.sh --device cuda:2
+bash scripts/evaluate/evaluate_smolvla10.sh --device cuda:2
+```
 
-The tested PI0.5 suffix clone has 693,422,112 trainable parameters and shares
-3,449,982,704 frozen teacher parameters. The default layout uses `cuda:0` for
-SmolVLA and `cuda:1` for PI0.5 prefix/suffix/features; both require a nominal
-24-GB-class GPU. Optimizer state and activations dominate beyond parameter-only
-memory. Config preflight records detected devices and fails rather than selecting
-a lightweight score or action-only discriminator.
+The 4/1-step SmolVLA ablations use the same command directly with
+`configs/evaluation/smolvla_4step_ablation.yaml` or
+`configs/evaluation/smolvla_1step_ablation.yaml`.
 
-The TMD action head is a truthful SmolVLA action-space architectural adaptation,
-not the paper's native last-K video-DiT split. DMD2's teacher-residual weighting
-and TMD-v's fake–teacher stopped-L1 direction are distinct, method-locked
-objectives. The preconditioning, time sampling, inner rollout, feature sources,
-and loss exclusions are preserved within the labeled adaptation.
-The current conditional action-policy TMD has no CFG; nonzero condition dropout
-is rejected rather than partially dropping only captured features.
+Audit every prepared input tensor in one real episode:
 
-See [DMD2 fidelity and operations](docs/dmd2_fidelity.md),
-[architecture](docs/architecture.md), [experiment protocol](docs/experiment_protocol.md),
-[config reference](configs/README.md), and the method/data/evaluation READMEs.
+```bash
+bash scripts/evaluate/debug_libero_model_inputs.sh \
+  --suite libero_spatial --task-id 0 --reset-seed 0 \
+  --max-episode-steps 20 \
+  --output artifacts/evaluation/input_audit
+```
+
+## LIBERO-Plus evaluation
+
+Full DMD2 evaluation can shard independent serial task loops across GPUs and
+resume completed tasks:
+
+```bash
+bash scripts/evaluate/evaluate_libero_plus_dmd2.sh \
+  --checkpoint artifacts/training/dmd2_final/inference_checkpoints/step-00001000.pt \
+  --checkpoint-sha256 auto \
+  --devices cuda:2 cuda:3 cuda:4 cuda:5 \
+  --output artifacts/evaluation/libero_plus_dmd2 \
+  --resume
+```
+
+Use `--suite libero_spatial` for one full suite or
+`--sample-per-category 10 --sample-seed 0` for a 70-task balanced performance
+check (videos default on for sampled runs).
+
+Run LIBERO-Plus baselines with:
+
+```bash
+bash scripts/evaluate/evaluate_libero_plus_baselines.sh smolvla10 --devices cuda:2 cuda:3
+bash scripts/evaluate/evaluate_libero_plus_baselines.sh smolvla4 --devices cuda:2 cuda:3
+bash scripts/evaluate/evaluate_libero_plus_baselines.sh smolvla1 --devices cuda:2 cuda:3
+bash scripts/evaluate/evaluate_libero_plus_baselines.sh pi05 --devices cuda:2 cuda:3
+```
+
+## Tests
+
+The default suite is CPU-only; the real model/environment integration test is
+opt-in and performs no training.
+
+```bash
+conda run --no-capture-output -n tmdpolicy python -m pytest -q
+TMD_RUN_INTEGRATION=1 conda run --no-capture-output -n tmdpolicy \
+  python -m pytest -q tests/test_real_integration.py
+```
+
+## Public CLI
+
+The intentional production surface is:
+
+```text
+data build-expert
+teacher validate-pi05-flow
+train dmd2-flow
+rollout collect-student
+evaluate libero
+evaluate libero-plus
+evaluate debug-libero-inputs
+```

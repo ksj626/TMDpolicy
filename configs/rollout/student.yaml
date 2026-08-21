@@ -27,8 +27,8 @@ horizons:
   prediction: 50
   execution: 10
 policy:
-  method: tmd_stage1
-  checkpoint: artifacts/training/tmd_stage1/checkpoints/final.pt
+  method: dmd2_flow
+  checkpoint: artifacts/training/dmd2_final/inference_checkpoints/step-00001000.pt
   checkpoint_sha256: auto
   device: cuda:0
 collection:

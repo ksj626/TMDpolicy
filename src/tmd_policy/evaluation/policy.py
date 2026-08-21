@@ -11,7 +11,6 @@ from torch import Tensor, nn
 
 from tmd_policy.backends.lerobot.smolvla_student import resolve_trainable_state_keys
 from tmd_policy.config import project_path
-from tmd_policy.methods.tmd import TMDStage1Program, sample_stage1_generator
 from tmd_policy.training.builders import build_student, build_teacher, file_sha256
 
 
@@ -129,7 +128,6 @@ class InferencePolicy(nn.Module):
         outer_steps: int,
         inner_steps: int,
         student_time_shift_gamma: float,
-        tmd_head: nn.Module | None = None,
         sampler_mode: str = "override",
     ) -> None:
         super().__init__()
@@ -138,7 +136,6 @@ class InferencePolicy(nn.Module):
         self.outer_steps = outer_steps
         self.inner_steps = inner_steps
         self.student_time_shift_gamma = student_time_shift_gamma
-        self.tmd_head = tmd_head
         self.sampler_mode = sampler_mode
 
     @property
@@ -150,8 +147,6 @@ class InferencePolicy(nn.Module):
 
     @property
     def inference_work_units(self) -> int:
-        if self.tmd_head is not None:
-            return self.outer_steps * (self.inner_steps + 1)
         return self.outer_steps
 
     @torch.no_grad()
@@ -164,7 +159,7 @@ class InferencePolicy(nn.Module):
     ) -> Tensor:
         processed = self.student.preprocess_observation(canonical_batch)
         batch_size = int(torch.as_tensor(processed["observation.state"]).shape[0])
-        if self.method == "dmd2_flow" and self.tmd_head is None:
+        if self.method == "dmd2_flow":
             noise, generator, renoise_noises = _dmd2_seeded_noises(
                 noise_seed,
                 batch_size=batch_size,
@@ -180,7 +175,7 @@ class InferencePolicy(nn.Module):
             )
             generator = None
             renoise_noises = None
-        if self.tmd_head is None and self.sampler_mode == "official":
+        if self.sampler_mode == "official":
             handle = None
             if step_callback is not None:
                 handle = self.student.flow.action_out_proj.register_forward_hook(
@@ -193,45 +188,22 @@ class InferencePolicy(nn.Module):
                     handle.remove()
             return self.student.postprocessor(normalized)
         condition = self.student.encode_condition(processed)
-        if self.tmd_head is None:
-            if self.method == "dmd2_flow":
-                normalized = self.student.sample_denoise_renoise(
-                    condition,
-                    noise,
-                    self.outer_steps,
-                    student_time_shift_gamma=self.student_time_shift_gamma,
-                    generator=generator,
-                    renoise_noises=renoise_noises,
-                    step_callback=step_callback,
-                )
-            else:
-                normalized = self.student.sample(
-                    condition,
-                    noise,
-                    self.outer_steps,
-                    student_time_shift_gamma=self.student_time_shift_gamma,
-                    step_callback=step_callback,
-                )
-        else:
-            inner = torch.stack([
-                _seeded_noise(
-                    noise_seed,
-                    batch_size=batch_size,
-                    device=noise.device,
-                    shape=(50, 32),
-                    offset=1_000_003 * (index + 1),
-                )
-                for index in range(self.outer_steps)
-            ])
-            normalized = sample_stage1_generator(
-                self.student,
-                self.tmd_head,
+        if self.method == "dmd2_flow":
+            normalized = self.student.sample_denoise_renoise(
                 condition,
                 noise,
-                outer_steps=self.outer_steps,
-                inner_steps=self.inner_steps,
+                self.outer_steps,
                 student_time_shift_gamma=self.student_time_shift_gamma,
-                inner_noises=inner,
+                generator=generator,
+                renoise_noises=renoise_noises,
+                step_callback=step_callback,
+            )
+        else:
+            normalized = self.student.sample(
+                condition,
+                noise,
+                self.outer_steps,
+                student_time_shift_gamma=self.student_time_shift_gamma,
                 step_callback=step_callback,
             )
         return self.student.postprocessor(normalized[..., :7])
@@ -361,7 +333,7 @@ def load_inference_policy(
     # Full resume checkpoints contain large fake-score/optimizer tensors that
     # inference never reads. Memory-map their storages so evaluating an
     # intermediate checkpoint does not materialize the whole training state in
-    # host RAM. Lightweight inference checkpoints benefit as well.
+    # host RAM. Inference-delta checkpoints benefit as well.
     payload = torch.load(checkpoint, map_location="cpu", weights_only=False, mmap=True)
     checkpoint_format = str(payload.get("format", ""))
     if checkpoint_format not in {"tmdpolicy.training/v1", "tmdpolicy.inference/v1"}:
@@ -372,56 +344,28 @@ def load_inference_policy(
     if checkpoint_config["models"] != config["models"] or checkpoint_config["dataset"]["revision"] != config["dataset"]["revision"]:
         raise ValueError("evaluation model/dataset identities differ from the checkpoint")
     state = payload["program"]
-    if method == "flow_sft":
-        student.configure_trainable(**checkpoint_config["fine_tuning"])
-    elif method == "dmd2_flow":
-        student.configure_trainable(checkpoint_config["dmd2"]["student_fine_tuning"])
+    if method != "dmd2_flow":
+        raise ValueError(f"unsupported inference checkpoint method: {method}")
+    student.configure_trainable(checkpoint_config["dmd2"]["student_fine_tuning"])
     _load_student_checkpoint_state(
         student,
         state,
         checkpoint_format=checkpoint_format,
         trainable_parameter_names=payload.get("trainable_parameter_names", ()),
     )
-    head = None
-    if method in {"tmd_stage1", "occupancy_tmd"}:
-        stage1 = TMDStage1Program(student, checkpoint_config["tmd"])
-        stage1.head.load_state_dict(_substate(state, "head."), strict=True)
-        head = stage1.head
-    elif method == "tmd_stage2":
-        stage1 = TMDStage1Program(student, checkpoint_config["stage1_architecture"])
-        stage1.head.load_state_dict(_substate(state, "stage1_head."), strict=True)
-        head = stage1.head
-    elif method not in {"flow_sft", "dmd2_flow"}:
-        raise ValueError(f"unsupported inference checkpoint method: {method}")
-    if method == "dmd2_flow":
-        sampling_architecture = checkpoint_config["dmd2"]
-        checkpoint_outer_steps = int(sampling_architecture["discrete_outer_steps"])
-        outer_steps = int(policy_config.get("outer_steps", checkpoint_outer_steps))
-        if outer_steps < 1:
-            raise ValueError("DMD2 evaluation outer_steps must be positive")
-        inner_steps = 1
-        student_time_shift_gamma = float(sampling_architecture["student_time_shift_gamma"])
-    elif method in {"tmd_stage1", "occupancy_tmd"}:
-        sampling_architecture = checkpoint_config["tmd"]
-        outer_steps = int(sampling_architecture["discrete_outer_steps"])
-        inner_steps = int(sampling_architecture["discrete_inner_steps"])
-        student_time_shift_gamma = float(sampling_architecture["student_time_shift_gamma"])
-    elif method == "tmd_stage2":
-        sampling_architecture = checkpoint_config["stage1_architecture"]
-        outer_steps = int(sampling_architecture["discrete_outer_steps"])
-        inner_steps = int(sampling_architecture["discrete_inner_steps"])
-        student_time_shift_gamma = float(sampling_architecture["student_time_shift_gamma"])
-    else:
-        outer_steps = int(policy_config["outer_steps"])
-        inner_steps = int(policy_config.get("inner_steps", 1))
-        student_time_shift_gamma = 1.0
+    sampling_architecture = checkpoint_config["dmd2"]
+    checkpoint_outer_steps = int(sampling_architecture["discrete_outer_steps"])
+    outer_steps = int(policy_config.get("outer_steps", checkpoint_outer_steps))
+    if outer_steps < 1:
+        raise ValueError("DMD2 evaluation outer_steps must be positive")
+    inner_steps = 1
+    student_time_shift_gamma = float(sampling_architecture["student_time_shift_gamma"])
     policy = InferencePolicy(
         student,
         method=method,
         outer_steps=outer_steps,
         inner_steps=inner_steps,
         student_time_shift_gamma=student_time_shift_gamma,
-        tmd_head=head,
     ).to(device).eval()
     return policy, {
         "method": method,
@@ -436,18 +380,8 @@ def load_inference_policy(
             "outer_steps": outer_steps,
             "inner_steps": inner_steps,
             "student_time_shift_gamma": student_time_shift_gamma,
-            "source": (
-                "DMD2 evaluation ablation override"
-                if method == "dmd2_flow" and "outer_steps" in policy_config
-                else "checkpoint architecture"
-                if method != "flow_sft"
-                else "flow-SFT evaluation"
-            ),
-            "sampler": (
-                "DMD2 denoise-renoise"
-                if method == "dmd2_flow"
-                else "deterministic shifted-grid integration"
-            ),
+            "source": "DMD2 evaluation ablation override" if "outer_steps" in policy_config else "checkpoint architecture",
+            "sampler": "DMD2 denoise-renoise",
         },
     }
 

@@ -1,299 +1,140 @@
-# DMD2 fidelity, diagnostics, and operations
+# DMD2 fidelity and architecture
 
-## Theory implemented here
+## Objective and sampler
 
-DMD2 distills a diffusion/flow teacher by differentiating a distribution
-matching direction. With rectified-flow convention
+The implementation uses rectified-flow coordinates
 
 ```text
 x_t = (1-t) x_0 + t epsilon
 x_hat_0(x_t,t) = x_t - t v(x_t,t)
 ```
 
-the frozen teacher and online fake model give clean predictions
-`mu_real` and `mu_fake`. The student direction is the stopped fake-minus-real
-difference, weighted by DMD2's teacher-residual denominator:
+and the stopped DMD2 direction
 
 ```text
-g_DMD = stopgrad((mu_fake - mu_real) /
-                 (mean_valid(abs(x_generated - mu_real)) + epsilon))
+g = stopgrad((x_hat_fake - x_hat_teacher) /
+             (mean_valid(abs(x_generated - x_hat_teacher)) + epsilon)).
 ```
 
-The fake model is trained on forward-noised generated samples. DMD2 removes the
-original regression term and adds a non-saturating GAN. Real expert and generated
-action chunks are independently noised before the discriminator. The resulting
-student objective is exactly
+The generator objective is `L_DMD + gan_weight * L_GAN`; there is no expert
+regression or Flow-SFT term. The fake score is a trainable copy of the PI0.5
+action-expert suffix initialized from the frozen teacher. The GAN has one FP32
+classifier head per configured fake-score layer (5, 11, and 17), and averages
+their losses/logits.
+
+Training and inference call the same denoise--renoise transition code. From
+pure Gaussian noise:
 
 ```text
-L_generator = L_distribution_matching + gan_weight * softplus(-D(fake_t))
-```
-
-with no Flow-SFT/data regression.
-
-For multi-step generation, DMD2 does not Euler-integrate the velocity. It starts
-from Gaussian noise and alternates clean prediction with independent forward
-re-noising:
-
-```text
-x_t0 ~ Normal(0,I)
 x_hat_i = x_ti - t_i v_student(x_ti,t_i)
-x_t(i+1) = (1-t_(i+1)) x_hat_i + t_(i+1) epsilon_i
+x_t(i+1) = (1-t_(i+1)) x_hat_i + t_(i+1) epsilon_i.
 ```
 
-Training samples one step index `j`, simulates its prefix without gradients,
-and differentiates only `x_hat_j`. The same shifted time grid and stochastic
-denoise--renoise transitions are used during DMD2 evaluation. `outer_steps=1`
-therefore means one clean prediction from pure noise.
+Training samples a step `j`, evaluates preceding transitions without gradient,
+and differentiates the clean prediction at `j`. Inference evaluates every
+transition. One outer step is therefore one clean prediction from Gaussian
+noise, not Euler integration and not a noised expert action.
 
-The five-to-one update ratio is TTUR. Each optimizer's schedule is measured in
-its actual updates:
+## Ownership and update schedule
+
+Registered module names are checkpoint-visible and stable:
+
+- `student`: frozen SmolVLA VLM/prefix encoder plus the trainable action-expert
+  transformer and action/time projections;
+- `teacher`: frozen PI0.5 (its parameters are excluded from inference deltas);
+- `fake_score`: independently trainable PI0.5 suffix;
+- `discriminator`: intermediate-feature heads;
+- `bridge`: frozen student/teacher coordinate transforms.
+
+The student trainable set contains every
+`vlm_with_expert.lm_expert.*` parameter plus `action_in_proj`,
+`action_out_proj`, `action_time_mlp_in`, and `action_time_mlp_out`: 99,849,312
+parameters in the pinned checkpoint. `state_proj`, the vision-language model,
+and the vision encoder remain frozen. The guidance optimizer owns the fake
+suffix and discriminator. The generator optimizer owns only this complete
+action-expert set. Cross-optimizer overlap is rejected.
+
+The phase schedule is five guidance updates followed by one generator update.
+Schedulers count actual optimizer updates:
 
 ```text
-total_updates[name]  = max_steps * count(name in phase_schedule)
-warmup_updates[name] = warmup_steps * count(name in phase_schedule)
+total_updates[name] = max_steps * count(name in phase_schedule)
+warmup_updates[name] = warmup_steps * count(name in phase_schedule).
 ```
 
-For the paper config this is 500,000 guidance updates versus 100,000 generator
-updates, and 5,000 versus 1,000 warmup updates.
+## Conditional state routing and replay
 
-## Robotics state-distribution adaptation
+The initial replay collection is blocking and balanced across all 40 standard
+LIBERO tasks. Periodic refreshes start after the configured number of actual
+generator updates and run asynchronously from immutable inference-delta
+snapshots. Training continues while workers collect; a completed round is
+validated and atomically ingested into a bounded task-balanced buffer.
 
-Periodic student-state replay is a repository adaptation for conditional robot
-policies, not a claim about the image-generation DMD2 paper. Before the first
-optimizer step, a lightweight student snapshot runs one rollout in every one of
-the 40 original LIBERO tasks. This initial collection is blocking, shards the
-tasks over the configured rollout GPUs, and streams progress to the terminal.
-Round `r` uses simulator seed `100000 + r` and fixed-init-state index `r % 50`
-for every task, preventing each fresh worker environment from silently returning
-to init state zero. These values are independent and persisted in the round
-configuration and rollout records.
+Round `r` uses simulator seed `base_reset_seed + r` and init-state index
+`r mod 50`. Suite horizons are explicit and persisted. Validation rollouts use
+held-out seed/init-state settings, are excluded from replay, and save videos.
 
-At the configured actual-generator-update interval, training writes another
-immutable student snapshot and starts a coordinator whose serial workers use the
-configured rollout devices. The trainer continues optimizing while they run and
-ingests a round only after its merged atomic rollout store is complete. The bounded replay samples tasks in
-round-robin order. Within a combined guidance update, fake-score score matching
-uses replay observations and an independently sampled student action, while GAN
-real/fake classification uses the expert minibatch and an expert-conditioned
-student action. The generator's DMD and GAN objectives use replay observations
-when the buffer is available. Before the initial replay is available, guidance
-falls back to the expert batch for both branches.
+Routing inside a guidance update is deliberate:
 
-Collector state is under
-`<training-output>/student_rollout_replay/`: resolved round configs, asynchronous
-logs, snapshots, completed rollout stores, and `status.json`. A failed periodic
-refresh is reported but does not destroy the last valid replay; a failed initial
-balanced collection aborts training.
+- fake-score matching uses student-replay observations and generated actions;
+- GAN real/fake classification uses the expert minibatch and expert condition;
+- generator DMD and GAN losses use replay observations once replay is ready.
 
-Every round also evaluates the snapshot on a fixed held-out probe: task 0 from
-each suite, simulator seed 200000, and init-state index 49. These four episodes
-are excluded from replay and saved under
-`student_rollout_replay/round-NNNNNN/validation_videos/`. Periodic rounds remain
-asynchronous, so video validation does not block optimization.
+Before replay is available, the expert minibatch is the fail-closed initial
+condition source.
 
-## Precision and gradient contract
+## Precision and safeguards
 
-Public flow coordinates, corruptions, clean predictions, DMD normalization, GAN
-head logits, and captured action gradients are FP32. SmolVLA and PI0.5 retain
-their checkpoint-native internal mixed layout. Repository wrappers disable an
-ambient autocast around FP32 action/time projections and explicitly cast at the
-BF16 expert boundary. GAN action gradients are captured with successively safer
-loss scales and replayed as a first-order surrogate, avoiding a second traversal
-of the large suffix.
+Flow coordinates, corruptions, clean predictions, DMD normalization,
+discriminator heads, and captured action gradients remain FP32. PI0.5 and
+SmolVLA keep their checkpoint-native internal precision. Wrappers disable
+ambient autocast around FP32 projections and cast explicitly at BF16 expert
+boundaries.
 
-The constructor and every phase validate that the PI0.5 teacher is completely
-frozen, frozen SmolVLA parameters receive no gradients, fake-score/classifier
-parameters update only in their phases, and student head parameters receive a
-finite nonzero generator gradient.
+The GAN input gradient is captured at successively safer backward scales and
+replayed through a first-order surrogate. Every phase checks finiteness,
+nonzero gradients, frozen teacher/backbone parameters, and optimizer ownership.
 
-## Training and monitoring
+## Checkpoints and exact resume
 
-The default paper run needs the expert manifest, GPUs `cuda:0` and `cuda:1` for
-training, and `cuda:2` for asynchronous rollout inference:
+Full checkpoints use `tmdpolicy.training/v1` and retain `student.*`,
+`fake_score.*`, `discriminator.*`, `bridge.*`, guidance/generator optimizer
+states, scheduler states, counters, RNG state, and the resolved config.
+Inference checkpoints use `tmdpolicy.inference/v1` and contain the complete
+action-expert delta (153 tensors for the pinned checkpoint) plus its manifest
+and immutable base-model contract. These checkpoints are consequently much
+larger than the historical head-only deltas.
 
-```bash
-conda activate tmdpolicy
-cd /home/dmsdmswns/TMDpolicy
-bash scripts/data/build_libero_expert.sh
-bash scripts/preflight/preflight_dmd2.sh
-bash scripts/train/train_dmd2_flow_paper.sh \
-  --output artifacts/training/dmd2_flow_paper_run1
-```
+`artifacts/training/dmd2_final` remains inference-compatible: its method tag and
+historical `head_only` delta are recognized and loaded using the contract stored
+inside that checkpoint. Its full optimizer checkpoint is intentionally not
+resume-compatible with new `action_expert` training because the generator
+optimizer now owns 153 tensors rather than eight. Resume requires an equivalent
+new-run config and full checkpoint; evaluation accepts either contract and
+applies only its validated student delta.
 
-To start a new run from an already completed, balanced round-1 replay and skip
-the blocking pre-training rollout, pass the round directory (not its parent):
+## Diagnostics
 
-```bash
-bash scripts/train/train_dmd2_flow_paper.sh \
-  --initial-rollout-replay /home/dmsdmswns/TMDpolicy/artifacts/training/dmd2_flow_paper_run1/student_rollout_replay/round-000000 \
-  --output artifacts/training/dmd2_flow_paper_run2
-```
+`metrics.jsonl` records global/optimizer update counters, optimizer LR and
+scheduler steps, fake-score/discriminator/DMD/GAN/total losses, gradient norms
+and nonfinite fractions, safe GAN backward scale, random backward-simulation
+step/time/noise/prefix/transition statistics, generated action dimensions and
+smoothness, fake velocity/timestep/teacher tracking, DMD direction and
+normalization quantiles, discriminator logits/probabilities/accuracy/AUC and
+per-layer/time-bin results, GAN input-gradient norms, and DMD/GAN gradient
+cosine similarity.
 
-The round must contain `collection_report.json` and train replans for all 40
-original LIBERO tasks. It is loaded into the new run's bounded replay without
-copying the source directory. The first asynchronous refresh remains due at 500
-actual generator updates.
+Fixed observation/noise validation probes track generator, teacher, and fake
+score behavior. Training also refreshes `training_progress.png` atomically and
+saves configured validation videos.
 
-The output contains:
+## Operations
 
-- `metrics.jsonl`: one complete row per global step;
-- `training_progress.png`: atomically refreshed loss plot;
-- `inference_checkpoints/step-*.pt`: student deltas for evaluation;
-- `checkpoints/step-*.pt`: full optimizer/RNG state for training resume;
-- `student_rollout_replay/status.json`: live collector/buffer state.
+Canonical commands and evaluation examples are in the root README. Important
+rules are:
 
-Metric prefixes include optimizer update counts/LRs/scheduler steps;
-`backward/*` source/prefix/transition/time diagnostics; `fake_score/*` score
-tracking and timestep bins; generator DMD direction, denominator, smoothness and
-per-action-dimension statistics; `classifier/*` logits/probabilities/AUC/layer
-and timestep metrics; phase and parameter-group gradient norms/nonfinite
-fractions; GAN/DMD input-gradient alignment; and `validation/fixed_probe/*` for
-fixed observation/noise generator, teacher, and fake-score probes.
-
-Continue training only from a full checkpoint and use the same resolved config:
-
-```bash
-bash scripts/train/train_dmd2_flow_paper.sh \
-  --output artifacts/training/dmd2_flow_paper_run1 \
-  --resume artifacts/training/dmd2_flow_paper_run1/checkpoints/latest.pt
-```
-
-## Original LIBERO evaluation
-
-Evaluate a small task sample from an intermediate student-delta checkpoint:
-
-```bash
-bash scripts/evaluate/evaluate_dmd2.sh \
-  --checkpoint artifacts/training/dmd2_flow_paper_run1/inference_checkpoints/step-00000500.pt \
-  --checkpoint-sha256 auto \
-  --device cuda:2 \
-  --suite libero_spatial \
-  --task-ids 0 5 \
-  --reset-seeds 0 \
-  --output artifacts/evaluation/dmd2_step500_spatial_sample
-```
-
-Add `--outer-steps 1` for one-step DMD2 inference. Repeat `--suite` to select
-multiple original suites; omitting suite/task/seed flags uses the full grid in
-the evaluation config.
-
-## LIBERO-Plus evaluation
-
-LIBERO-Plus must not replace vanilla LIBERO in the training environment. Create
-the separate pinned environment once:
-
-```bash
-bash scripts/setup/create_libero_plus_environment.sh
-```
-
-The setup defaults to fork commit
-`4976dc30028e805ff8094b55501d532c48fec182`; override
-`TMD_LIBERO_PLUS_COMMIT` only when intentionally starting a new benchmark
-provenance. The evaluator records that commit and the classification-file hash.
-
-Run the full four-suite, one-trial-per-variant 10,030-task benchmark. For
-throughput, assign independent serial task shards to multiple GPUs:
-
-```bash
-bash scripts/evaluate/evaluate_libero_plus_dmd2.sh \
-  --checkpoint artifacts/training/dmd2_flow_paper_run1/inference_checkpoints/final.pt \
-  --checkpoint-sha256 auto \
-  --devices cuda:2 cuda:3 cuda:4 cuda:5 \
-  --output artifacts/evaluation/libero_plus_dmd2_run1
-```
-
-The coordinator launches one policy replica per device and distributes complete
-tasks round-robin. Every worker uses the original batch-1 reset, plan, step, and
-termination loop, so there is no cross-task synchronization or waiting for a
-batch's slowest episode. Worker results are checked for exact task coverage and
-merged into `episodes.jsonl`. Resume without repeating completed tasks:
-
-```bash
-bash scripts/evaluate/evaluate_libero_plus_dmd2.sh \
-  --checkpoint artifacts/training/dmd2_flow_paper_run1/inference_checkpoints/final.pt \
-  --checkpoint-sha256 auto \
-  --devices cuda:2 cuda:3 cuda:4 cuda:5 \
-  --output artifacts/evaluation/libero_plus_dmd2_run1 \
-  --resume
-```
-
-Fully evaluate one selected suite, or a selected subset of the four suites:
-
-```bash
-# One complete suite.
-bash scripts/evaluate/evaluate_libero_plus_dmd2.sh \
-  --checkpoint artifacts/training/dmd2_flow_paper_run1/inference_checkpoints/final.pt \
-  --checkpoint-sha256 auto \
-  --suite libero_spatial \
-  --output artifacts/evaluation/libero_plus_spatial
-
-# Two complete suites. Repeating --suite also works.
-bash scripts/evaluate/evaluate_libero_plus_dmd2.sh \
-  --checkpoint artifacts/training/dmd2_flow_paper_run1/inference_checkpoints/final.pt \
-  --checkpoint-sha256 auto \
-  --suite libero_object libero_goal \
-  --output artifacts/evaluation/libero_plus_object_goal
-```
-
-A lightweight environment smoke test (not a reportable benchmark) is:
-
-```bash
-bash scripts/evaluate/evaluate_libero_plus_dmd2.sh \
-  --checkpoint artifacts/training/dmd2_flow_paper_run1/inference_checkpoints/step-00000500.pt \
-  --checkpoint-sha256 auto \
-  --suite libero_spatial \
-  --task-ids 0 1 \
-  --max-episode-steps 20 \
-  --output artifacts/evaluation/libero_plus_smoke
-```
-
-For a more representative performance check, deterministically sample exactly
-10 variants from each of the seven perturbation categories (70 episodes total),
-balanced across the four suites:
-
-```bash
-bash scripts/evaluate/evaluate_libero_plus_dmd2.sh \
-  --checkpoint artifacts/training/dmd2_flow_paper_run1/inference_checkpoints/step-00000060.pt \
-  --checkpoint-sha256 auto \
-  --device cuda:3 \
-  --sample-per-category 10 \
-  --sample-seed 0 \
-  --output artifacts/evaluation/libero_plus_dmd2_category10
-```
-
-The exact suite-local task IDs are recorded under `selection.tasks` in
-`manifest.json`. Category-sampled runs save agent-view videos by default under
-`videos/<suite>/`; use `--no-save-videos` to disable them. Conversely, use
-`--save-videos` to opt into videos for a full run. Use the same seed and
-`--resume` to continue an interrupted sample without changing its task set.
-
-The configured evaluation batch size is `1`. `--devices` is the acceleration
-control; omit it (or pass one device with `--device`) for a single serial worker.
-Each extra worker needs enough VRAM for one policy replica. Model startup is paid
-once per worker, so multi-GPU sharding helps sustained sampled/full evaluations,
-not tiny one-step smoke tests. This container exposes one EGL render device, so
-rendering remains there while policy replicas use the requested CUDA devices.
-
-## Batched DMD2 student rollout refresh
-
-Initial and asynchronous DMD2 student-state collection use the same process-level
-task sharding. Configure the worker GPUs in the training YAML:
-
-```yaml
-dmd2:
-  student_rollout_replay:
-    devices: [cuda:2, cuda:3, cuda:4, cuda:5]
-    batch_size: 1
-```
-
-The coordinator assigns the 40 tasks across the listed devices, validates every
-worker store, and merges them into the same atomic round consumed by training.
-The shared protocol uses per-suite `220/280/300/520` horizons. Simulator seeds,
-fixed-init-state indices, and held-out validation-video probes are explicit in
-each resolved round config; task balance, asynchronous refresh scheduling, and
-expert-state GAN minibatches remain unchanged.
-
-Primary references are the [DMD2 paper](https://arxiv.org/abs/2405.14867),
-[official DMD2 implementation](https://github.com/tianweiy/DMD2),
-[LeRobot LIBERO-Plus guide](https://github.com/huggingface/lerobot/blob/main/docs/source/libero_plus.mdx),
-and [LIBERO-Plus benchmark](https://github.com/sylvestf/LIBERO-plus).
+- train with `configs/methods/dmd2_flow.yaml` only;
+- resume training from `checkpoints/*.pt`, never an inference delta;
+- evaluate with `inference_checkpoints/*.pt` when possible;
+- use the separate `tmdpolicy-libero-plus` environment for LIBERO-Plus;
+- use official SmolVLA-10 for the baseline and label 4/1 steps as ablations.

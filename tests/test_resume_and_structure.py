@@ -95,7 +95,7 @@ def test_uninterrupted_and_resumed_training_match(tmp_path: Path) -> None:
     assert all(torch.equal(full_state[key], resumed_state[key]) for key in full_state)
 
 
-def test_lightweight_intermediate_inference_checkpoints_are_periodic(tmp_path: Path) -> None:
+def test_inference_delta_checkpoints_are_periodic(tmp_path: Path) -> None:
     manifest = tmp_path / "manifest.json"
     manifest.write_text(json.dumps({"unit": True}), encoding="utf-8")
     config = _config(manifest)
@@ -138,7 +138,7 @@ def test_ttur_scheduler_is_expressed_in_actual_optimizer_updates() -> None:
     assert factor(50) == 0.05
 
 
-def test_removed_paths_and_training_scripts_are_concrete() -> None:
+def test_removed_paths_are_absent_and_dmd2_script_is_canonical() -> None:
     root = Path(__file__).resolve().parents[1]
     ignored_roots = {".deps", ".cache", ".git", "artifacts"}
     assert not [
@@ -149,16 +149,11 @@ def test_removed_paths_and_training_scripts_are_concrete() -> None:
     assert not (root / "src/tmd_policy/research_cli.py").exists()
     assert not (root / "src/tmd_policy/common/density/cnf.py").exists()
     scripts = list((root / "scripts/train").glob("*.sh"))
-    required = {
-        "train_dmd2_flow_paper.sh",
-        "train_tmd_stage1.sh",
-        "train_tmd_stage2_paper.sh",
-        "run_tmd_pipeline.sh",
-    }
-    assert required <= {script.name for script in scripts}
+    assert {script.name for script in scripts} == {"train_dmd2_flow.sh"}
     for script in scripts:
         text = script.read_text(encoding="utf-8").lower()
-        assert "tmd-policy train" in text or script.name == "train_tmd_stage2.sh"
+        assert "tmd-policy train dmd2-flow" in text
+        assert "configs/methods/dmd2_flow.yaml" in text
         assert "dry-run" not in text and "--execute" not in text
 
 

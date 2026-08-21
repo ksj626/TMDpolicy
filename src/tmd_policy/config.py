@@ -1,31 +1,32 @@
-"""Configuration loading for executable TMDpolicy runs.
-
-YAML files are intentionally plain and fully resolved: there is no capability
-registry and no mode that pretends to train without constructing the assets.
-"""
+"""Strict configuration loading for the DMD2-only production surface."""
 
 from __future__ import annotations
 
 import copy
-import json
 import re
 from pathlib import Path
 from typing import Any
 
 import yaml
 
-from tmd_policy.libero_protocol import (
-    LIBERO_SUITE_MAX_EPISODE_STEPS,
-    validate_suite_max_episode_steps,
-)
+from tmd_policy.libero_protocol import LIBERO_SUITE_MAX_EPISODE_STEPS, validate_suite_max_episode_steps
 
 LEROBOT_VERSION = "0.6.1"
 IMMUTABLE_REVISION = re.compile(r"^[0-9a-f]{40}$")
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+SUPPORTED_METHODS = {
+    "data_build_expert",
+    "pi05_flow_parity",
+    "dmd2_flow",
+    "collect_student",
+    "evaluate_libero",
+    "evaluate_libero_plus",
+}
+SUPPORTED_POLICIES = {"pi05", "smolvla", "dmd2_flow"}
 
 
 class ConfigError(ValueError):
-    """Raised before any model or dataset is loaded when a run is ambiguous."""
+    """Raised before models or datasets are loaded when a run is ambiguous."""
 
 
 def _require(mapping: dict[str, Any], key: str, context: str) -> Any:
@@ -34,50 +35,24 @@ def _require(mapping: dict[str, Any], key: str, context: str) -> Any:
     return mapping[key]
 
 
-def _revision(value: Any, field: str) -> str:
-    value = str(value)
-    if not IMMUTABLE_REVISION.fullmatch(value):
-        raise ConfigError(f"{field} must be an immutable 40-character Hub commit, got {value!r}")
-    return value
-
-
 def _reject_unknown(mapping: dict[str, Any], allowed: set[str], context: str) -> None:
     unknown = sorted(set(mapping) - allowed)
     if unknown:
         raise ConfigError(f"unknown or deprecated configuration fields in {context}: {unknown}")
 
 
-def _all_libero_tasks(benchmark: Any, context: str) -> None:
-    if not isinstance(benchmark, list):
-        raise ConfigError(f"{context} must be a suite/task list")
-    expected = {
-        "libero_spatial": set(range(10)),
-        "libero_object": set(range(10)),
-        "libero_goal": set(range(10)),
-        "libero_10": set(range(10)),
-    }
-    actual: dict[str, set[int]] = {}
-    for value in benchmark:
-        suite = str(value.get("suite"))
-        if suite in actual:
-            raise ConfigError(f"{context} repeats suite {suite}")
-        actual[suite] = {int(task) for task in value.get("task_ids", [])}
-    if actual != expected:
-        raise ConfigError(f"{context} must cover each of the four suites and all 40 tasks exactly")
+def _positive_int(value: Any, field: str) -> int:
+    result = int(value)
+    if result < 1:
+        raise ConfigError(f"{field} must be positive")
+    return result
 
 
-def _libero_task_subset(benchmark: Any, context: str) -> None:
-    if not isinstance(benchmark, list) or not benchmark:
-        raise ConfigError(f"{context} must be a nonempty suite/task list")
-    seen: set[str] = set()
-    for value in benchmark:
-        suite = str(value.get("suite"))
-        task_ids = [int(task) for task in value.get("task_ids", [])]
-        if suite not in LIBERO_SUITE_MAX_EPISODE_STEPS or suite in seen:
-            raise ConfigError(f"{context} contains an unknown or repeated suite: {suite}")
-        if not task_ids or len(task_ids) != len(set(task_ids)) or not set(task_ids) <= set(range(10)):
-            raise ConfigError(f"{context} task_ids must be unique values in [0,9]")
-        seen.add(suite)
+def _revision(value: Any, field: str) -> str:
+    result = str(value)
+    if not IMMUTABLE_REVISION.fullmatch(result):
+        raise ConfigError(f"{field} must be an immutable 40-character Hub commit, got {result!r}")
+    return result
 
 
 def _suite_steps(value: Any, context: str) -> dict[str, int]:
@@ -87,57 +62,25 @@ def _suite_steps(value: Any, context: str) -> dict[str, int]:
         raise ConfigError(str(error)) from error
 
 
-def validate_config(config: dict[str, Any], *, expected_method: str | None = None) -> None:
-    """Fail closed on asset identity and the shared LIBERO tensor contract."""
+def _libero_tasks(benchmark: Any, context: str, *, require_all: bool) -> None:
+    if not isinstance(benchmark, list) or not benchmark:
+        raise ConfigError(f"{context} must be a nonempty suite/task list")
+    actual: dict[str, set[int]] = {}
+    for entry in benchmark:
+        suite = str(entry.get("suite"))
+        ids = [int(value) for value in entry.get("task_ids", ())]
+        if suite not in LIBERO_SUITE_MAX_EPISODE_STEPS or suite in actual:
+            raise ConfigError(f"{context} contains an unknown or repeated suite: {suite}")
+        if not ids or len(ids) != len(set(ids)) or not set(ids) <= set(range(10)):
+            raise ConfigError(f"{context} task_ids must be unique values in [0,9]")
+        actual[suite] = set(ids)
+    if require_all:
+        expected = {suite: set(range(10)) for suite in LIBERO_SUITE_MAX_EPISODE_STEPS}
+        if actual != expected:
+            raise ConfigError(f"{context} must cover each of the four suites and all 40 tasks exactly")
 
-    method = str(_require(config, "method", "config"))
-    root_fields = {
-        "data_build_expert": {"method", "backend", "models", "dataset", "horizons", "output"},
-        "pi05_flow_parity": {
-            "method", "classification", "backend", "models", "dataset", "horizons", "parity", "output"
-        },
-        "flow_sft": {
-            "method", "classification", "backend", "models", "dataset", "horizons", "training",
-            "fine_tuning", "output"
-        },
-        "tmd_stage1": {
-            "method", "classification", "backend", "models", "dataset", "horizons", "training",
-            "tmd", "preflight", "output"
-        },
-        "dmd2_flow": {
-            "method", "classification", "backend", "models", "dataset", "horizons", "training",
-            "dmd2", "preflight", "output"
-        },
-        "tmd_stage2": {
-            "method", "classification", "backend", "models", "dataset", "horizons", "training",
-            "stage1_architecture", "stage2", "preflight", "output"
-        },
-        "occupancy_discriminator": {
-            "method", "classification", "backend", "models", "dataset", "horizons", "training",
-            "rollouts", "occupancy_discriminator", "preflight", "output"
-        },
-        "occupancy_tmd": {
-            "method", "classification", "backend", "models", "dataset", "horizons", "training",
-            "tmd", "occupancy", "output"
-        },
-        "collect_student": {
-            "method", "classification", "backend", "models", "dataset", "horizons", "policy",
-            "collection", "output"
-        },
-        "evaluate_libero": {
-            "method", "classification", "backend", "models", "dataset", "horizons", "policy",
-            "evaluation", "output"
-        },
-        "evaluate_libero_plus": {
-            "method", "classification", "backend", "models", "dataset", "horizons", "policy",
-            "evaluation", "output"
-        },
-    }
-    if method not in root_fields:
-        raise ConfigError(f"unknown production method: {method!r}")
-    _reject_unknown(config, root_fields[method] | {"_config_path"}, "config")
-    if expected_method is not None and method != expected_method:
-        raise ConfigError(f"command expects method={expected_method!r}, config declares {method!r}")
+
+def _validate_assets(config: dict[str, Any]) -> None:
     backend = _require(config, "backend", "config")
     _reject_unknown(backend, {"lerobot_version", "expected_source_hashes", "local_files_only"}, "backend")
     if _require(backend, "lerobot_version", "backend") != LEROBOT_VERSION:
@@ -154,490 +97,195 @@ def validate_config(config: dict[str, Any], *, expected_method: str | None = Non
         if not str(_require(asset, "id", f"models.{name}")).strip():
             raise ConfigError(f"models.{name}.id must be nonempty")
         _revision(_require(asset, "revision", f"models.{name}"), f"models.{name}.revision")
-        _revision(
-            _require(asset, "processor_revision", f"models.{name}"),
-            f"models.{name}.processor_revision",
-        )
+        _revision(asset["processor_revision"], f"models.{name}.processor_revision")
 
     dataset = _require(config, "dataset", "config")
     _reject_unknown(
         dataset,
-        {
-            "id", "revision", "cache", "manifest", "validation_fraction", "test_fraction",
-            "split_seed", "download_videos", "video_backend",
-        },
+        {"id", "revision", "cache", "manifest", "validation_fraction", "test_fraction", "split_seed", "download_videos", "video_backend"},
         "dataset",
     )
-    if _require(dataset, "id", "dataset") != "lerobot/libero":
+    if dataset["id"] != "lerobot/libero":
         raise ConfigError("the canonical expert dataset must be lerobot/libero")
-    _revision(_require(dataset, "revision", "dataset"), "dataset.revision")
-    fractions = [float(dataset.get("validation_fraction", 0.1)), float(dataset.get("test_fraction", 0.1))]
-    if min(fractions) <= 0 or sum(fractions) >= 1:
+    _revision(dataset["revision"], "dataset.revision")
+    validation = float(dataset.get("validation_fraction", 0.1))
+    test = float(dataset.get("test_fraction", 0.1))
+    if min(validation, test) <= 0 or validation + test >= 1:
         raise ConfigError("validation/test fractions must be positive and sum to less than one")
 
     horizons = _require(config, "horizons", "config")
     _reject_unknown(horizons, {"prediction", "execution"}, "horizons")
-    if int(_require(horizons, "prediction", "horizons")) != 50:
+    if int(horizons["prediction"]) != 50:
         raise ConfigError("LIBERO prediction horizon is fixed at 50")
-    execution = int(_require(horizons, "execution", "horizons"))
-    if not 1 <= execution <= 50:
+    if not 1 <= int(horizons["execution"]) <= 50:
         raise ConfigError("horizons.execution must be in [1, 50]")
-
-    training = config.get("training")
-    if training is not None:
-        _reject_unknown(
-            training,
-            {
-                "seed", "device", "batch_size", "num_workers", "mixed_precision",
-                "gradient_accumulation", "gradient_clip_norm", "learning_rate", "weight_decay",
-                "betas", "epsilon", "warmup_steps", "minimum_lr_scale", "max_steps",
-                "validation_interval", "validation_batches", "checkpoint_interval",
-                "inference_checkpoint_interval", "diagnostics_interval",
-            },
-            "training",
-        )
-        if int(training.get("batch_size", 0)) < 1 or int(training.get("max_steps", 0)) < 1:
-            raise ConfigError("training.batch_size and training.max_steps must be positive")
-        if training.get("mixed_precision", "bf16") not in {"no", "fp16", "bf16"}:
-            raise ConfigError("training.mixed_precision must be no, fp16, or bf16")
-        if int(training.get("gradient_accumulation", 0)) < 1:
-            raise ConfigError("training.gradient_accumulation must be positive")
-        if int(training.get("inference_checkpoint_interval", 1)) < 1:
-            raise ConfigError("training.inference_checkpoint_interval must be positive when set")
-        if int(training.get("diagnostics_interval", 1)) < 1:
-            raise ConfigError("training.diagnostics_interval must be positive")
     _reject_unknown(_require(config, "output", "config"), {"directory"}, "output")
-    if "preflight" in config:
-        _reject_unknown(config["preflight"], {"minimum_total_memory_gib"}, "preflight")
 
-    if "capabilities" in json.dumps(config):
-        raise ConfigError("capability declarations were removed; configure concrete assets instead")
 
-    tmd_fields = {
-        "variant", "attention_mode", "flow_matching_fraction", "normalization_constant_scale",
-        "student_time_shift_gamma", "meanflow_time_shift_gamma", "condition_dropout_probability",
-        "last_k_expert_blocks", "train_backbone_flow_blocks", "model_dim", "layers", "heads",
-        "feedforward_dim", "dropout", "discrete_outer_steps", "discrete_inner_steps",
-    }
-    if method in {"tmd_stage1", "occupancy_tmd"}:
-        tmd = _require(config, "tmd", "config")
-        _reject_unknown(tmd, tmd_fields, "tmd")
-        tmd_sections = [("tmd", tmd)]
+def _validate_policy(policy: dict[str, Any]) -> None:
+    method = str(_require(policy, "method", "policy"))
+    if method not in SUPPORTED_POLICIES:
+        raise ConfigError(f"unsupported evaluation policy method: {method!r}")
+    common = {"method", "device"}
+    if method == "pi05":
+        allowed = common | {"num_steps"}
+        _positive_int(policy.get("num_steps", 10), "policy.num_steps")
+    elif method == "smolvla":
+        allowed = common | {"sampler_mode", "num_steps", "classification"}
+        mode = str(policy.get("sampler_mode", "official"))
+        if mode not in {"official", "override"}:
+            raise ConfigError("policy.sampler_mode must be official or override")
+        if mode == "official" and ("num_steps" in policy or "classification" in policy):
+            raise ConfigError("official SmolVLA forbids sampler overrides and ablation labels")
+        if mode == "override":
+            _positive_int(_require(policy, "num_steps", "policy"), "policy.num_steps")
+            if "ablation" not in str(_require(policy, "classification", "policy")).lower():
+                raise ConfigError("SmolVLA sampler overrides must be explicitly classified as an ablation")
     else:
-        tmd_sections = []
-    if method == "tmd_stage2":
-        architecture = _require(config, "stage1_architecture", "config")
-        _reject_unknown(architecture, tmd_fields, "stage1_architecture")
-        tmd_sections.append(("stage1_architecture", architecture))
-    for name, value in tmd_sections:
-        if not 0 <= float(value["flow_matching_fraction"]) <= 1:
-            raise ConfigError(f"{name}.flow_matching_fraction must be in [0,1]")
-        if float(value.get("student_time_shift_gamma", 1.0)) < 1 or float(
-            value.get("meanflow_time_shift_gamma", 1.0)
-        ) < 1:
-            raise ConfigError(f"{name} timestep shifts must be at least one")
-        if float(value.get("condition_dropout_probability", 0.0)) != 0.0:
-            raise ConfigError(
-                f"{name}.condition_dropout_probability must be 0.0; this conditional baseline has no CFG"
-            )
-        if float(value["normalization_constant_scale"]) <= 0:
-            raise ConfigError(f"{name}.normalization_constant_scale must be positive")
-        if int(value["discrete_outer_steps"]) < 1 or int(value["discrete_inner_steps"]) < 1:
-            raise ConfigError(f"{name} discrete student-grid step counts must be positive")
+        allowed = common | {"checkpoint", "checkpoint_sha256", "outer_steps"}
+        _require(policy, "checkpoint", "policy")
+        _require(policy, "checkpoint_sha256", "policy")
+        if "outer_steps" in policy:
+            _positive_int(policy["outer_steps"], "policy.outer_steps")
+    _reject_unknown(policy, allowed, "policy")
 
-    if method in {"dmd2_flow", "tmd_stage2"}:
-        section_name = "dmd2" if method == "dmd2_flow" else "stage2"
-        objective = _require(config, section_name, "config")
-        objective_fields = {
-            "student_fine_tuning", "fake_score_variant", "fake_updates_per_generator",
-            "student_training_mode",
-            "generator_learning_rate", "fake_score_learning_rate",
-            "discriminator_learning_rate", "gan_weight", "vsd_normalization_epsilon",
-            "vsd_normalization",
-            "teacher_device", "teacher_dtype", "fake_score_device",
-            "vsd_time", "gan_time", "fake_score_time", "discriminator", "resource_estimate",
-            "fake_score", "data_weight", "student_rollout_replay",
-        }
-        if method == "tmd_stage2":
-            objective_fields |= {
-                "stage1_checkpoint", "stage1_checkpoint_sha256",
-                "discriminator_updates_per_generator",
-            }
-        else:
-            objective_fields |= {
-                "guidance_classifier_weight", "discriminator_updates_per_generator",
-                "discrete_outer_steps", "student_time_shift_gamma",
-            }
-        _reject_unknown(objective, objective_fields, section_name)
-        if "data_weight" in objective:
-            raise ConfigError(
-                f"{section_name}.data_weight is deprecated: faithful {method} has no SFT/data loss; "
-                "migrate to the paper config or an explicitly named hybrid ablation"
-            )
-        expected_normalization = (
-            "dmd2_teacher_residual_mean_abs"
-            if method == "dmd2_flow"
-            else "tmd_fake_teacher_difference_l1"
-        )
-        if objective.get("vsd_normalization") != expected_normalization:
-            raise ConfigError(
-                f"{section_name}.vsd_normalization must be {expected_normalization} for {method}"
-            )
-        expected_training_mode = (
-            "backward_simulation_denoise_renoise"
-            if method == "dmd2_flow"
-            else "tmd_stage1_outer_transition"
-        )
-        if objective.get("student_training_mode") != expected_training_mode:
-            raise ConfigError(
-                f"{section_name}.student_training_mode must be {expected_training_mode}"
-            )
-        if int(objective.get("fake_updates_per_generator", 0)) != 5:
-            raise ConfigError(f"{section_name}.fake_updates_per_generator must be 5")
-        if method == "dmd2_flow":
-            if int(objective["discrete_outer_steps"]) < 1:
-                raise ConfigError("dmd2.discrete_outer_steps must be positive")
-            if float(objective["student_time_shift_gamma"]) < 1:
-                raise ConfigError("dmd2.student_time_shift_gamma must be at least one")
-            replay = _require(objective, "student_rollout_replay", "dmd2")
-            _reject_unknown(
-                replay,
-                {
-                    "enabled", "initial_blocking", "refresh_generator_updates",
-                    "capacity_replans", "device", "devices", "fps", "base_reset_seed",
-                    "suite_max_episode_steps", "batch_size", "validation_videos",
-                },
-                "dmd2.student_rollout_replay",
-            )
-            if not bool(replay.get("enabled", False)):
-                raise ConfigError("configured DMD2 student replay must be enabled")
-            if not bool(replay.get("initial_blocking", False)):
-                raise ConfigError("DMD2 student replay must collect a balanced initial rollout")
-            if int(replay.get("capacity_replans", 0)) < 40:
-                raise ConfigError("DMD2 student replay capacity must be at least 40 replans")
-            _suite_steps(
-                _require(replay, "suite_max_episode_steps", "dmd2.student_rollout_replay"),
-                "dmd2.student_rollout_replay.suite_max_episode_steps",
-            )
-            if int(replay.get("batch_size", 1)) < 1:
-                raise ConfigError("DMD2 student replay batch_size must be positive")
-            devices = [str(value) for value in replay.get("devices", [replay["device"]])]
-            if not devices or len(devices) != len(set(devices)):
-                raise ConfigError("DMD2 student replay devices must be unique and nonempty")
-            validation_videos = _require(
-                replay, "validation_videos", "dmd2.student_rollout_replay"
-            )
-            _reject_unknown(
-                validation_videos,
-                {"enabled", "task_ids", "simulator_seed", "init_state_index", "camera"},
-                "dmd2.student_rollout_replay.validation_videos",
-            )
-            video_tasks = [int(value) for value in validation_videos.get("task_ids", [])]
-            if bool(validation_videos.get("enabled", False)) and (
-                not video_tasks
-                or len(video_tasks) != len(set(video_tasks))
-                or not set(video_tasks) <= set(range(10))
-            ):
-                raise ConfigError("DMD2 validation-video task_ids must be unique values in [0,9]")
-            if min(
-                int(validation_videos.get("simulator_seed", -1)),
-                int(validation_videos.get("init_state_index", -1)),
-            ) < 0:
-                raise ConfigError("DMD2 validation-video seed/init-state index must be nonnegative")
-            if not str(validation_videos.get("camera", "")).strip():
-                raise ConfigError("DMD2 validation-video camera must be nonempty")
-        if objective.get("fake_score_variant") != "pi05_clone" and "ablation" not in str(
-            config.get("classification", "")
-        ).lower():
-            raise ConfigError(f"baseline {method} must use fake_score_variant=pi05_clone")
-        if "fake_score" in objective and objective.get("fake_score_variant") != "lightweight":
-            raise ConfigError(
-                f"{section_name}.fake_score is only valid for the explicitly lightweight ablation"
-            )
-        discriminator = _require(objective, "discriminator", section_name)
-        if discriminator.get("variant") not in {"pi05_intermediate_features", "cached_vla_features"}:
-            raise ConfigError(
-                f"{section_name}.discriminator.variant must explicitly select paper or cached VLA features"
-            )
-        if (
-            discriminator["variant"] != "pi05_intermediate_features"
-            and "ablation" not in str(config.get("classification", "")).lower()
-        ):
-            raise ConfigError(f"baseline {method} must use the paper intermediate-feature discriminator")
-        if discriminator["variant"] == "pi05_intermediate_features":
-            _reject_unknown(
-                discriminator,
-                {"variant", "feature_source", "selected_layers", "hidden_dim", "time_embedding_dim"},
-                f"{section_name}.discriminator",
-            )
-            expected_source = "fake_score_features" if method == "dmd2_flow" else "teacher_features"
-            if discriminator.get("feature_source") != expected_source:
-                raise ConfigError(
-                    f"{section_name} paper discriminator requires feature_source={expected_source}"
-                )
-            if method == "dmd2_flow" and float(objective.get("guidance_classifier_weight", 0.0)) <= 0:
-                raise ConfigError("dmd2.guidance_classifier_weight must be positive")
-            if method == "dmd2_flow" and "discriminator_updates_per_generator" in objective:
-                raise ConfigError(
-                    "dmd2 fake-score-feature guidance jointly updates the classifier; "
-                    "discriminator_updates_per_generator is invalid"
-                )
-            if method == "tmd_stage2" and int(
-                objective.get("discriminator_updates_per_generator", 0)
-            ) < 1:
-                raise ConfigError("stage2.discriminator_updates_per_generator must be positive")
-            selected = [int(value) for value in discriminator.get("selected_layers", [])]
-            if not selected or len(selected) != len(set(selected)) or min(selected) < 0:
-                raise ConfigError(f"{section_name}.discriminator.selected_layers must be nonempty and unique")
-        else:
-            _reject_unknown(
-                discriminator,
-                {"variant", "feature_source", "num_tasks", "model_dim", "layers", "heads"},
-                f"{section_name}.discriminator",
-            )
-            if discriminator.get("feature_source") != "cached_vla_features":
-                raise ConfigError(f"{section_name} cached discriminator must identify cached_vla_features")
-            if int(objective.get("discriminator_updates_per_generator", 0)) < 1:
-                raise ConfigError(
-                    f"{section_name}.discriminator_updates_per_generator must be positive"
-                )
-            if "guidance_classifier_weight" in objective:
-                raise ConfigError(
-                    f"{section_name}.guidance_classifier_weight is only valid for fake-score features"
-                )
-        for name in ("vsd_time", "gan_time", "fake_score_time"):
-            timing = _require(objective, name, section_name)
-            minimum = float(_require(timing, "minimum_time", f"{section_name}.{name}"))
-            maximum = float(_require(timing, "maximum_time", f"{section_name}.{name}"))
-            gamma = float(_require(timing, "time_shift_gamma", f"{section_name}.{name}"))
-            if not 0 <= minimum < maximum <= 1 or gamma < 1:
-                raise ConfigError(f"invalid {section_name}.{name} time range/shift")
 
-    if method == "collect_student":
-        collection = config["collection"]
-        _reject_unknown(
-            collection,
-            {
-                "fps", "devices", "batch_size", "benchmark", "train_reset_seeds",
-                "validation_reset_seeds", "train_init_state_indices",
-                "validation_init_state_indices", "validation_task_ids",
-                "suite_max_episode_steps", "collection_round", "parallel_worker",
-                "save_validation_videos", "video_camera",
-            },
-            "collection",
-        )
-        benchmark = _require(collection, "benchmark", "collection")
-        if bool(collection.get("parallel_worker", False)):
-            seen: set[tuple[str, int]] = set()
-            for suite_spec in benchmark:
-                suite = str(suite_spec.get("suite"))
-                task_ids = [int(value) for value in suite_spec.get("task_ids", [])]
-                if suite not in {"libero_spatial", "libero_object", "libero_goal", "libero_10"}:
-                    raise ConfigError(f"unknown collection worker suite: {suite}")
-                if not task_ids or len(task_ids) != len(set(task_ids)) or not set(task_ids) <= set(range(10)):
-                    raise ConfigError("collection worker task_ids must be unique values in [0,9]")
-                if any((suite, task_id) in seen for task_id in task_ids):
-                    raise ConfigError("collection worker repeats a suite/task pair")
-                seen.update((suite, task_id) for task_id in task_ids)
-        else:
-            _all_libero_tasks(benchmark, "collection.benchmark")
-        if int(collection.get("batch_size", 1)) < 1:
-            raise ConfigError("collection.batch_size must be positive")
-        devices = [str(value) for value in collection.get("devices", [])]
-        if len(devices) != len(set(devices)):
-            raise ConfigError("collection.devices must be unique")
-        _suite_steps(
-            _require(collection, "suite_max_episode_steps", "collection"),
-            "collection.suite_max_episode_steps",
-        )
-        for split in ("train", "validation"):
-            seeds = [int(value) for value in _require(
-                collection, f"{split}_reset_seeds", "collection"
-            )]
-            indices = [int(value) for value in _require(
-                collection, f"{split}_init_state_indices", "collection"
-            )]
-            if len(seeds) != len(indices) or min(seeds + indices, default=0) < 0:
-                raise ConfigError(
-                    f"collection {split} simulator seeds and init-state indices must be "
-                    "nonnegative and paired one-to-one"
-                )
-        validation_tasks = [int(value) for value in collection.get("validation_task_ids", [])]
-        if validation_tasks and (
-            len(validation_tasks) != len(set(validation_tasks))
-            or not set(validation_tasks) <= set(range(10))
-        ):
-            raise ConfigError("collection.validation_task_ids must be unique values in [0,9]")
-        if bool(collection.get("save_validation_videos", False)) and not validation_tasks:
-            raise ConfigError("validation videos require collection.validation_task_ids")
-        if not str(collection.get("video_camera", "image")).strip():
-            raise ConfigError("collection.video_camera must be nonempty")
-        _reject_unknown(
-            config["policy"],
-            {"method", "device", "checkpoint", "checkpoint_sha256"},
-            "policy",
-        )
+def _validate_dmd2(config: dict[str, Any]) -> None:
+    training = _require(config, "training", "config")
+    _reject_unknown(
+        training,
+        {"seed", "device", "batch_size", "num_workers", "mixed_precision", "gradient_accumulation", "gradient_clip_norm", "learning_rate", "weight_decay", "betas", "epsilon", "warmup_steps", "minimum_lr_scale", "max_steps", "validation_interval", "validation_batches", "checkpoint_interval", "inference_checkpoint_interval", "diagnostics_interval"},
+        "training",
+    )
+    for field in ("batch_size", "gradient_accumulation", "max_steps", "validation_interval", "validation_batches", "checkpoint_interval", "inference_checkpoint_interval", "diagnostics_interval"):
+        _positive_int(training[field], f"training.{field}")
+    if training["mixed_precision"] not in {"no", "fp16", "bf16"}:
+        raise ConfigError("training.mixed_precision must be no, fp16, or bf16")
 
-    if method == "occupancy_tmd":
-        _reject_unknown(
-            config["occupancy"],
-            {
-                "discriminator_checkpoint", "discriminator_checkpoint_sha256", "minimum_weight",
-                "maximum_weight", "temperature", "weight_sampler_outer_steps",
-                "weight_sampler_inner_steps", "rollout_mode",
-            },
-            "occupancy",
-        )
+    dmd2 = _require(config, "dmd2", "config")
+    _reject_unknown(
+        dmd2,
+        {"student_fine_tuning", "fake_score_variant", "fake_updates_per_generator", "guidance_classifier_weight", "student_training_mode", "discrete_outer_steps", "student_time_shift_gamma", "generator_learning_rate", "fake_score_learning_rate", "discriminator_learning_rate", "gan_weight", "vsd_normalization", "vsd_normalization_epsilon", "teacher_device", "teacher_dtype", "fake_score_device", "student_rollout_replay", "vsd_time", "gan_time", "fake_score_time", "discriminator", "resource_estimate"},
+        "dmd2",
+    )
+    required_values = {
+        "student_fine_tuning": "action_expert",
+        "fake_score_variant": "pi05_clone",
+        "student_training_mode": "backward_simulation_denoise_renoise",
+        "vsd_normalization": "dmd2_teacher_residual_mean_abs",
+    }
+    for field, expected in required_values.items():
+        if dmd2.get(field) != expected:
+            raise ConfigError(f"dmd2.{field} must be {expected!r}")
+    if int(dmd2.get("fake_updates_per_generator", 0)) != 5:
+        raise ConfigError("dmd2.fake_updates_per_generator must be 5")
+    _positive_int(dmd2["discrete_outer_steps"], "dmd2.discrete_outer_steps")
+    if float(dmd2["student_time_shift_gamma"]) < 1:
+        raise ConfigError("dmd2.student_time_shift_gamma must be at least one")
+    for name in ("vsd_time", "gan_time", "fake_score_time"):
+        section = _require(dmd2, name, "dmd2")
+        _reject_unknown(section, {"minimum_time", "maximum_time", "time_shift_gamma"}, f"dmd2.{name}")
+        minimum, maximum, gamma = float(section["minimum_time"]), float(section["maximum_time"]), float(section["time_shift_gamma"])
+        if not 0 < minimum < maximum <= 1 or gamma < 1:
+            raise ConfigError(f"invalid dmd2.{name} time range/shift")
+    discriminator = _require(dmd2, "discriminator", "dmd2")
+    _reject_unknown(discriminator, {"variant", "feature_source", "selected_layers", "hidden_dim", "time_embedding_dim"}, "dmd2.discriminator")
+    if discriminator.get("variant") != "pi05_intermediate_features":
+        raise ConfigError("dmd2.discriminator.variant must be 'pi05_intermediate_features'")
+    if discriminator.get("feature_source") != "fake_score_features":
+        raise ConfigError("dmd2.discriminator.feature_source must be 'fake_score_features'")
+    if not discriminator.get("selected_layers"):
+        raise ConfigError("dmd2.discriminator.selected_layers must be nonempty")
 
-    if method == "occupancy_discriminator":
-        occupancy = _require(config, "occupancy_discriminator", "config")
-        allowed = {
-            "variant", "window_length", "minimum_time", "maximum_time", "time_shift_gamma",
-            "selected_layers", "hidden_dim", "time_embedding_dim", "num_tasks", "model_dim",
-            "layers", "heads",
-        }
-        _reject_unknown(occupancy, allowed, "occupancy_discriminator")
-        if occupancy.get("variant") not in {"pi05_intermediate_features", "cached_vla_features"}:
-            raise ConfigError("occupancy_discriminator.variant must explicitly select a feature source")
-        configured = set(int(value) for value in config["rollouts"].get("configured_task_indices", []))
-        if configured != set(range(40)):
-            raise ConfigError("occupancy rollouts must configure all 40 global task indices")
-        minimum = float(_require(occupancy, "minimum_time", "occupancy_discriminator"))
-        maximum = float(_require(occupancy, "maximum_time", "occupancy_discriminator"))
-        gamma = float(_require(occupancy, "time_shift_gamma", "occupancy_discriminator"))
-        if not 0 <= minimum < maximum <= 1 or gamma < 1:
-            raise ConfigError("invalid occupancy discriminator time range/shift")
+    replay = _require(dmd2, "student_rollout_replay", "dmd2")
+    _reject_unknown(replay, {"enabled", "initial_blocking", "refresh_generator_updates", "capacity_replans", "device", "devices", "fps", "base_reset_seed", "suite_max_episode_steps", "batch_size", "validation_videos"}, "dmd2.student_rollout_replay")
+    if not replay.get("enabled") or not replay.get("initial_blocking"):
+        raise ConfigError("DMD2 requires enabled balanced initial student replay")
+    if _positive_int(replay["capacity_replans"], "dmd2.student_rollout_replay.capacity_replans") < 40:
+        raise ConfigError("DMD2 student replay capacity must be at least 40 replans")
+    _positive_int(replay["refresh_generator_updates"], "dmd2.student_rollout_replay.refresh_generator_updates")
+    _positive_int(replay["batch_size"], "dmd2.student_rollout_replay.batch_size")
+    devices = [str(value) for value in replay.get("devices", [replay["device"]])]
+    if not devices or len(devices) != len(set(devices)):
+        raise ConfigError("DMD2 student replay devices must be unique and nonempty")
+    _suite_steps(replay["suite_max_episode_steps"], "dmd2.student_rollout_replay.suite_max_episode_steps")
+    videos = _require(replay, "validation_videos", "dmd2.student_rollout_replay")
+    _reject_unknown(videos, {"enabled", "task_ids", "simulator_seed", "init_state_index", "camera"}, "dmd2.student_rollout_replay.validation_videos")
+    preflight = _require(config, "preflight", "config")
+    _reject_unknown(preflight, {"minimum_total_memory_gib"}, "preflight")
 
-    if method in {"evaluate_libero", "evaluate_libero_plus"}:
-        policy = _require(config, "policy", "config")
-        policy_method = str(_require(policy, "method", "policy"))
-        if policy_method not in {
-            "pi05", "smolvla", "flow_sft", "tmd_stage1", "dmd2_flow", "tmd_stage2", "occupancy_tmd"
-        }:
-            raise ConfigError(f"unknown evaluation policy method: {policy_method}")
-        if policy_method == "pi05":
-            _reject_unknown(policy, {"method", "device", "num_steps"}, "policy")
-        elif policy_method == "smolvla":
-            _reject_unknown(
-                policy, {"method", "device", "sampler_mode", "num_steps", "classification"}, "policy"
-            )
-        else:
-            sampling_override_fields = (
-                {"outer_steps", "inner_steps"}
-                if policy_method == "flow_sft"
-                else {"outer_steps"}
-                if policy_method == "dmd2_flow"
-                else set()
-            )
-            _reject_unknown(
-                policy,
-                {"method", "device", "checkpoint", "checkpoint_sha256"}
-                | sampling_override_fields,
-                "policy",
-            )
-        if policy_method == "smolvla":
-            mode = str(_require(policy, "sampler_mode", "policy"))
-            if mode == "official" and ({"num_steps", "outer_steps"} & set(policy)):
-                raise ConfigError("official SmolVLA evaluation forbids step overrides")
-            if mode == "override" and "ablation" not in str(policy.get("classification", "")).lower():
-                raise ConfigError("SmolVLA override mode must be classified as an ablation")
 
-    if method == "evaluate_libero":
-        evaluation = _require(config, "evaluation", "config")
-        _reject_unknown(
-            evaluation,
-            {
-                "fps", "benchmark", "reset_seeds", "suite_max_episode_steps",
-                "save_rollouts", "synchronize_cuda",
-            },
-            "evaluation",
-        )
-        _libero_task_subset(
-            _require(evaluation, "benchmark", "evaluation"), "evaluation.benchmark"
-        )
-        reset_seeds = [int(value) for value in _require(evaluation, "reset_seeds", "evaluation")]
-        if not reset_seeds or len(reset_seeds) != len(set(reset_seeds)) or min(reset_seeds) < 0:
-            raise ConfigError("LIBERO reset_seeds must be unique nonnegative integers")
-        _suite_steps(
-            _require(evaluation, "suite_max_episode_steps", "evaluation"),
-            "evaluation.suite_max_episode_steps",
-        )
-        if int(evaluation.get("fps", 0)) < 1:
-            raise ConfigError("LIBERO evaluation.fps must be positive")
+def _validate_collection(config: dict[str, Any]) -> None:
+    _validate_policy(config["policy"])
+    if config["policy"]["method"] != "dmd2_flow":
+        raise ConfigError("student rollout collection requires policy.method='dmd2_flow'")
+    collection = _require(config, "collection", "config")
+    _reject_unknown(collection, {"fps", "devices", "batch_size", "benchmark", "train_reset_seeds", "train_init_state_indices", "validation_reset_seeds", "validation_init_state_indices", "validation_task_ids", "save_validation_videos", "video_camera", "suite_max_episode_steps", "collection_round"}, "collection")
+    _libero_tasks(collection["benchmark"], "collection.benchmark", require_all=True)
+    _suite_steps(collection["suite_max_episode_steps"], "collection.suite_max_episode_steps")
+    _positive_int(collection["batch_size"], "collection.batch_size")
 
-    if method == "evaluate_libero_plus":
-        evaluation = _require(config, "evaluation", "config")
-        _reject_unknown(
-            evaluation,
-            {
-                "fps", "suites", "task_ids", "reset_seeds", "suite_max_episode_steps",
-                "expected_total_tasks", "synchronize_cuda", "control_mode", "hard_reset",
-                "sample_per_category", "sample_seed",
-                "batch_size", "save_videos", "video_camera", "devices",
-                "task_map", "parallel_worker",
-            },
-            "evaluation",
-        )
-        suites = [str(value) for value in _require(evaluation, "suites", "evaluation")]
-        expected_suites = ["libero_spatial", "libero_object", "libero_goal", "libero_10"]
-        if not suites or len(suites) != len(set(suites)) or any(
-            suite not in expected_suites for suite in suites
-        ):
-            raise ConfigError(
-                "LIBERO-Plus evaluation.suites must be a unique nonempty subset of the four suites"
-            )
-        if int(_require(evaluation, "expected_total_tasks", "evaluation")) != 10_030:
-            raise ConfigError("the full four-suite LIBERO-Plus contract contains exactly 10,030 tasks")
-        task_ids = evaluation.get("task_ids")
-        sample_per_category = evaluation.get("sample_per_category")
-        if task_ids is not None and sample_per_category is not None:
-            raise ConfigError(
-                "LIBERO-Plus task_ids and sample_per_category are mutually exclusive"
-            )
-        if task_ids is not None:
-            normalized_ids = [int(value) for value in task_ids]
-            if (
-                not normalized_ids
-                or len(normalized_ids) != len(set(normalized_ids))
-                or min(normalized_ids) < 0
-            ):
-                raise ConfigError("LIBERO-Plus task_ids must be unique nonnegative integers")
-        if sample_per_category is not None and int(sample_per_category) < 1:
-            raise ConfigError("LIBERO-Plus sample_per_category must be positive")
-        if int(evaluation.get("sample_seed", 0)) < 0:
-            raise ConfigError("LIBERO-Plus sample_seed must be nonnegative")
-        if int(evaluation.get("batch_size", 1)) < 1:
-            raise ConfigError("LIBERO-Plus batch_size must be positive")
-        devices = [str(value) for value in evaluation.get("devices", [])]
-        if len(devices) != len(set(devices)):
-            raise ConfigError("LIBERO-Plus devices must be unique")
-        if evaluation.get("save_videos") not in {None, True, False}:
-            raise ConfigError("LIBERO-Plus save_videos must be null or boolean")
-        task_map = evaluation.get("task_map")
-        if task_map is not None and not isinstance(task_map, dict):
-            raise ConfigError("LIBERO-Plus task_map must be a suite-to-task-list mapping")
-        if not str(evaluation.get("video_camera", "image")).strip():
-            raise ConfigError("LIBERO-Plus video_camera must be nonempty")
-        reset_seeds = [int(value) for value in _require(evaluation, "reset_seeds", "evaluation")]
-        if not reset_seeds or len(reset_seeds) != len(set(reset_seeds)) or min(reset_seeds) < 0:
-            raise ConfigError("LIBERO-Plus reset_seeds must be unique nonnegative integers")
-        _suite_steps(
-            _require(evaluation, "suite_max_episode_steps", "evaluation"),
-            "evaluation.suite_max_episode_steps",
-        )
-        if int(evaluation.get("fps", 0)) < 1:
-            raise ConfigError("LIBERO-Plus evaluation.fps must be positive")
-        if evaluation.get("control_mode", "relative") not in {"relative", "absolute"}:
-            raise ConfigError("LIBERO-Plus control_mode must be relative or absolute")
+
+def _validate_evaluation(config: dict[str, Any], *, plus: bool) -> None:
+    _validate_policy(config["policy"])
+    evaluation = _require(config, "evaluation", "config")
+    if plus:
+        allowed = {"fps", "suites", "task_ids", "sample_per_category", "sample_seed", "batch_size", "save_videos", "video_camera", "reset_seeds", "suite_max_episode_steps", "expected_total_tasks", "synchronize_cuda", "control_mode", "hard_reset", "devices"}
+        _reject_unknown(evaluation, allowed, "evaluation")
+        suites = [str(value) for value in evaluation["suites"]]
+        if not suites or len(suites) != len(set(suites)) or not set(suites) <= set(LIBERO_SUITE_MAX_EPISODE_STEPS):
+            raise ConfigError("evaluation.suites must be unique known LIBERO suites")
+        if evaluation.get("task_ids") is not None and evaluation.get("sample_per_category") is not None:
+            raise ConfigError("evaluation.task_ids and sample_per_category are mutually exclusive")
+        _positive_int(evaluation["batch_size"], "evaluation.batch_size")
+        _positive_int(evaluation["expected_total_tasks"], "evaluation.expected_total_tasks")
+    else:
+        _reject_unknown(evaluation, {"fps", "benchmark", "reset_seeds", "suite_max_episode_steps", "save_rollouts", "synchronize_cuda"}, "evaluation")
+        _libero_tasks(evaluation["benchmark"], "evaluation.benchmark", require_all=False)
+    _suite_steps(evaluation["suite_max_episode_steps"], "evaluation.suite_max_episode_steps")
+    seeds = [int(value) for value in evaluation["reset_seeds"]]
+    if not seeds or len(seeds) != len(set(seeds)) or min(seeds) < 0:
+        raise ConfigError("evaluation.reset_seeds must be unique nonnegative integers")
+
+
+def validate_config(config: dict[str, Any], *, expected_method: str | None = None) -> None:
+    method = str(_require(config, "method", "config"))
+    if method not in SUPPORTED_METHODS:
+        raise ConfigError(f"unknown production method: {method!r}")
+    if expected_method is not None and method != expected_method:
+        raise ConfigError(f"command expects method={expected_method!r}, config declares {method!r}")
+    root_fields = {
+        "data_build_expert": {"method", "backend", "models", "dataset", "horizons", "output"},
+        "pi05_flow_parity": {"method", "classification", "backend", "models", "dataset", "horizons", "parity", "output"},
+        "dmd2_flow": {"method", "classification", "backend", "models", "dataset", "horizons", "training", "dmd2", "preflight", "output"},
+        "collect_student": {"method", "classification", "backend", "models", "dataset", "horizons", "policy", "collection", "output"},
+        "evaluate_libero": {"method", "classification", "backend", "models", "dataset", "horizons", "policy", "evaluation", "output"},
+        "evaluate_libero_plus": {"method", "classification", "backend", "models", "dataset", "horizons", "policy", "evaluation", "output"},
+    }
+    _reject_unknown(config, root_fields[method] | {"_config_path"}, "config")
+    _validate_assets(config)
+    if method == "dmd2_flow":
+        _validate_dmd2(config)
+    elif method == "collect_student":
+        _validate_collection(config)
+    elif method == "evaluate_libero":
+        _validate_evaluation(config, plus=False)
+    elif method == "evaluate_libero_plus":
+        _validate_evaluation(config, plus=True)
+    elif method == "pi05_flow_parity":
+        parity = config["parity"]
+        _reject_unknown(parity, {"device", "dtype", "num_steps", "noise_seed", "minimum_score_time"}, "parity")
+        _positive_int(parity["num_steps"], "parity.num_steps")
 
 
 def load_config(path: str | Path, *, expected_method: str | None = None) -> dict[str, Any]:
-    path = Path(path)
-    value = yaml.safe_load(path.read_text(encoding="utf-8"))
-    if not isinstance(value, dict):
-        raise ConfigError(f"configuration root must be a mapping: {path}")
-    config = copy.deepcopy(value)
-    config["_config_path"] = str(path.resolve())
+    resolved = Path(path).expanduser().resolve()
+    with resolved.open("r", encoding="utf-8") as handle:
+        config = yaml.safe_load(handle)
+    if not isinstance(config, dict):
+        raise ConfigError(f"configuration root must be a mapping: {resolved}")
+    config = copy.deepcopy(config)
+    config["_config_path"] = str(resolved)
     validate_config(config, expected_method=expected_method)
     return config
 
@@ -650,17 +298,8 @@ def save_resolved_config(config: dict[str, Any], path: str | Path) -> Path:
 
 
 def project_path(value: str | Path) -> Path:
-    path = Path(value)
+    path = Path(value).expanduser()
     return path if path.is_absolute() else PROJECT_ROOT / path
 
 
-__all__ = [
-    "ConfigError",
-    "IMMUTABLE_REVISION",
-    "LEROBOT_VERSION",
-    "PROJECT_ROOT",
-    "load_config",
-    "project_path",
-    "save_resolved_config",
-    "validate_config",
-]
+__all__ = ["ConfigError", "PROJECT_ROOT", "load_config", "project_path", "save_resolved_config", "validate_config"]
